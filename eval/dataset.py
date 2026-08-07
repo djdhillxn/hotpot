@@ -100,6 +100,40 @@ SAMPLE_HOTPOT_QUESTIONS = [
 ]
 
 
+def normalize_hf_item(item, idx):
+    raw_sp = item.get("supporting_facts", {})
+    supporting_facts = []
+    if isinstance(raw_sp, dict) and "title" in raw_sp and "sent_id" in raw_sp:
+        supporting_facts = [[t, s] for t, s in zip(raw_sp["title"], raw_sp["sent_id"])]
+    elif isinstance(raw_sp, list):
+        supporting_facts = raw_sp
+
+    gold_titles = list(set([fact[0] for fact in supporting_facts if isinstance(fact, (list, tuple)) and len(fact) > 0]))
+
+    raw_context = item.get("context", {})
+    formatted_context = []
+    if isinstance(raw_context, dict) and "title" in raw_context and "sentences" in raw_context:
+        for t, s in zip(raw_context["title"], raw_context["sentences"]):
+            formatted_context.append({"title": t, "sentences": s})
+    elif isinstance(raw_context, list):
+        for entry in raw_context:
+            if isinstance(entry, dict):
+                formatted_context.append(entry)
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                formatted_context.append({"title": entry[0], "sentences": entry[1]})
+
+    return {
+        "id": item.get("id", f"hf_{idx}"),
+        "question": item.get("question", ""),
+        "answer": item.get("answer", ""),
+        "type": item.get("type", "unknown"),
+        "level": item.get("level", "unknown"),
+        "supporting_facts": supporting_facts,
+        "gold_titles": gold_titles,
+        "context": formatted_context,
+    }
+
+
 def load_hotpot_dataset(num_samples=None, source="sample"):
     if source == "sample":
         if num_samples:
@@ -107,32 +141,20 @@ def load_hotpot_dataset(num_samples=None, source="sample"):
         return SAMPLE_HOTPOT_QUESTIONS
 
     if source == "huggingface" or source == "official_json":
-        # First try loading via HuggingFace with modern namespace 'hotpotqa/hotpot_qa'
         try:
             print("Loading HotpotQA FullWiki validation dataset via HuggingFace ('hotpotqa/hotpot_qa')...")
             from datasets import load_dataset
-            dataset = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split="validation", trust_remote_code=True)
+            dataset = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split="validation")
             samples = []
             for i, item in enumerate(dataset):
                 if num_samples and i >= num_samples:
                     break
-                gold_titles = list(set([fact[0] for fact in item.get("supporting_facts", [])]))
-                samples.append({
-                    "id": item.get("id", f"hf_{i}"),
-                    "question": item.get("question", ""),
-                    "answer": item.get("answer", ""),
-                    "type": item.get("type", "unknown"),
-                    "level": item.get("level", "unknown"),
-                    "supporting_facts": item.get("supporting_facts", []),
-                    "gold_titles": gold_titles,
-                    "context": item.get("context", []),
-                })
+                samples.append(normalize_hf_item(item, i))
             print(f"Successfully loaded {len(samples)} questions from HuggingFace dataset ('hotpotqa/hotpot_qa').")
             return samples
         except Exception as e_hf:
-            print(f"Notice: HuggingFace namespace 'hotpotqa/hotpot_qa' load failed ({str(e_hf)}). Trying direct HTTP download...")
+            print(f"Notice: HuggingFace load failed ({str(e_hf)}). Trying direct HTTP download...")
 
-        # Fallback to direct HTTP download URLs
         urls = [
             HOTPOT_DEV_URL,
             "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_fullwiki_v1.json",
