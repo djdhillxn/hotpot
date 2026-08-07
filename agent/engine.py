@@ -8,7 +8,7 @@ from config import MAX_AGENT_HOPS
 def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
     def agent_node(state):
         prompt = REACT_PROMPT_SYSTEM.format(
-            question=state["question"], scratchpad=state["scratchpad"]
+            question=state["question"], scratchpad=state.get("scratchpad", "")
         )
 
         response = llm.invoke(prompt)
@@ -17,7 +17,7 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         thought, raw_action, action_type, action_arg = parse_react_output(response_text)
 
         step_record = {
-            "step": state["step_count"] + 1,
+            "step": state.get("step_count", 0) + 1,
             "thought": thought,
             "action": raw_action,
             "action_type": action_type,
@@ -25,11 +25,10 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
             "observation": "",
         }
 
-        updates = {
-            "current_action_type": action_type,
-            "current_action_arg": action_arg,
-            "steps": state["steps"] + [step_record],
-        }
+        updates = dict(state)
+        updates["current_action_type"] = action_type
+        updates["current_action_arg"] = action_arg
+        updates["steps"] = list(state.get("steps", [])) + [step_record]
 
         if action_type == "finish":
             updates["final_answer"] = action_arg
@@ -37,19 +36,20 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         return updates
 
     def tool_node(state):
-        action_type = state["current_action_type"]
-        action_arg = state["current_action_arg"]
-        last_step = state["steps"][-1]
+        action_type = state.get("current_action_type")
+        action_arg = state.get("current_action_arg")
+        steps = list(state.get("steps", []))
+        last_step = steps[-1] if steps else {"thought": "", "action": ""}
 
         observation = ""
         evidence_graph = list(state.get("evidence_graph", []))
         visited_pages = list(state.get("visited_pages", []))
 
-        prev_page = toolset.current_page_title
+        prev_page = getattr(toolset, "current_page_title", None)
 
         if action_type == "search":
             observation = toolset.search(action_arg)
-            new_page = toolset.current_page_title
+            new_page = getattr(toolset, "current_page_title", None)
             if new_page and new_page not in visited_pages:
                 visited_pages.append(new_page)
                 if prev_page and prev_page != new_page:
@@ -67,26 +67,30 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         else:
             observation = "Observation: Unknown action type."
 
-        updated_steps = list(state["steps"])
-        updated_steps[-1]["observation"] = observation
+        updated_steps = list(steps)
+        if updated_steps:
+            updated_steps[-1]["observation"] = observation
 
         new_scratchpad = (
-            state["scratchpad"]
+            state.get("scratchpad", "")
             + f"Thought: {last_step['thought']}\nAction: {last_step['action']}\n{observation}\n"
         )
 
-        return {
-            "steps": updated_steps,
-            "scratchpad": new_scratchpad,
-            "step_count": state["step_count"] + 1,
-            "visited_pages": visited_pages,
-            "evidence_graph": evidence_graph,
-        }
+        updates = dict(state)
+        updates["steps"] = updated_steps
+        updates["scratchpad"] = new_scratchpad
+        updates["step_count"] = state.get("step_count", 0) + 1
+        updates["visited_pages"] = visited_pages
+        updates["evidence_graph"] = evidence_graph
+
+        return updates
 
     def should_continue(state):
-        if state["current_action_type"] == "finish":
+        action_type = state.get("current_action_type")
+        step_count = state.get("step_count", 0)
+        if action_type == "finish":
             return "end"
-        if state["step_count"] >= max_hops:
+        if step_count >= max_hops:
             return "end"
         return "tool"
 
