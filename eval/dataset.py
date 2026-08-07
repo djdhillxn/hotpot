@@ -106,8 +106,31 @@ def load_hotpot_dataset(num_samples=None, source="sample"):
             return SAMPLE_HOTPOT_QUESTIONS[:num_samples]
         return SAMPLE_HOTPOT_QUESTIONS
 
+    if source == "official_json":
+        urls = [
+            HOTPOT_DEV_URL,
+            "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_fullwiki_v1.json",
+            "https://raw.githubusercontent.com/hotpotqa/hotpot/master/hotpot_dev_fullwiki_v1.json",
+        ]
+        for url in urls:
+            try:
+                print(f"Downloading official HotpotQA validation set from {url}...")
+                resp = requests.get(url, timeout=60)
+                resp.raise_for_status()
+                data = resp.json()
+                print(f"Successfully loaded {len(data)} questions from official HotpotQA JSON.")
+                if num_samples:
+                    data = data[:num_samples]
+                return data
+            except Exception as e:
+                print(f"Warning: Failed to fetch from {url} ({str(e)}). Trying next source...")
+
+        print("Falling back to HuggingFace dataset...")
+        source = "huggingface"
+
     if source == "huggingface":
         try:
+            print("Loading HotpotQA FullWiki validation dataset from HuggingFace...")
             from datasets import load_dataset
             dataset = load_dataset("hotpot_qa", "fullwiki", split="validation")
             samples = []
@@ -125,21 +148,9 @@ def load_hotpot_dataset(num_samples=None, source="sample"):
                     "gold_titles": gold_titles,
                     "context": item.get("context", []),
                 })
+            print(f"Successfully loaded {len(samples)} questions from HuggingFace.")
             return samples
         except Exception as e:
             print(f"Warning: Could not load HuggingFace dataset ({str(e)}). Falling back to sample questions.")
-            return SAMPLE_HOTPOT_QUESTIONS[:num_samples] if num_samples else SAMPLE_HOTPOT_QUESTIONS
-
-    if source == "official_json":
-        try:
-            resp = requests.get(HOTPOT_DEV_URL, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            if num_samples:
-                data = data[:num_samples]
-            return data
-        except Exception as e:
-            print(f"Warning: Could not download official JSON ({str(e)}). Falling back to sample questions.")
-            return SAMPLE_HOTPOT_QUESTIONS[:num_samples] if num_samples else SAMPLE_HOTPOT_QUESTIONS
 
     return SAMPLE_HOTPOT_QUESTIONS[:num_samples] if num_samples else SAMPLE_HOTPOT_QUESTIONS

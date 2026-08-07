@@ -16,4 +16,4 @@ WIKIPEDIA_USER_AGENT = os.getenv(
 HOTPOT_DEV_DATASET = "hotpot_qa"
 HOTPOT_CONFIG = "fullwiki"
 HOTPOT_SPLIT = "validation"
-HOTPOT_DEV_URL = "https://nlp.stanford.edu/projects/hotpot/hotpot_dev_fullwiki_v1.json"
+HOTPOT_DEV_URL = "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_fullwiki_v1.json"
