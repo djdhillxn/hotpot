@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config import LLM_MODEL_NAME, OPENAI_API_KEY, OPENAI_API_BASE, MAX_AGENT_HOPS
 from agent.engine import run_react_agent
+from agent.baseline_rag import run_single_pass_rag
 from tools.wikipedia import WikipediaToolSet
 from tools.local_retriever import LocalHotpotRetriever
 from eval.dataset import SAMPLE_HOTPOT_QUESTIONS, load_hotpot_dataset
@@ -68,8 +69,12 @@ def get_llm(model_name, api_key, api_base):
     return ChatOpenAI(**kwargs)
 
 
-st.sidebar.title("ReAct Agent Configuration")
-st.sidebar.markdown("FullWiki Multi-Hop QA Engine built with LangGraph.")
+st.sidebar.title("System Configuration")
+engine_mode = st.sidebar.radio(
+    "Architecture Engine",
+    options=["ReAct Multi-Hop Agent", "Single-Pass RAG Baseline"],
+    index=0,
+)
 
 retrieval_mode = st.sidebar.radio(
     "Retrieval Backend",
@@ -80,16 +85,17 @@ retrieval_mode = st.sidebar.radio(
 model_choice = st.sidebar.text_input("LLM Model Name", value=LLM_MODEL_NAME)
 api_base_input = st.sidebar.text_input("Local vLLM Base URL", value=OPENAI_API_BASE, placeholder="http://localhost:8000/v1")
 api_key_input = st.sidebar.text_input("API Key (Optional for vLLM)", value=OPENAI_API_KEY if OPENAI_API_KEY != "EMPTY" else "", type="password")
-max_hops = st.sidebar.slider("Max Agent Hops", min_value=3, max_value=10, value=MAX_AGENT_HOPS)
+max_hops = st.sidebar.slider("Max Agent Hops (ReAct Only)", min_value=3, max_value=10, value=MAX_AGENT_HOPS)
 
 st.sidebar.divider()
 st.sidebar.markdown("### System Pipeline")
 st.sidebar.markdown("- ReAct Reasoning Loop: Thought -> Action -> Observation")
+st.sidebar.markdown("- Single-Pass RAG Baseline Comparison")
 st.sidebar.markdown("- Entity Knowledge Graph Visualizer")
 st.sidebar.markdown("- Official HotpotQA Leaderboard Metrics")
 
 st.title("ReAct Multi-Hop Question Answering Agent")
-st.caption("Implementation for HotpotQA FullWiki benchmark using LangGraph and Local vLLM Inference")
+st.caption("Implementation for HotpotQA FullWiki benchmark with Single-Pass RAG Baseline Comparison")
 
 tab1, tab2 = st.tabs(["Interactive Playground and Trajectory Visualizer", "Benchmark Evaluation"])
 
@@ -106,8 +112,8 @@ with tab1:
 
     user_question = st.text_area("Question", value=default_q, height=70)
 
-    if st.button("Run ReAct Agent", type="primary"):
-        with st.spinner("Executing ReAct Reasoning Loop..."):
+    if st.button(f"Run {engine_mode}", type="primary"):
+        with st.spinner(f"Executing {engine_mode}..."):
             try:
                 llm = get_llm(model_choice, api_key_input, api_base_input)
 
@@ -118,11 +124,16 @@ with tab1:
                     context = matched.get("context", []) if matched else []
                     toolset = LocalHotpotRetriever(context_paragraphs=context)
 
-                final_state = run_react_agent(
-                    question=user_question, llm=llm, toolset=toolset, max_hops=max_hops
-                )
+                if engine_mode == "ReAct Multi-Hop Agent":
+                    final_state = run_react_agent(
+                        question=user_question, llm=llm, toolset=toolset, max_hops=max_hops
+                    )
+                else:
+                    final_state = run_single_pass_rag(
+                        question=user_question, llm=llm, toolset=toolset
+                    )
 
-                st.success("ReAct Agent Execution Complete.")
+                st.success(f"{engine_mode} Execution Complete.")
 
                 col1, col2 = st.columns([3, 2])
 
@@ -143,7 +154,7 @@ with tab1:
                         )
                         st.caption(f"Ground Truth: **{gold_ans}** | Exact Match: **{metrics['exact_match']}** | Joint F1: **{metrics['joint_f1']:.2f}**")
 
-                    st.markdown("### Step-by-Step ReAct Trajectory")
+                    st.markdown("### Trajectory Steps")
                     steps = final_state.get("steps", [])
 
                     for step in steps:
@@ -175,11 +186,12 @@ with tab2:
     st.subheader("Automated HotpotQA Benchmark Suite")
     st.markdown("Run quantitative evaluation over HotpotQA validation questions.")
 
+    eval_engine = st.selectbox("Engine to Evaluate", options=["ReAct Multi-Hop Agent", "Single-Pass RAG Baseline"])
     eval_source = st.selectbox("Dataset Source", options=["sample", "huggingface", "official_json"])
     num_eval_samples = st.number_input("Evaluation Samples Limit (0 = Full Dataset)", min_value=0, max_value=7405, value=4)
 
     if st.button("Run Evaluation Suite"):
-        with st.spinner("Running evaluation suite..."):
+        with st.spinner(f"Running evaluation suite using {eval_engine}..."):
             try:
                 llm = get_llm(model_choice, api_key_input, api_base_input)
                 limit = num_eval_samples if num_eval_samples > 0 else None
@@ -190,7 +202,10 @@ with tab2:
 
                 for idx, s in enumerate(samples):
                     toolset = LocalHotpotRetriever(context_paragraphs=s.get("context", []))
-                    state = run_react_agent(question=s["question"], llm=llm, toolset=toolset)
+                    if eval_engine == "ReAct Multi-Hop Agent":
+                        state = run_react_agent(question=s["question"], llm=llm, toolset=toolset)
+                    else:
+                        state = run_single_pass_rag(question=s["question"], llm=llm, toolset=toolset)
 
                     pred = state.get("final_answer") or ""
                     eval_m = evaluate_prediction(

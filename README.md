@@ -1,6 +1,6 @@
 # ReAct Multi-Hop Question Answering Agent (HotpotQA FullWiki)
 
-A ReAct (Reasoning + Acting) Agent built using Python, LangGraph, and local vLLM inference on Google Compute Engine (GCE) NVIDIA L4 GPU (24GB VRAM) to solve the HotpotQA FullWiki multi-hop benchmark.
+A ReAct (Reasoning + Acting) Agent built using Python, LangGraph, and local vLLM inference on Google Compute Engine (GCE) NVIDIA L4 GPU (24GB VRAM) to solve the HotpotQA FullWiki multi-hop benchmark, featuring a side-by-side **Single-Pass RAG Baseline Comparison Study**.
 
 ---
 
@@ -17,11 +17,12 @@ A ReAct (Reasoning + Acting) Agent built using Python, LangGraph, and local vLLM
 ## Key Architecture & Features
 
 - Strict Agentic Control Loop: Built using LangGraph StateGraph enforcing an explicit Thought -> Action -> Observation cycle.
+- Single-Pass RAG Baseline Engine: Dedicated direct prompting engine (`agent/baseline_rag.py`) for comparative baseline study.
 - Dual Wikipedia Tool Suite:
   - search[entity]: Searches Wikipedia API and retrieves lead section summaries.
   - lookup[keyword]: Searches paragraphs within loaded Wikipedia pages for exact keyword matches.
 - Interactive Trajectory & Knowledge Graph Visualizer: Streamlit dashboard visualizing step-by-step reasoning traces and an interactive PyVis Knowledge Bridge Graph showing entity transitions.
-- Official HotpotQA Benchmark & Plotting Engine: Automated evaluation measuring Answer Exact Match (EM), Answer F1, Supporting Facts F1, Joint Exact Match (Joint EM), and Joint F1 on full HotpotQA validation sets, automatically generating metric bar charts and markdown evaluation reports.
+- Official HotpotQA Benchmark & Comparison Engine: Automated evaluation measuring Answer Exact Match (EM), Answer F1, Supporting Facts F1, Joint Exact Match (Joint EM), and Joint F1 on full HotpotQA validation sets, automatically generating comparative metric bar charts and markdown evaluation reports.
 
 ---
 
@@ -56,31 +57,41 @@ Wait until vLLM outputs `Application startup complete` on `http://localhost:8000
 
 ### Step 3: Run Unit Tests
 
-Verify the ReAct parser, retrieval tools, and LangGraph engine state machine:
+Verify the ReAct parser, baseline engine, retrieval tools, and LangGraph engine state machine:
 
 ```bash
 PYTHONPATH=. pytest tests/
 ```
 
-### Step 4: Run Benchmark & Generate Metric Plots + Evaluation Report
+### Step 4: Run Single-Pass RAG Baseline Benchmark
 
-Execute evaluation on sample questions or the full official HotpotQA validation dataset:
+Execute Single-Pass RAG evaluation to establish the non-agentic baseline:
 
 ```bash
-# 1. Quick test on sample multi-hop questions
-python eval/run_eval.py --samples 4 --mode offline --source sample
-
-# 2. Full benchmark evaluation on official validation set
-python eval/run_eval.py --samples 100 --mode offline --source official_json --output-dir eval_results
+python eval/run_baseline.py --samples 100 --mode offline --source official_json --output-dir eval_results/baseline
 ```
 
-Generated Output Artifacts (`eval_results/`):
-- `results.json`: Raw prediction JSON with per-question EM/F1 metrics.
-- `benchmark_metrics.png`: Bar chart of Answer EM, Answer F1, Supporting Facts F1, Joint EM, and Joint F1.
-- `hop_distribution.png`: Histogram showing trajectory hop counts per question.
-- `evaluation_report.md`: Markdown summary report with metrics table, latency, and sample question predictions.
+### Step 5: Run ReAct Multi-Hop Agent Benchmark
 
-### Step 5: Launch Interactive Web UI
+Execute the ReAct Agent evaluation:
+
+```bash
+python eval/run_eval.py --samples 100 --mode offline --source official_json --output-dir eval_results/react
+```
+
+### Step 6: Generate Comparative Analysis & Side-by-Side Plots
+
+Generate comparative bar charts (`comparison_metrics.png`) and performance report (`comparison_report.md`):
+
+```bash
+python eval/compare_results.py --baseline eval_results/baseline/results.json --react eval_results/react/results.json --output-dir eval_results/comparison
+```
+
+Generated Output Artifacts (`eval_results/comparison/`):
+- `comparison_metrics.png`: Side-by-side bar chart comparing Single-Pass RAG vs ReAct Multi-Hop Agent for EM, F1, and Joint F1.
+- `comparison_report.md`: Markdown summary report demonstrating the exact accuracy gain achieved by Agentic AI over static RAG.
+
+### Step 7: Launch Interactive Web UI
 
 ```bash
 streamlit run app/web_ui.py --server.port 8501 --server.address 0.0.0.0
@@ -90,26 +101,12 @@ Access the visual dashboard at `http://<GCE_EXTERNAL_IP>:8501`.
 
 ---
 
-## Benchmark Metrics & Evaluation Output Format
-
-```text
-=== OFFICIAL HOTPOTQA LEADERBOARD METRICS ===
-Answer Exact Match (EM):      75.0%
-Answer F1 Score:              87.5%
-Supporting Facts F1:          100.0%
-Joint Exact Match (Joint EM): 75.0%
-Joint F1 Score (Joint F1):    87.5%
-Avg Hops / Question:          2.50
-Total Evaluation Time:        4.12s
-```
-
----
-
 ## Repository Structure
 
 ```
 hotpot/
 ├── agent/
+│   ├── baseline_rag.py    # Single-Pass RAG direct prompting baseline engine
 │   ├── engine.py          # LangGraph StateGraph agent loop
 │   ├── parser.py          # Regex ReAct output parser & error handling
 │   ├── prompt.py          # System prompt & multi-hop ReAct examples
@@ -118,10 +115,18 @@ hotpot/
 │   ├── wikipedia.py       # Live Wikipedia API (Search & Lookup)
 │   └── local_retriever.py # Local HotpotQA corpus retriever
 ├── eval/
+│   ├── compare_results.py # Baseline vs ReAct comparative analysis script
 │   ├── dataset.py         # HotpotQA dataset loader
 │   ├── metrics.py         # Official Joint EM & Joint F1 evaluation metrics
 │   ├── plot_results.py    # Metric plotting & markdown report generator
-│   └── run_eval.py        # CLI benchmark runner
+│   ├── run_baseline.py    # CLI runner for Single-Pass RAG baseline
+│   └── run_eval.py        # CLI runner for ReAct Agent
+├── portfolio/
+│   ├── app.js             # Portfolio JavaScript trajectory renderer
+│   ├── index.html         # Portfolio trajectory visualizer HTML component
+│   ├── portfolio_trajectories.json # Saved trajectory JSON dataset
+│   ├── style.css          # Portfolio CSS stylesheet
+│   └── README.md          # Portfolio embedding guide
 ├── app/
 │   ├── web_ui.py          # Streamlit portfolio dashboard
 │   └── graph_view.py      # PyVis knowledge graph generator
@@ -129,6 +134,7 @@ hotpot/
 │   └── test_agent.py      # Pytest test suite
 ├── config.py              # Environment & model configurations
 ├── environment.yml        # Conda environment definition
+├── project_proposal.md    # Comprehensive project proposal
 ├── requirements.txt       # Pip requirements file
 └── README.md
 ```
