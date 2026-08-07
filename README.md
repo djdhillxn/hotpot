@@ -37,20 +37,24 @@ cd hotpot
 # Create and activate Conda environment
 conda env create -f environment.yml
 conda activate hotpot
+
+# Fix for Linux CXXABI libstdc++ compatibility on GCE
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
 ### Step 2: Launch vLLM Local Model Server on L4 GPU
 
-Start the OpenAI-compatible vLLM inference server using local GPU memory:
+Start the OpenAI-compatible vLLM inference server using local GPU memory (including `--enforce-eager` to bypass JIT compilation requiring `nvcc`):
 
 ```bash
-python -m vllm.entrypoints.openai.api_server \
+LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-7B-Instruct \
     --host 0.0.0.0 \
     --port 8000 \
     --dtype bfloat16 \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 8192
+    --max-model-len 8192 \
+    --enforce-eager
 ```
 
 Wait until vLLM outputs `Application startup complete` on `http://localhost:8000/v1`.
@@ -98,6 +102,23 @@ streamlit run app/web_ui.py --server.port 8501 --server.address 0.0.0.0
 ```
 
 Access the visual dashboard at `http://<GCE_EXTERNAL_IP>:8501`.
+
+---
+
+## Troubleshooting GCE Errors
+
+### 1. `RuntimeError: Could not find nvcc`
+Add `--enforce-eager` flag to your `vllm` launch command (as shown in Step 2 above). Alternatively, install CUDA toolkit into Conda:
+```bash
+conda install -n hotpot -c nvidia cuda-toolkit -y
+```
+
+### 2. `ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version CXXABI_1.3.15 not found`
+Run:
+```bash
+conda install -n hotpot -c conda-forge libstdcxx-ng sysroot_linux-64 -y
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+```
 
 ---
 
