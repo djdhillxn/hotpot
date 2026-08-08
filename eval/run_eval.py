@@ -5,11 +5,12 @@ import json
 import logging
 import argparse
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from config import LLM_MODEL_NAME, OPENAI_API_KEY, OPENAI_API_BASE
+from config import LLM_MODEL_NAME, OPENAI_API_KEY, OPENAI_API_BASE, MAX_AGENT_HOPS
 from agent.engine import run_react_agent
 from tools.wikipedia import WikipediaToolSet
 from tools.local_retriever import LocalHotpotRetriever
@@ -46,7 +47,64 @@ def get_llm_model(model_name=LLM_MODEL_NAME, api_base=OPENAI_API_BASE, api_key=O
     return ChatOpenAI(**kwargs)
 
 
-def run_benchmark(num_samples=None, mode="offline", model_name=LLM_MODEL_NAME, source="sample", api_base=OPENAI_API_BASE, output_dir="eval_results/react"):
+def process_single_question(sample, idx, total, mode, llm, max_hops, logger):
+    question = sample["question"]
+    gold_answer = sample["answer"]
+    gold_titles = [f[0] for f in sample.get("supporting_facts", [])]
+
+    if mode == "offline":
+        toolset = LocalHotpotRetriever(context_paragraphs=sample.get("context", []))
+    else:
+        toolset = WikipediaToolSet()
+
+    t0 = time.time()
+    agent_state = run_react_agent(question=question, llm=llm, toolset=toolset, max_hops=max_hops)
+    latency = time.time() - t0
+
+    pred_answer = agent_state.get("final_answer") or "No Answer"
+    visited_pages = agent_state.get("visited_pages", [])
+    step_count = agent_state.get("step_count", 0)
+
+    eval_metrics = evaluate_prediction(
+        prediction=pred_answer,
+        ground_truth=gold_answer,
+        visited_pages=visited_pages,
+        gold_titles=gold_titles,
+        step_count=step_count,
+    )
+    eval_metrics["latency"] = round(latency, 3)
+    eval_metrics["question"] = question
+    eval_metrics["pred_answer"] = pred_answer
+    eval_metrics["gold_answer"] = gold_answer
+    eval_metrics["timestamp"] = datetime.now().isoformat()
+    eval_metrics["idx"] = idx
+
+    logger.info(
+        f"Question [{idx}/{total}]: '{question}' | Pred: '{pred_answer}' | Gold: '{gold_answer}' | "
+        f"EM: {eval_metrics['exact_match']} | Joint F1: {eval_metrics['joint_f1']:.3f} | "
+        f"Steps: {step_count} | Latency: {latency:.2f}s"
+    )
+
+    trajectory_entry = {
+        "id": sample.get("id", f"sample_{idx}"),
+        "timestamp": datetime.now().isoformat(),
+        "question": question,
+        "ground_truth": gold_answer,
+        "predicted_answer": pred_answer,
+        "exact_match": eval_metrics["exact_match"],
+        "joint_f1": round(eval_metrics["joint_f1"], 3),
+        "step_count": step_count,
+        "latency_seconds": round(latency, 3),
+        "visited_pages": visited_pages,
+        "evidence_graph": agent_state.get("evidence_graph", []),
+        "steps": agent_state.get("steps", []),
+        "idx": idx,
+    }
+
+    return eval_metrics, trajectory_entry
+
+
+def run_benchmark(num_samples=None, mode="offline", model_name=LLM_MODEL_NAME, source="sample", api_base=OPENAI_API_BASE, output_dir="eval_results/react", concurrency=16, max_hops=MAX_AGENT_HOPS):
     logger, log_file = setup_logger(output_dir)
 
     info_msg = (
@@ -57,6 +115,8 @@ def run_benchmark(num_samples=None, mode="offline", model_name=LLM_MODEL_NAME, s
         f"Retrieval Mode: {mode.upper()}\n"
         f"Dataset Source: {source}\n"
         f"Samples Limit: {num_samples if num_samples else 'Full Set'}\n"
+        f"Concurrency Workers: {concurrency}\n"
+        f"Max Hops Limit: {max_hops}\n"
     )
     print(info_msg)
     logger.info(info_msg)
@@ -67,84 +127,61 @@ def run_benchmark(num_samples=None, mode="offline", model_name=LLM_MODEL_NAME, s
     results = []
     full_trajectories = []
     total_start_time = time.time()
+    total = len(samples)
 
-    pbar = tqdm(samples, desc="ReAct Agent Evaluation", unit="question", dynamic_ncols=True)
+    pbar = tqdm(total=total, desc="ReAct Agent Evaluation", unit="question", dynamic_ncols=True)
 
-    for idx, sample in enumerate(pbar, 1):
-        question = sample["question"]
-        gold_answer = sample["answer"]
-        gold_titles = [f[0] for f in sample.get("supporting_facts", [])]
+    if concurrency <= 1:
+        for idx, sample in enumerate(samples, 1):
+            eval_metrics, trajectory_entry = process_single_question(sample, idx, total, mode, llm, max_hops, logger)
+            results.append(eval_metrics)
+            full_trajectories.append(trajectory_entry)
 
-        logger.info(f"Question [{idx}/{len(samples)}]: {question}")
-        logger.info(f"Ground Truth: {gold_answer}")
+            current_em = sum(r["exact_match"] for r in results) / len(results)
+            current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
+            pbar.set_postfix({
+                "EM": f"{current_em * 100:.1f}%",
+                "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
+                "Steps": eval_metrics["step_count"],
+            })
+            pbar.update(1)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_idx = {
+                executor.submit(process_single_question, sample, idx, total, mode, llm, max_hops, logger): idx
+                for idx, sample in enumerate(samples, 1)
+            }
 
-        if mode == "offline":
-            toolset = LocalHotpotRetriever(context_paragraphs=sample.get("context", []))
-        else:
-            toolset = WikipediaToolSet()
+            for future in as_completed(future_to_idx):
+                try:
+                    eval_metrics, trajectory_entry = future.result()
+                    results.append(eval_metrics)
+                    full_trajectories.append(trajectory_entry)
 
-        t0 = time.time()
-        agent_state = run_react_agent(question=question, llm=llm, toolset=toolset)
-        latency = time.time() - t0
+                    current_em = sum(r["exact_match"] for r in results) / len(results)
+                    current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
+                    pbar.set_postfix({
+                        "EM": f"{current_em * 100:.1f}%",
+                        "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
+                        "Steps": eval_metrics["step_count"],
+                    })
+                    pbar.update(1)
+                except Exception as e:
+                    logger.error(f"Error processing question: {str(e)}")
+                    pbar.update(1)
 
-        pred_answer = agent_state.get("final_answer") or "No Answer"
-        visited_pages = agent_state.get("visited_pages", [])
-        step_count = agent_state.get("step_count", 0)
-
-        eval_metrics = evaluate_prediction(
-            prediction=pred_answer,
-            ground_truth=gold_answer,
-            visited_pages=visited_pages,
-            gold_titles=gold_titles,
-            step_count=step_count,
-        )
-        eval_metrics["latency"] = round(latency, 3)
-        eval_metrics["question"] = question
-        eval_metrics["pred_answer"] = pred_answer
-        eval_metrics["gold_answer"] = gold_answer
-        eval_metrics["timestamp"] = datetime.now().isoformat()
-
-        results.append(eval_metrics)
-
-        current_em = sum(r["exact_match"] for r in results) / len(results)
-        current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
-        pbar.set_postfix({
-            "EM": f"{current_em * 100:.1f}%",
-            "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
-            "Steps": step_count,
-        })
-
-        logger.info(
-            f"Prediction: '{pred_answer}' | EM: {eval_metrics['exact_match']} | "
-            f"F1: {eval_metrics['f1']:.3f} | Joint F1: {eval_metrics['joint_f1']:.3f} | "
-            f"Steps: {step_count} | Latency: {latency:.2f}s"
-        )
-
-        trajectory_entry = {
-            "id": sample.get("id", f"sample_{idx}"),
-            "timestamp": datetime.now().isoformat(),
-            "question": question,
-            "ground_truth": gold_answer,
-            "predicted_answer": pred_answer,
-            "exact_match": eval_metrics["exact_match"],
-            "joint_f1": round(eval_metrics["joint_f1"], 3),
-            "step_count": step_count,
-            "latency_seconds": round(latency, 3),
-            "visited_pages": visited_pages,
-            "evidence_graph": agent_state.get("evidence_graph", []),
-            "steps": agent_state.get("steps", []),
-        }
-        full_trajectories.append(trajectory_entry)
+    results.sort(key=lambda r: r.get("idx", 0))
+    full_trajectories.sort(key=lambda t: t.get("idx", 0))
 
     total_time = time.time() - total_start_time
     total_count = len(results)
-    avg_em = sum(r["exact_match"] for r in results) / total_count
-    avg_f1 = sum(r["f1"] for r in results) / total_count
-    avg_sp_f1 = sum(r["sp_f1"] for r in results) / total_count
-    avg_joint_em = sum(r["joint_em"] for r in results) / total_count
-    avg_joint_f1 = sum(r["joint_f1"] for r in results) / total_count
-    avg_steps = sum(r["step_count"] for r in results) / total_count
-    avg_lat = sum(r["latency"] for r in results) / total_count
+    avg_em = sum(r["exact_match"] for r in results) / total_count if total_count else 0
+    avg_f1 = sum(r["f1"] for r in results) / total_count if total_count else 0
+    avg_sp_f1 = sum(r["sp_f1"] for r in results) / total_count if total_count else 0
+    avg_joint_em = sum(r["joint_em"] for r in results) / total_count if total_count else 0
+    avg_joint_f1 = sum(r["joint_f1"] for r in results) / total_count if total_count else 0
+    avg_steps = sum(r["step_count"] for r in results) / total_count if total_count else 0
+    avg_lat = sum(r["latency"] for r in results) / total_count if total_count else 0
 
     summary_text = (
         "\n=== OFFICIAL HOTPOTQA LEADERBOARD METRICS ===\n"
@@ -190,6 +227,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
     parser.add_argument("--output-dir", type=str, default="eval_results/react", help="Directory for outputs")
+    parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
+    parser.add_argument("--max-hops", type=int, default=MAX_AGENT_HOPS, help="Maximum hops per question")
 
     args = parser.parse_args()
     run_benchmark(
@@ -199,4 +238,6 @@ if __name__ == "__main__":
         source=args.source,
         api_base=args.api_base,
         output_dir=args.output_dir,
+        concurrency=args.concurrency,
+        max_hops=args.max_hops,
     )

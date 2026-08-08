@@ -8,7 +8,7 @@ LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
 
-MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
+MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "5"))
 WIKIPEDIA_USER_AGENT = os.getenv(
     "USER_AGENT", "HotpotQAReActAgent/1.0 (https://github.com/example/hotpot)"
 )
