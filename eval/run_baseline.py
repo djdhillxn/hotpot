@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from tqdm import tqdm
@@ -48,6 +49,187 @@ def get_llm_model(model_name=LLM_MODEL_NAME, api_base=OPENAI_API_BASE, api_key=O
     )
 
 
+def _sample_metadata(sample):
+    gold_supporting_facts = sample.get("supporting_facts", []) or []
+    gold_titles = list(dict.fromkeys(
+        fact[0]
+        for fact in gold_supporting_facts
+        if isinstance(fact, (list, tuple)) and len(fact) == 2
+    ))
+    return gold_supporting_facts, gold_titles, context_diagnostics(sample)
+
+
+def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_backend=None, top_k=7):
+    question = sample["question"]
+    gold_answer = sample["answer"]
+    gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
+
+    logger.info(f"Question [{idx}/{total}]: {question}")
+    logger.info(f"Ground Truth: {gold_answer}")
+
+    if mode == "offline":
+        toolset = LocalHotpotRetriever(context_paragraphs=sample.get("context", []))
+    elif mode == "fullwiki":
+        if fullwiki_backend is None:
+            raise RuntimeError("FullWiki backend was not initialized.")
+        toolset = fullwiki_backend.create_session(
+            search_top_k=top_k,
+            max_observation_chars=24000,
+        )
+    else:
+        toolset = WikipediaToolSet()
+
+    t0 = time.time()
+    agent_state = run_single_pass_rag(question=question, llm=llm, toolset=toolset)
+    latency = time.time() - t0
+
+    pred_answer = agent_state.get("final_answer") or "No Answer"
+    predicted_supporting_facts = agent_state.get("predicted_supporting_facts", []) or []
+    observed_supporting_facts = agent_state.get("observed_supporting_facts", []) or []
+    invalid_supporting_facts = agent_state.get("invalid_supporting_facts", []) or []
+    visited_pages = agent_state.get("visited_pages", [])
+
+    eval_metrics = evaluate_prediction(
+        prediction=pred_answer,
+        ground_truth=gold_answer,
+        predicted_supporting_facts=predicted_supporting_facts,
+        gold_supporting_facts=gold_supporting_facts,
+        visited_pages=visited_pages,
+        gold_titles=gold_titles,
+        step_count=1,
+    )
+    eval_metrics.update({
+        "id": str(sample.get("id", f"sample_{idx}")),
+        "idx": idx,
+        "question": question,
+        "question_type": sample.get("type", "unknown"),
+        "difficulty_level": sample.get("level", "unknown"),
+        "pred_answer": pred_answer,
+        "gold_answer": gold_answer,
+        "predicted_supporting_facts": predicted_supporting_facts,
+        "observed_supporting_facts": observed_supporting_facts,
+        "invalid_supporting_facts": invalid_supporting_facts,
+        "invalid_supporting_fact_count": len(invalid_supporting_facts),
+        "gold_supporting_facts": gold_supporting_facts,
+        "visited_pages": visited_pages,
+        "latency": round(latency, 3),
+        "timestamp": datetime.now().isoformat(),
+        "failed": False,
+        "error": None,
+        **context_info,
+    })
+
+    logger.info(
+        f"Prediction: '{pred_answer}' | EM: {eval_metrics['exact_match']} | "
+        f"F1: {eval_metrics['f1']:.3f} | SP F1: {eval_metrics['sp_f1']:.3f} | "
+        f"Joint F1: {eval_metrics['joint_f1']:.3f} | Latency: {latency:.2f}s"
+    )
+
+    trajectory_entry = {
+        "id": eval_metrics["id"],
+        "idx": idx,
+        "timestamp": eval_metrics["timestamp"],
+        "question": question,
+        "question_type": eval_metrics["question_type"],
+        "difficulty_level": eval_metrics["difficulty_level"],
+        "ground_truth": gold_answer,
+        "predicted_answer": pred_answer,
+        "gold_supporting_facts": gold_supporting_facts,
+        "predicted_supporting_facts": predicted_supporting_facts,
+        "observed_supporting_facts": observed_supporting_facts,
+        "invalid_supporting_facts": invalid_supporting_facts,
+        "exact_match": eval_metrics["exact_match"],
+        "answer_f1": round(eval_metrics["f1"], 6),
+        "supporting_fact_em": eval_metrics["sp_em"],
+        "supporting_fact_f1": round(eval_metrics["sp_f1"], 6),
+        "joint_em": eval_metrics["joint_em"],
+        "joint_f1": round(eval_metrics["joint_f1"], 6),
+        "supporting_document_f1": round(eval_metrics["doc_f1"], 6),
+        "step_count": 1,
+        "latency_seconds": round(latency, 3),
+        "visited_pages": visited_pages,
+        "context_titles": context_info["context_titles"],
+        "gold_titles_in_context": context_info["gold_titles_in_context"],
+        "gold_document_recall_in_context": context_info["gold_document_recall_in_context"],
+        "gold_supporting_fact_recall_in_context": context_info["gold_supporting_fact_recall_in_context"],
+        "all_gold_supporting_facts_available": context_info["all_gold_supporting_facts_available"],
+        "evidence_graph": agent_state.get("evidence_graph", []),
+        "steps": agent_state.get("steps", []),
+        "error": None,
+    }
+
+    return eval_metrics, trajectory_entry
+
+
+def build_failure_record(sample, idx, error):
+    gold_answer = sample.get("answer", "")
+    gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
+    metrics = evaluate_prediction(
+        prediction="No Answer",
+        ground_truth=gold_answer,
+        predicted_supporting_facts=[],
+        gold_supporting_facts=gold_supporting_facts,
+        visited_pages=[],
+        gold_titles=gold_titles,
+        step_count=0,
+    )
+    timestamp = datetime.now().isoformat()
+    qid = str(sample.get("id", f"sample_{idx}"))
+    metrics.update({
+        "id": qid,
+        "idx": idx,
+        "question": sample.get("question", ""),
+        "question_type": sample.get("type", "unknown"),
+        "difficulty_level": sample.get("level", "unknown"),
+        "pred_answer": "No Answer",
+        "gold_answer": gold_answer,
+        "predicted_supporting_facts": [],
+        "observed_supporting_facts": [],
+        "invalid_supporting_facts": [],
+        "invalid_supporting_fact_count": 0,
+        "gold_supporting_facts": gold_supporting_facts,
+        "visited_pages": [],
+        "latency": 0.0,
+        "timestamp": timestamp,
+        "failed": True,
+        "error": str(error),
+        **context_info,
+    })
+    trajectory = {
+        "id": qid,
+        "idx": idx,
+        "timestamp": timestamp,
+        "question": sample.get("question", ""),
+        "question_type": sample.get("type", "unknown"),
+        "difficulty_level": sample.get("level", "unknown"),
+        "ground_truth": gold_answer,
+        "predicted_answer": "No Answer",
+        "gold_supporting_facts": gold_supporting_facts,
+        "predicted_supporting_facts": [],
+        "observed_supporting_facts": [],
+        "invalid_supporting_facts": [],
+        "exact_match": metrics["exact_match"],
+        "answer_f1": metrics["f1"],
+        "supporting_fact_em": metrics["sp_em"],
+        "supporting_fact_f1": metrics["sp_f1"],
+        "joint_em": metrics["joint_em"],
+        "joint_f1": metrics["joint_f1"],
+        "supporting_document_f1": metrics["doc_f1"],
+        "step_count": 0,
+        "latency_seconds": 0.0,
+        "visited_pages": [],
+        "context_titles": context_info["context_titles"],
+        "gold_titles_in_context": context_info["gold_titles_in_context"],
+        "gold_document_recall_in_context": context_info["gold_document_recall_in_context"],
+        "gold_supporting_fact_recall_in_context": context_info["gold_supporting_fact_recall_in_context"],
+        "all_gold_supporting_facts_available": context_info["all_gold_supporting_facts_available"],
+        "evidence_graph": [],
+        "steps": [],
+        "error": str(error),
+    }
+    return metrics, trajectory
+
+
 def run_baseline_benchmark(
     num_samples=None,
     mode="offline",
@@ -58,6 +240,7 @@ def run_baseline_benchmark(
     retriever="hybrid",
     index_dir=FULLWIKI_INDEX_DIR,
     top_k=7,
+    concurrency=16,
 ):
     logger, log_file = setup_logger(output_dir)
     run_started_at = datetime.now().isoformat()
@@ -70,6 +253,7 @@ def run_baseline_benchmark(
         f"Retrieval Mode: {mode.upper()}\n"
         f"Dataset Source: {source}\n"
         f"Samples Limit: {num_samples if num_samples else 'Full Set'}\n"
+        f"Concurrency Workers: {concurrency}\n"
         f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
         f"Retrieved document budget: {top_k if mode == 'fullwiki' else 1}\n"
     )
@@ -95,133 +279,61 @@ def run_baseline_benchmark(
     results = []
     full_trajectories = []
     total_start_time = time.time()
-    failed_count = 0
+    total = len(samples)
 
-    pbar = tqdm(samples, desc="Single-Pass RAG Evaluation", unit="question", dynamic_ncols=True)
+    pbar = tqdm(total=total, desc="Single-Pass RAG Evaluation", unit="question", dynamic_ncols=True)
 
-    for idx, sample in enumerate(pbar, 1):
-        question = sample["question"]
-        gold_answer = sample["answer"]
-        gold_supporting_facts = sample.get("supporting_facts", []) or []
-        gold_titles = list(dict.fromkeys(
-            fact[0]
-            for fact in gold_supporting_facts
-            if isinstance(fact, (list, tuple)) and len(fact) == 2
-        ))
-        context_info = context_diagnostics(sample)
+    if concurrency <= 1:
+        for idx, sample in enumerate(samples, 1):
+            try:
+                eval_metrics, trajectory_entry = process_single_question(
+                    sample, idx, total, mode, llm, logger, fullwiki_backend, top_k
+                )
+            except Exception as exc:
+                logger.exception(f"Error processing question {idx}: {exc}")
+                eval_metrics, trajectory_entry = build_failure_record(sample, idx, exc)
+            results.append(eval_metrics)
+            full_trajectories.append(trajectory_entry)
 
-        logger.info(f"Question [{idx}/{len(samples)}]: {question}")
-        logger.info(f"Ground Truth: {gold_answer}")
-
-        if mode == "offline":
-            toolset = LocalHotpotRetriever(context_paragraphs=sample.get("context", []))
-        elif mode == "fullwiki":
-            toolset = fullwiki_backend.create_session(
-                search_top_k=top_k,
-                max_observation_chars=24000,
-            )
-        else:
-            toolset = WikipediaToolSet()
-
-        t0 = time.time()
-        error = None
-        try:
-            agent_state = run_single_pass_rag(question=question, llm=llm, toolset=toolset)
-        except Exception as exc:
-            logger.exception(f"Error processing question {idx}: {exc}")
-            error = str(exc)
-            failed_count += 1
-            agent_state = {
-                "final_answer": "No Answer",
-                "predicted_supporting_facts": [],
-                "visited_pages": [],
-                "evidence_graph": [],
-                "steps": [],
+            current_em = sum(r["exact_match"] for r in results) / len(results)
+            current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
+            pbar.set_postfix({
+                "EM": f"{current_em * 100:.1f}%",
+                "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
+            })
+            pbar.update(1)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_meta = {
+                executor.submit(
+                    process_single_question, sample, idx, total, mode, llm, logger,
+                    fullwiki_backend, top_k
+                ): (idx, sample)
+                for idx, sample in enumerate(samples, 1)
             }
-        latency = time.time() - t0
 
-        pred_answer = agent_state.get("final_answer") or "No Answer"
-        predicted_supporting_facts = agent_state.get("predicted_supporting_facts", []) or []
-        observed_supporting_facts = agent_state.get("observed_supporting_facts", []) or []
-        invalid_supporting_facts = agent_state.get("invalid_supporting_facts", []) or []
-        visited_pages = agent_state.get("visited_pages", [])
+            for future in as_completed(future_to_meta):
+                idx, sample = future_to_meta[future]
+                try:
+                    eval_metrics, trajectory_entry = future.result()
+                except Exception as exc:
+                    logger.exception(f"Error processing question {idx}: {exc}")
+                    eval_metrics, trajectory_entry = build_failure_record(sample, idx, exc)
 
-        eval_metrics = evaluate_prediction(
-            prediction=pred_answer,
-            ground_truth=gold_answer,
-            predicted_supporting_facts=predicted_supporting_facts,
-            gold_supporting_facts=gold_supporting_facts,
-            visited_pages=visited_pages,
-            gold_titles=gold_titles,
-            step_count=1,
-        )
-        eval_metrics.update({
-            "id": str(sample.get("id", f"sample_{idx}")),
-            "idx": idx,
-            "question": question,
-            "question_type": sample.get("type", "unknown"),
-            "difficulty_level": sample.get("level", "unknown"),
-            "pred_answer": pred_answer,
-            "gold_answer": gold_answer,
-            "predicted_supporting_facts": predicted_supporting_facts,
-            "observed_supporting_facts": observed_supporting_facts,
-            "invalid_supporting_facts": invalid_supporting_facts,
-            "invalid_supporting_fact_count": len(invalid_supporting_facts),
-            "gold_supporting_facts": gold_supporting_facts,
-            "visited_pages": visited_pages,
-            "latency": round(latency, 3),
-            "timestamp": datetime.now().isoformat(),
-            "failed": error is not None,
-            "error": error,
-            **context_info,
-        })
-        results.append(eval_metrics)
+                results.append(eval_metrics)
+                full_trajectories.append(trajectory_entry)
 
-        current_em = sum(r["exact_match"] for r in results) / len(results)
-        current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
-        pbar.set_postfix({
-            "EM": f"{current_em * 100:.1f}%",
-            "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
-        })
+                current_em = sum(r["exact_match"] for r in results) / len(results)
+                current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
+                pbar.set_postfix({
+                    "EM": f"{current_em * 100:.1f}%",
+                    "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
+                })
+                pbar.update(1)
 
-        logger.info(
-            f"Prediction: '{pred_answer}' | EM: {eval_metrics['exact_match']} | "
-            f"F1: {eval_metrics['f1']:.3f} | SP F1: {eval_metrics['sp_f1']:.3f} | "
-            f"Joint F1: {eval_metrics['joint_f1']:.3f} | Latency: {latency:.2f}s"
-        )
-
-        full_trajectories.append({
-            "id": eval_metrics["id"],
-            "idx": idx,
-            "timestamp": eval_metrics["timestamp"],
-            "question": question,
-            "question_type": eval_metrics["question_type"],
-            "difficulty_level": eval_metrics["difficulty_level"],
-            "ground_truth": gold_answer,
-            "predicted_answer": pred_answer,
-            "gold_supporting_facts": gold_supporting_facts,
-            "predicted_supporting_facts": predicted_supporting_facts,
-            "observed_supporting_facts": observed_supporting_facts,
-            "invalid_supporting_facts": invalid_supporting_facts,
-            "exact_match": eval_metrics["exact_match"],
-            "answer_f1": round(eval_metrics["f1"], 6),
-            "supporting_fact_em": eval_metrics["sp_em"],
-            "supporting_fact_f1": round(eval_metrics["sp_f1"], 6),
-            "joint_em": eval_metrics["joint_em"],
-            "joint_f1": round(eval_metrics["joint_f1"], 6),
-            "supporting_document_f1": round(eval_metrics["doc_f1"], 6),
-            "step_count": 1,
-            "latency_seconds": round(latency, 3),
-            "visited_pages": visited_pages,
-            "context_titles": context_info["context_titles"],
-            "gold_titles_in_context": context_info["gold_titles_in_context"],
-            "gold_document_recall_in_context": context_info["gold_document_recall_in_context"],
-            "gold_supporting_fact_recall_in_context": context_info["gold_supporting_fact_recall_in_context"],
-            "all_gold_supporting_facts_available": context_info["all_gold_supporting_facts_available"],
-            "evidence_graph": agent_state.get("evidence_graph", []),
-            "steps": agent_state.get("steps", []),
-            "error": error,
-        })
+    pbar.close()
+    results.sort(key=lambda r: r.get("idx", 0))
+    full_trajectories.sort(key=lambda t: t.get("idx", 0))
 
     total_time = time.time() - total_start_time
     total_count = len(results)
@@ -235,9 +347,10 @@ def run_baseline_benchmark(
     avg_lat = sum(r["latency"] for r in results) / total_count if total_count else 0
     avg_context_sp_recall = sum(r["gold_supporting_fact_recall_in_context"] for r in results) / total_count if total_count else 0
     full_context_count = sum(r["all_gold_supporting_facts_available"] for r in results)
+    failed_count = sum(bool(r.get("failed")) for r in results)
 
     summary_text = (
-        "\n=== HOTPOTQA DEV METRICS (OFFICIAL FORMULAS) ===\n"
+        "\n=== SINGLE-PASS RAG BASELINE METRICS ===\n"
         f"Answer Exact Match (EM):      {avg_em * 100:.1f}%\n"
         f"Answer F1 Score:              {avg_f1 * 100:.1f}%\n"
         f"Supporting Facts EM:          {avg_sp_em * 100:.1f}%\n"
@@ -267,7 +380,7 @@ def run_baseline_benchmark(
     manifest_path = write_run_manifest(
         output_dir,
         {
-            "runner": "single_pass_rag",
+            "runner": "baseline",
             "started_at": run_started_at,
             "finished_at": datetime.now().isoformat(),
             "model": model_name,
@@ -275,13 +388,12 @@ def run_baseline_benchmark(
             "retrieval_mode": mode,
             "dataset_source": source,
             "requested_samples": num_samples,
-            "dataset_size": len(samples),
+            "dataset_size": total,
             "completed_records": total_count,
             "failed_records": failed_count,
-            "retrieval_calls_per_question": 1,
-            "generation_calls_per_question": 1,
-            "retrieval_document_budget": top_k if mode == "fullwiki" else 1,
+            "concurrency": concurrency,
             "retriever": retriever if mode == "fullwiki" else mode,
+            "retrieved_document_budget": top_k if mode == "fullwiki" else 1,
             "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
             "total_evaluation_seconds": round(total_time, 3),
             "official_prediction_file": os.path.basename(prediction_path),
@@ -305,11 +417,12 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
-    parser.add_argument("--top-k", type=int, default=7, help="Documents exposed to the one-shot RAG baseline")
+    parser.add_argument("--top-k", type=int, default=7, help="Documents retrieved in single-pass FullWiki search")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
-    parser.add_argument("--output-dir", type=str, default="eval_results/baseline", help="Directory for baseline outputs")
+    parser.add_argument("--output-dir", type=str, default="eval_results/baseline", help="Directory for outputs")
+    parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
 
     args = parser.parse_args()
     run_baseline_benchmark(
@@ -322,4 +435,5 @@ if __name__ == "__main__":
         retriever=args.retriever,
         index_dir=args.index_dir,
         top_k=args.top_k,
+        concurrency=args.concurrency,
     )
