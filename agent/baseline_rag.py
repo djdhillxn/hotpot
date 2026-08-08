@@ -42,10 +42,20 @@ def run_single_pass_rag(question, llm, toolset=None):
 
     retrieval = getattr(toolset, "last_result", None)
     observed_supporting_facts = []
-    if isinstance(retrieval, dict) and retrieval.get("title"):
-        for sentence in retrieval.get("sentences", []):
-            if isinstance(sentence, dict) and "sent_id" in sentence:
-                observed_supporting_facts.append([retrieval["title"], int(sentence["sent_id"])])
+    if isinstance(retrieval, dict):
+        hits = retrieval.get("hits") or []
+        if hits:
+            for hit in hits:
+                title = hit.get("title")
+                for sentence in hit.get("sentences", []):
+                    if title and isinstance(sentence, dict) and "sent_id" in sentence:
+                        fact = [title, int(sentence["sent_id"])]
+                        if fact not in observed_supporting_facts:
+                            observed_supporting_facts.append(fact)
+        elif retrieval.get("title"):
+            for sentence in retrieval.get("sentences", []):
+                if isinstance(sentence, dict) and "sent_id" in sentence:
+                    observed_supporting_facts.append([retrieval["title"], int(sentence["sent_id"])])
 
     observed_set = {tuple(fact) for fact in observed_supporting_facts}
     supporting_facts = [fact for fact in parsed_supporting_facts if tuple(fact) in observed_set]
@@ -75,7 +85,8 @@ def run_single_pass_rag(question, llm, toolset=None):
         }
     ]
     state["evidence_graph"] = [
-        {"source": "Question", "target": visited_pages[0] if visited_pages else "Context", "label": "Single-pass search"}
-    ]
+        {"source": "Question", "target": page, "label": "Single-pass retrieval"}
+        for page in visited_pages
+    ] or [{"source": "Question", "target": "Context", "label": "Single-pass retrieval"}]
 
     return state

@@ -9,3 +9,5 @@ eval_results/
 *.log
 venv/
 .DS_Store
+data/fullwiki/
+indexes/fullwiki/

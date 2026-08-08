@@ -103,13 +103,23 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
             retrieval = getattr(toolset, "last_result", None)
             if retrieval is not None:
                 updated_steps[-1]["retrieval"] = retrieval
-                title = retrieval.get("title") if isinstance(retrieval, dict) else None
-                sentences = retrieval.get("sentences", []) if isinstance(retrieval, dict) else []
-                for sentence in sentences:
-                    if title and isinstance(sentence, dict) and "sent_id" in sentence:
-                        fact = [title, int(sentence["sent_id"])]
-                        if fact not in observed_supporting_facts:
-                            observed_supporting_facts.append(fact)
+                if isinstance(retrieval, dict):
+                    retrieval_hits = retrieval.get("hits") or []
+                    if retrieval_hits:
+                        for hit in retrieval_hits:
+                            title = hit.get("title")
+                            for sentence in hit.get("sentences", []):
+                                if title and isinstance(sentence, dict) and "sent_id" in sentence:
+                                    fact = [title, int(sentence["sent_id"])]
+                                    if fact not in observed_supporting_facts:
+                                        observed_supporting_facts.append(fact)
+                    else:
+                        title = retrieval.get("title")
+                        for sentence in retrieval.get("sentences", []):
+                            if title and isinstance(sentence, dict) and "sent_id" in sentence:
+                                fact = [title, int(sentence["sent_id"])]
+                                if fact not in observed_supporting_facts:
+                                    observed_supporting_facts.append(fact)
 
         new_scratchpad = (
             state.get("scratchpad", "")

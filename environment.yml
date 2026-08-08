@@ -6,6 +6,7 @@ dependencies:
   - python=3.11
   - libstdcxx-ng
   - sysroot_linux-64
+  - openjdk=21
   - pip
   - pip:
       - langgraph>=0.2.0
@@ -26,3 +27,8 @@ dependencies:
       - matplotlib>=3.8.0
       - seaborn>=0.13.0
       - vllm>=0.6.0
+      - pyserini==1.6.0
+      - sentence-transformers>=3.0.0,<6.0
+      - faiss-cpu>=1.8.0,<2.0
+      - numpy>=1.26
+      - tqdm>=4.66

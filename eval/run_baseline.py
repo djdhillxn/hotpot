@@ -11,13 +11,14 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agent.baseline_rag import run_single_pass_rag
-from config import LLM_MODEL_NAME, OPENAI_API_BASE, OPENAI_API_KEY
+from config import FULLWIKI_INDEX_DIR, LLM_MODEL_NAME, OPENAI_API_BASE, OPENAI_API_KEY
 from eval.artifacts import context_diagnostics, write_official_files, write_run_manifest
 from eval.dataset import load_hotpot_dataset
 from eval.metrics import evaluate_prediction
 from eval.plot_results import generate_eval_plots_and_report
 from tools.local_retriever import LocalHotpotRetriever
 from tools.wikipedia import WikipediaToolSet
+from retrieval.fullwiki_retriever import FullWikiSearchBackend
 
 
 def setup_logger(output_dir):
@@ -54,6 +55,9 @@ def run_baseline_benchmark(
     source="sample",
     api_base=OPENAI_API_BASE,
     output_dir="eval_results/baseline",
+    retriever="hybrid",
+    index_dir=FULLWIKI_INDEX_DIR,
+    top_k=7,
 ):
     logger, log_file = setup_logger(output_dir)
     run_started_at = datetime.now().isoformat()
@@ -66,6 +70,8 @@ def run_baseline_benchmark(
         f"Retrieval Mode: {mode.upper()}\n"
         f"Dataset Source: {source}\n"
         f"Samples Limit: {num_samples if num_samples else 'Full Set'}\n"
+        f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
+        f"Retrieved document budget: {top_k if mode == 'fullwiki' else 1}\n"
     )
     if mode == "live":
         info_msg += (
@@ -77,6 +83,14 @@ def run_baseline_benchmark(
 
     samples = load_hotpot_dataset(num_samples=num_samples, source=source)
     llm = get_llm_model(model_name=model_name, api_base=api_base)
+    fullwiki_backend = None
+    if mode == "fullwiki":
+        fullwiki_backend = FullWikiSearchBackend(
+            bm25_index_dir=os.path.join(index_dir, "bm25"),
+            dense_index_path=os.path.join(index_dir, "dense.faiss"),
+            manifest_path=os.path.join(index_dir, "manifest.json"),
+            mode=retriever,
+        )
 
     results = []
     full_trajectories = []
@@ -101,6 +115,11 @@ def run_baseline_benchmark(
 
         if mode == "offline":
             toolset = LocalHotpotRetriever(context_paragraphs=sample.get("context", []))
+        elif mode == "fullwiki":
+            toolset = fullwiki_backend.create_session(
+                search_top_k=top_k,
+                max_observation_chars=24000,
+            )
         else:
             toolset = WikipediaToolSet()
 
@@ -261,6 +280,9 @@ def run_baseline_benchmark(
             "failed_records": failed_count,
             "retrieval_calls_per_question": 1,
             "generation_calls_per_question": 1,
+            "retrieval_document_budget": top_k if mode == "fullwiki" else 1,
+            "retriever": retriever if mode == "fullwiki" else mode,
+            "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
             "total_evaluation_seconds": round(total_time, 3),
             "official_prediction_file": os.path.basename(prediction_path),
             "official_gold_file": os.path.basename(gold_path),
@@ -280,7 +302,10 @@ def run_baseline_benchmark(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Single-Pass RAG Baseline Benchmark")
     parser.add_argument("--samples", type=int, default=None, help="Number of questions to test (default: all)")
-    parser.add_argument("--mode", choices=["offline", "live"], default="offline", help="Retrieval mode")
+    parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
+    parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
+    parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
+    parser.add_argument("--top-k", type=int, default=7, help="Documents exposed to the one-shot RAG baseline")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
@@ -294,4 +319,7 @@ if __name__ == "__main__":
         source=args.source,
         api_base=args.api_base,
         output_dir=args.output_dir,
+        retriever=args.retriever,
+        index_dir=args.index_dir,
+        top_k=args.top_k,
     )

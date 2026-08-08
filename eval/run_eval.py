@@ -12,13 +12,14 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agent.engine import run_react_agent
-from config import LLM_MODEL_NAME, MAX_AGENT_HOPS, OPENAI_API_BASE, OPENAI_API_KEY
+from config import FULLWIKI_INDEX_DIR, LLM_MODEL_NAME, MAX_AGENT_HOPS, OPENAI_API_BASE, OPENAI_API_KEY
 from eval.artifacts import context_diagnostics, write_official_files, write_run_manifest
 from eval.dataset import load_hotpot_dataset
 from eval.metrics import evaluate_prediction
 from eval.plot_results import generate_eval_plots_and_report
 from tools.local_retriever import LocalHotpotRetriever
 from tools.wikipedia import WikipediaToolSet
+from retrieval.fullwiki_retriever import FullWikiSearchBackend
 
 
 def setup_logger(output_dir):
@@ -59,13 +60,20 @@ def _sample_metadata(sample):
     return gold_supporting_facts, gold_titles, context_diagnostics(sample)
 
 
-def process_single_question(sample, idx, total, mode, llm, max_hops, logger):
+def process_single_question(sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend=None, search_top_k=1):
     question = sample["question"]
     gold_answer = sample["answer"]
     gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
 
     if mode == "offline":
         toolset = LocalHotpotRetriever(context_paragraphs=sample.get("context", []))
+    elif mode == "fullwiki":
+        if fullwiki_backend is None:
+            raise RuntimeError("FullWiki backend was not initialized.")
+        toolset = fullwiki_backend.create_session(
+            search_top_k=search_top_k,
+            max_observation_chars=2200,
+        )
     else:
         toolset = WikipediaToolSet()
 
@@ -228,6 +236,9 @@ def run_benchmark(
     output_dir="eval_results/react",
     concurrency=16,
     max_hops=MAX_AGENT_HOPS,
+    retriever="hybrid",
+    index_dir=FULLWIKI_INDEX_DIR,
+    search_top_k=1,
 ):
     logger, log_file = setup_logger(output_dir)
     run_started_at = datetime.now().isoformat()
@@ -242,6 +253,8 @@ def run_benchmark(
         f"Samples Limit: {num_samples if num_samples else 'Full Set'}\n"
         f"Concurrency Workers: {concurrency}\n"
         f"Max Hops Limit: {max_hops}\n"
+        f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
+        f"Documents per adaptive search: {search_top_k if mode == 'fullwiki' else 1}\n"
     )
     if mode == "live":
         info_msg += (
@@ -253,6 +266,14 @@ def run_benchmark(
 
     samples = load_hotpot_dataset(num_samples=num_samples, source=source)
     llm = get_llm_model(model_name=model_name, api_base=api_base)
+    fullwiki_backend = None
+    if mode == "fullwiki":
+        fullwiki_backend = FullWikiSearchBackend(
+            bm25_index_dir=os.path.join(index_dir, "bm25"),
+            dense_index_path=os.path.join(index_dir, "dense.faiss"),
+            manifest_path=os.path.join(index_dir, "manifest.json"),
+            mode=retriever,
+        )
 
     results = []
     full_trajectories = []
@@ -265,7 +286,7 @@ def run_benchmark(
         for idx, sample in enumerate(samples, 1):
             try:
                 eval_metrics, trajectory_entry = process_single_question(
-                    sample, idx, total, mode, llm, max_hops, logger
+                    sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend, search_top_k
                 )
             except Exception as exc:
                 logger.exception(f"Error processing question {idx}: {exc}")
@@ -284,7 +305,10 @@ def run_benchmark(
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             future_to_meta = {
-                executor.submit(process_single_question, sample, idx, total, mode, llm, max_hops, logger): (idx, sample)
+                executor.submit(
+                    process_single_question, sample, idx, total, mode, llm, max_hops, logger,
+                    fullwiki_backend, search_top_k
+                ): (idx, sample)
                 for idx, sample in enumerate(samples, 1)
             }
 
@@ -378,6 +402,10 @@ def run_benchmark(
             "failed_records": failed_count,
             "concurrency": concurrency,
             "max_hops": max_hops,
+            "documents_per_search": search_top_k if mode == "fullwiki" else 1,
+            "max_retrieval_document_budget": max_hops * search_top_k if mode == "fullwiki" else max_hops,
+            "retriever": retriever if mode == "fullwiki" else mode,
+            "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
             "total_evaluation_seconds": round(total_time, 3),
             "official_prediction_file": os.path.basename(prediction_path),
             "official_gold_file": os.path.basename(gold_path),
@@ -398,7 +426,10 @@ def run_benchmark(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run ReAct HotpotQA Benchmark")
     parser.add_argument("--samples", type=int, default=None, help="Number of questions to test (default: all)")
-    parser.add_argument("--mode", choices=["offline", "live"], default="offline", help="Retrieval mode")
+    parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
+    parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
+    parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
+    parser.add_argument("--top-k", type=int, default=1, help="Documents returned by each adaptive FullWiki search")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
@@ -416,4 +447,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         concurrency=args.concurrency,
         max_hops=args.max_hops,
+        retriever=args.retriever,
+        index_dir=args.index_dir,
+        search_top_k=args.top_k,
     )

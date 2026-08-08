@@ -1,54 +1,143 @@
 # ReAct Multi-Hop Question Answering Agent (HotpotQA FullWiki)
 
-A ReAct (Reasoning + Acting) Agent built using Python, LangGraph, and local vLLM inference on Google Compute Engine (GCE) NVIDIA L4 GPU (24GB VRAM) to solve the HotpotQA FullWiki multi-hop benchmark, featuring a side-by-side **Single-Pass RAG Baseline Comparison Study**.
+A retrieval-and-reasoning project that compares a **single-pass RAG baseline** against a **ReAct (Reason + Act) multi-hop agent** on HotpotQA FullWiki. Both systems use the same frozen `Qwen/Qwen2.5-7B-Instruct` model and the same global Wikipedia retrieval backend; the experimental difference is whether retrieval happens once from the original question or adaptively after each observation.
+
+## Final Benchmark Architecture
+
+```text
+Official HotpotQA Wikipedia (Oct. 1, 2017)
+        ~5M introductory paragraphs
+                    |
+        +-----------+-----------+
+        |                       |
+  Lucene BM25             BGE dense vectors
+   (Pyserini)          (bge-base-en-v1.5 + FAISS)
+        |                       |
+        +-----------+-----------+
+                    |
+          Reciprocal Rank Fusion
+                    |
+           shared FullWiki backend
+             /                \
+            /                  \
+Single-Pass RAG                ReAct
+1 query -> top 7 docs     up to 7 adaptive queries
+1 Qwen generation          top 1 doc/query -> Qwen
+            \                  /
+             HotpotQA official metrics
+```
+
+### Why the HotpotQA Wikipedia abstracts corpus?
+
+HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia articles. The project uses the official October 1, 2017 introductory-paragraph release (`enwiki-20171001-pages-meta-current-withlinks-abstracts.tar.bz2`, MD5 `01edf64cd120ecc03a2745352779514c`) rather than current live Wikipedia. The source sentence segmentation is preserved exactly, so retrieved evidence remains compatible with HotpotQA `[title, sentence_id]` supporting-fact evaluation.
+
+## Core Components
+
+- **Frozen LLM:** `Qwen/Qwen2.5-7B-Instruct`, served through local vLLM on an NVIDIA L4. No LLM fine-tuning or post-training.
+- **Sparse retrieval:** Lucene BM25 through Pyserini/Anserini.
+- **Dense retrieval:** `BAAI/bge-base-en-v1.5`, L2-normalized embeddings, persisted in a memory-efficient FAISS IVF-PQ index (`IVF4096,PQ96x8`). Corpus encoding is performed once during index construction; benchmark-time query encoding defaults to CPU so it does not compete with vLLM for the L4.
+- **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings. No dataset-specific fusion-weight sweep.
+- **Fair retrieval budget:** Single-pass RAG sees up to 7 documents from one retrieval. ReAct sees one document per adaptive search for at most 7 searches.
+- **ReAct controller:** LangGraph state machine enforcing Thought -> Action -> Observation, with delimiter-safe action parsing and a mandatory final synthesis call at the hop budget.
+- **Official-compatible evaluation:** Answer EM/F1, Supporting Fact EM/F1, Joint EM/F1, and evaluator-format `official_predictions.json`.
+- **Structured experiment artifacts:** complete trajectories, raw model outputs, sentence-level evidence, sparse/dense/fused ranks and scores, retrieval latency, run manifests, failures, and evidence graphs.
 
 ---
 
-## Model Selection & Hardware Optimization
+# End-to-End Execution Guide on GCE L4
 
-- **Finalized LLM**: `Qwen/Qwen2.5-7B-Instruct`
-- **Target Hardware**: Google Compute Engine (GCE) g2-standard-8 VM with 1x NVIDIA L4 GPU (24GB VRAM) and 32GB RAM.
-- **Why Qwen-2.5-7B-Instruct?**
-  - Leading open-source 7B model for instruction following, structured tool calling, and multi-step ReAct reasoning loops.
-  - Fits within ~14GB VRAM in bfloat16 precision, leaving 10GB VRAM for vLLM KV-cache memory, enabling 100+ tokens/sec local inference throughput.
+Target machine: `g2-standard-8`, NVIDIA L4 (24 GB), 32 GB system RAM, Ubuntu 22.04.
 
----
+## Step 1: Create or Update the Environment
 
-## Key Architecture & Features
-
-- Strict Agentic Control Loop: Built using LangGraph StateGraph enforcing an explicit Thought -> Action -> Observation cycle.
-- Single-Pass RAG Baseline Engine: Dedicated direct prompting engine (`agent/baseline_rag.py`) for comparative baseline study.
-- High-Throughput Concurrent Evaluation: Concurrent multi-threaded benchmark runner leveraging vLLM continuous batching for 15x faster evaluation throughput.
-- Dual Wikipedia Tool Suite:
-  - search[entity]: Searches Wikipedia API and retrieves lead section summaries.
-  - lookup[keyword]: Searches paragraphs within loaded Wikipedia pages for exact keyword matches.
-- Interactive Trajectory & Knowledge Graph Visualizer: Streamlit dashboard visualizing step-by-step reasoning traces and an interactive PyVis Knowledge Bridge Graph showing entity transitions.
-- HotpotQA-Compatible Evaluation: Predicts exact sentence-level supporting facts as `[Wikipedia title, sentence_id]`, uses the official answer/support/joint scoring formulas, and exports `official_predictions.json` in the format accepted by `hotpot_evaluate_v1.py`. Page-title retrieval overlap is retained separately as a non-leaderboard diagnostic.
-- Reproducible Trajectory Artifacts: Saves raw model outputs, sentence-labeled retrieval results, predicted/gold evidence, question metadata, candidate-context oracle coverage, run configuration, failures, and complete ReAct trajectories for later analysis and portfolio visualization.
-
-> **Current retrieval scope:** `--mode offline` searches the 10 candidate paragraphs supplied with each HotpotQA FullWiki dev example. The evaluator is official-compatible, but this is not yet a global Wikipedia retrieval backend; replacing the candidate-pool matcher with a shared FullWiki index is a separate architectural step.
-
----
-
-## End-to-End Execution Guide on GCE L4 GPU
-
-### Step 1: Clone Repository & Create Conda Environment
+Fresh environment:
 
 ```bash
 git clone https://github.com/your-username/hotpot.git
 cd hotpot
-
-# Create and activate Conda environment
 conda env create -f environment.yml
 conda activate hotpot
-
-# Fix for Linux CXXABI libstdc++ compatibility on GCE
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
-### Step 2: Launch vLLM Local Model Server on L4 GPU
+If the existing `hotpot` environment predates FullWiki retrieval support:
 
-Start the OpenAI-compatible vLLM inference server using local GPU memory:
+```bash
+conda activate hotpot
+conda env update -f environment.yml --prune
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+```
+
+Verify the retrieval runtime:
+
+```bash
+python --version
+java -version
+```
+
+The repository intentionally pins `pyserini==1.6.0`, the Python 3.11-compatible release line. Pyserini 1.6.0 requires Java 21, which is installed by `environment.yml`.
+
+## Step 2: Build the Global FullWiki Retrieval Indexes
+
+Do this **before launching vLLM**, because the one-time BGE corpus encoding uses the L4.
+
+```bash
+python retrieval/build_fullwiki_index.py
+```
+
+This single command:
+
+1. downloads the official HotpotQA Wikipedia intro archive if needed;
+2. verifies its official MD5 checksum;
+3. streams the archive into sharded JSONL without materializing an expanded Wikipedia dump;
+4. preserves every source sentence and its 0-based sentence ID;
+5. builds a Lucene BM25 index with stored raw documents;
+6. encodes the same corpus with `BAAI/bge-base-en-v1.5`;
+7. builds a FAISS IVF-PQ dense index;
+8. verifies Lucene/FAISS document counts; and
+9. writes `indexes/fullwiki/manifest.json` with the exact corpus/index configuration.
+
+Generated data are deliberately ignored by Git:
+
+```text
+data/fullwiki/
+indexes/fullwiki/
+```
+
+The build is idempotent. Existing verified stages are reused unless an explicit `--force-*` flag is supplied.
+
+Useful overrides:
+
+```bash
+python retrieval/build_fullwiki_index.py --help
+```
+
+## Step 3: Verify FullWiki Retrieval Before Spending LLM Compute
+
+Run a first-stage retrieval sanity check over the validation questions:
+
+```bash
+python retrieval/evaluate_retrieval.py \
+    --source official_json \
+    --modes bm25 dense hybrid \
+    --ks 1 5 10 20
+```
+
+This does **not** call Qwen. It reports mean gold-document Recall@K and the rate at which all gold documents are recovered for BM25, dense, and hybrid retrieval, and saves the per-question results to:
+
+```text
+eval_results/retrieval/retrieval_results.json
+```
+
+For an initial smoke run:
+
+```bash
+python retrieval/evaluate_retrieval.py --source official_json --samples 100
+```
+
+## Step 4: Launch the Local Qwen/vLLM Server
+
+The dense corpus is already encoded, so benchmark-time dense query embeddings run on CPU by default. The L4 can therefore be dedicated to Qwen.
 
 ```bash
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python -m vllm.entrypoints.openai.api_server \
@@ -61,70 +150,179 @@ LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python -m vllm.entrypoints.op
     --enforce-eager
 ```
 
-Wait until vLLM outputs `Application startup complete` on `http://localhost:8000/v1`.
+Wait for `Application startup complete` on `http://localhost:8000/v1`.
 
-### Step 3: Run Unit Tests
-
-Verify the ReAct parser, baseline engine, retrieval tools, and LangGraph engine state machine:
+## Step 5: Run Tests
 
 ```bash
 PYTHONPATH=. pytest tests/
 ```
 
-### Step 4: Run Single-Pass RAG Baseline Benchmark
+The retrieval tests do not require the full Wikipedia indexes and exercise corpus parsing, sentence-ID preservation, RRF, and the per-question FullWiki retriever contract.
 
-Execute Single-Pass RAG evaluation to establish the non-agentic baseline:
+## Step 6: Run the Budget-Matched Single-Pass FullWiki RAG Baseline
 
-```bash
-python eval/run_baseline.py --mode offline --source official_json --output-dir eval_results/baseline
-```
-
-### Step 5: Run High-Throughput ReAct Multi-Hop Agent Benchmark
-
-Execute concurrent ReAct Agent evaluation using 16 worker threads (leveraging vLLM continuous batching for a 15x speedup):
+One hybrid retrieval from the original question, top 7 Wikipedia paragraphs, one Qwen generation:
 
 ```bash
-python eval/run_eval.py --mode offline --source official_json --concurrency 16 --max-hops 5 --output-dir eval_results/react
+python eval/run_baseline.py \
+    --mode fullwiki \
+    --retriever hybrid \
+    --top-k 7 \
+    --source official_json \
+    --output-dir eval_results/baseline
 ```
 
-### Step 6: Generate Comparative Analysis & Side-by-Side Plots
+## Step 7: Run the FullWiki ReAct Agent
 
-Generate comparative bar charts (`comparison_metrics.png`) and performance report (`comparison_report.md`):
+Each ReAct search uses the **same hybrid backend** but exposes only its top-1 paragraph. The agent may make at most seven adaptive searches, so its maximum retrieved-document budget matches the baseline's seven documents.
 
 ```bash
-python eval/compare_results.py --baseline eval_results/baseline/results.json --react eval_results/react/results.json --output-dir eval_results/comparison
+python eval/run_eval.py \
+    --mode fullwiki \
+    --retriever hybrid \
+    --top-k 1 \
+    --source official_json \
+    --concurrency 16 \
+    --max-hops 7 \
+    --output-dir eval_results/react
 ```
 
-Each benchmark output directory also contains `official_predictions.json`, `official_gold.json`, `run_manifest.json`, `results.json`, and `trajectories.json`. The first two can be checked directly with the official HotpotQA evaluator:
+For debugging, the old candidate-pool mode remains available:
 
 ```bash
-python hotpot_evaluate_v1.py eval_results/react/official_predictions.json eval_results/react/official_gold.json
+python eval/run_eval.py --mode offline --source official_json --samples 20 --max-hops 7
 ```
 
-Generated Comparison Artifacts (`eval_results/comparison/`):
-- `comparison_metrics.png`: Side-by-side bar chart comparing Single-Pass RAG vs ReAct Multi-Hop Agent for EM, F1, and Joint F1.
-- `comparison_report.md`: Markdown summary report demonstrating the exact accuracy gain achieved by Agentic AI over static RAG.
+`--mode live` remains a qualitative current-Wikipedia demo and should not be used for official HotpotQA supporting-fact comparisons.
 
-### Step 7: Launch Interactive Web UI
+## Step 8: Generate the Baseline-vs-ReAct Comparison
+
+```bash
+python eval/compare_results.py \
+    --baseline eval_results/baseline/results.json \
+    --react eval_results/react/results.json \
+    --output-dir eval_results/comparison
+```
+
+Each benchmark directory contains:
+
+```text
+results.json
+trajectories.json
+official_predictions.json
+official_gold.json
+run_manifest.json
+run.log
+```
+
+The ReAct trajectory for every retrieval step retains:
+
+- generated search query;
+- BM25 rank/score;
+- dense rank/score;
+- fused rank/score;
+- exact retrieved Wikipedia title and sentence IDs;
+- retrieval latency by sparse/dense/fusion component;
+- raw Qwen response;
+- parsed Thought/Action;
+- Observation;
+- predicted/invalid supporting-fact citations; and
+- final answer/evidence graph.
+
+Official-format predictions can be checked with HotpotQA's evaluator:
+
+```bash
+python hotpot_evaluate_v1.py \
+    eval_results/react/official_predictions.json \
+    eval_results/react/official_gold.json
+```
+
+## Step 9: Launch the Existing Interactive UI
 
 ```bash
 streamlit run app/web_ui.py --server.port 8501 --server.address 0.0.0.0
 ```
 
-Access the visual dashboard at `http://<GCE_EXTERNAL_IP>:8501`.
+---
+
+## Retrieval Modes
+
+The benchmark runners support three modes:
+
+- `offline`: searches only the 10 candidate paragraphs bundled with each FullWiki dev example; useful for tests/debugging, not the final global-retrieval experiment.
+- `fullwiki`: searches the global HotpotQA Wikipedia index; this is the primary benchmark mode.
+- `live`: current Wikipedia API; qualitative only because current Wikipedia sentence boundaries do not match HotpotQA's 2017 supporting-fact IDs.
+
+Within `fullwiki`, `--retriever` can be `bm25`, `dense`, or `hybrid`. The primary reported experiment should use `hybrid`; the other modes exist mainly for retrieval sanity analysis.
 
 ---
 
-## Troubleshooting GCE Errors
+## Repository Structure
 
-### 1. `RuntimeError: Could not find nvcc`
-Add `--enforce-eager` flag to your `vllm` launch command (as shown in Step 2 above). Alternatively, install CUDA toolkit into Conda:
+```text
+hotpot/
+├── agent/
+│   ├── baseline_rag.py
+│   ├── engine.py
+│   ├── parser.py
+│   ├── prompt.py
+│   └── state.py
+├── retrieval/
+│   ├── __init__.py
+│   ├── corpus.py                 # official archive download/streaming conversion
+│   ├── build_fullwiki_index.py   # BM25 + BGE/FAISS build pipeline
+│   ├── fullwiki_retriever.py     # shared global backend + per-question sessions
+│   └── evaluate_retrieval.py     # Recall@K retrieval sanity benchmark
+├── tools/
+│   ├── wikipedia.py
+│   └── local_retriever.py
+├── eval/
+│   ├── artifacts.py
+│   ├── compare_results.py
+│   ├── dataset.py
+│   ├── metrics.py
+│   ├── plot_results.py
+│   ├── run_baseline.py
+│   └── run_eval.py
+├── app/
+├── portfolio/
+├── tests/
+│   ├── test_agent.py
+│   └── test_retrieval.py
+├── config.py
+├── environment.yml
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Troubleshooting
+
+### Pyserini / Java error
+
+```bash
+java -version
+```
+
+The project expects Java 21. If the current environment was created before the retrieval upgrade:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate hotpot
+```
+
+### `RuntimeError: Could not find nvcc` from vLLM
+
+Use the `--enforce-eager` vLLM flag shown above. If needed:
+
 ```bash
 conda install -n hotpot -c nvidia cuda-toolkit -y
 ```
 
-### 2. `ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version CXXABI_1.3.15 not found`
-Run:
+### `CXXABI` / `libstdc++` error
+
 ```bash
 conda install -n hotpot -c conda-forge libstdcxx-ng sysroot_linux-64 -y
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
@@ -132,47 +330,6 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 ---
 
-## Repository Structure
-
-```
-hotpot/
-├── agent/
-│   ├── baseline_rag.py    # Single-Pass RAG direct prompting baseline engine
-│   ├── engine.py          # LangGraph StateGraph agent loop
-│   ├── parser.py          # ReAct/action/evidence output parsing & error handling
-│   ├── prompt.py          # System prompt & multi-hop ReAct examples
-│   └── state.py           # Agent state schema constructor
-├── tools/
-│   ├── wikipedia.py       # Live Wikipedia API (Search & Lookup)
-│   └── local_retriever.py # Local HotpotQA corpus retriever
-├── eval/
-│   ├── compare_results.py # Baseline vs ReAct comparative analysis script
-│   ├── dataset.py         # HotpotQA dataset loader
-│   ├── metrics.py         # HotpotQA answer/support/joint metrics + retrieval diagnostics
-│   ├── artifacts.py       # Official prediction/gold files + run manifests
-│   ├── plot_results.py    # Metric plotting & markdown report generator
-│   ├── run_baseline.py    # CLI runner for Single-Pass RAG baseline
-│   └── run_eval.py        # CLI runner for ReAct Agent
-├── portfolio/
-│   ├── app.js             # Portfolio JavaScript trajectory renderer
-│   ├── index.html         # Portfolio trajectory visualizer HTML component
-│   ├── portfolio_trajectories.json # Saved trajectory JSON dataset
-│   ├── style.css          # Portfolio CSS stylesheet
-│   └── README.md          # Portfolio embedding guide
-├── app/
-│   ├── web_ui.py          # Streamlit portfolio dashboard
-│   └── graph_view.py      # PyVis knowledge graph generator
-├── tests/
-│   └── test_agent.py      # Pytest test suite
-├── config.py              # Environment & model configurations
-├── environment.yml        # Conda environment definition
-├── project_proposal.md    # Comprehensive project proposal
-├── requirements.txt       # Pip requirements file
-└── README.md
-```
-
----
-
 ## License
 
-MIT License.
+MIT License. The HotpotQA Wikipedia corpus is distributed separately under the license stated by the HotpotQA authors; generated corpus/index files are not committed to this repository.

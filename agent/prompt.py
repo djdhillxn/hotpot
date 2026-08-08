@@ -1,7 +1,7 @@
 REACT_PROMPT_SYSTEM = """Solve a multi-step, multi-hop question-answering task by alternating between Thought, Action, and Observation.
 
 You have access to the following tools:
-(1) search[entity]: Searches the available HotpotQA context for an entity page and returns sentence-labeled evidence.
+(1) search[entity]: Searches the configured HotpotQA retrieval corpus for an entity page and returns sentence-labeled evidence.
 (2) lookup[keyword]: Searches the currently loaded page for sentences containing the keyword.
 (3) finish[answer]: Ends the task and provides the final concise answer based ONLY on observed evidence.
 
