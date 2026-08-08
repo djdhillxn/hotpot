@@ -88,6 +88,7 @@ class FullWikiSearchBackend:
         self._dense_lock = threading.Lock()
 
         try:
+            os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
             from pyserini.search.lucene import LuceneSearcher
         except ImportError as exc:
             raise RuntimeError(
