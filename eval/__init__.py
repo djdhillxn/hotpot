@@ -1,5 +1,12 @@
-from .dataset import load_hotpot_dataset, SAMPLE_HOTPOT_QUESTIONS
-from .metrics import evaluate_prediction, exact_match_score, f1_score, supporting_facts_overlap
+from .dataset import SAMPLE_HOTPOT_QUESTIONS, load_hotpot_dataset
+from .metrics import (
+    evaluate_prediction,
+    exact_match_score,
+    f1_score,
+    supporting_document_score,
+    supporting_fact_score,
+    supporting_facts_overlap,
+)
 
 # Alias for backwards compatibility
 load_hotpot_samples = load_hotpot_dataset
@@ -11,5 +18,7 @@ __all__ = [
     "evaluate_prediction",
     "exact_match_score",
     "f1_score",
+    "supporting_fact_score",
+    "supporting_document_score",
     "supporting_facts_overlap",
 ]

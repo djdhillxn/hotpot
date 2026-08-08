@@ -43,18 +43,19 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
     def calc_metrics(data):
         count = len(data)
         if count == 0:
-            return 0, 0, 0, 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0, 0, 0
         em = sum(r["exact_match"] for r in data) / count
         f1 = sum(r["f1"] for r in data) / count
+        sp_em = sum(r["sp_em"] for r in data) / count
         sp_f1 = sum(r["sp_f1"] for r in data) / count
         joint_em = sum(r["joint_em"] for r in data) / count
         joint_f1 = sum(r["joint_f1"] for r in data) / count
         steps = sum(r.get("step_count", 1) for r in data) / count
         lat = sum(r.get("latency", 0) for r in data) / count
-        return em * 100, f1 * 100, sp_f1 * 100, joint_em * 100, joint_f1 * 100, steps, lat
+        return em * 100, f1 * 100, sp_em * 100, sp_f1 * 100, joint_em * 100, joint_f1 * 100, steps, lat
 
-    b_em, b_f1, b_sp_f1, b_joint_em, b_joint_f1, b_steps, b_lat = calc_metrics(baseline_data)
-    r_em, r_f1, r_sp_f1, r_joint_em, r_joint_f1, r_steps, r_lat = calc_metrics(react_data)
+    b_em, b_f1, b_sp_em, b_sp_f1, b_joint_em, b_joint_f1, b_steps, b_lat = calc_metrics(baseline_data)
+    r_em, r_f1, r_sp_em, r_sp_f1, r_joint_em, r_joint_f1, r_steps, r_lat = calc_metrics(react_data)
 
     info = (
         f"=== COMPARATIVE STUDY: SINGLE-PASS RAG vs REACT AGENT ===\n"
@@ -65,9 +66,9 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
     print(info)
     logger.info(info)
 
-    metrics_names = ["Ans EM", "Ans F1", "SP F1", "Joint EM", "Joint F1"]
-    baseline_scores = [b_em, b_f1, b_sp_f1, b_joint_em, b_joint_f1]
-    react_scores = [r_em, r_f1, r_sp_f1, r_joint_em, r_joint_f1]
+    metrics_names = ["Ans EM", "Ans F1", "SP EM", "SP F1", "Joint EM", "Joint F1"]
+    baseline_scores = [b_em, b_f1, b_sp_em, b_sp_f1, b_joint_em, b_joint_f1]
+    react_scores = [r_em, r_f1, r_sp_em, r_sp_f1, r_joint_em, r_joint_f1]
 
     # Plot Side-by-Side Comparison Bar Chart
     plt.figure(figsize=(10, 6))
@@ -120,12 +121,14 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
 
         g_em, r_em_str = gain_str(b_em, r_em)
         g_f1, r_f1_str = gain_str(b_f1, r_f1)
+        g_sp_em, r_sp_em_str = gain_str(b_sp_em, r_sp_em)
         g_sp, r_sp_str = gain_str(b_sp_f1, r_sp_f1)
         g_jem, r_jem_str = gain_str(b_joint_em, r_joint_em)
         g_jf1, r_jf1_str = gain_str(b_joint_f1, r_joint_f1)
 
         f.write(f"| Answer EM | {b_em:.1f}% | {r_em:.1f}% | {g_em} | {r_em_str} |\n")
         f.write(f"| Answer F1 | {b_f1:.1f}% | {r_f1:.1f}% | {g_f1} | {r_f1_str} |\n")
+        f.write(f"| Supporting Facts EM | {b_sp_em:.1f}% | {r_sp_em:.1f}% | {g_sp_em} | {r_sp_em_str} |\n")
         f.write(f"| Supporting Facts F1 | {b_sp_f1:.1f}% | {r_sp_f1:.1f}% | {g_sp} | {r_sp_str} |\n")
         f.write(f"| **Joint EM** | **{b_joint_em:.1f}%** | **{r_joint_em:.1f}%** | **{g_jem}** | **{r_jem_str}** |\n")
         f.write(f"| **Joint F1** | **{b_joint_f1:.1f}%** | **{r_joint_f1:.1f}%** | **{g_jf1}** | **{r_jf1_str}** |\n")

@@ -21,6 +21,7 @@ dependencies:
       - pyvis>=0.3.2
       - python-dotenv>=1.0.0
       - pytest>=8.0.0
+      - ujson>=5.0.0
       - datasets>=2.18.0
       - matplotlib>=3.8.0
       - seaborn>=0.13.0

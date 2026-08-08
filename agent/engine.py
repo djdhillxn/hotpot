@@ -1,6 +1,8 @@
+import time
+
 from langgraph.graph import StateGraph, END
 from agent.prompt import REACT_PROMPT_SYSTEM, FORCED_SYNTHESIS_PROMPT_SYSTEM
-from agent.parser import parse_react_output
+from agent.parser import parse_react_output, parse_supporting_facts
 from agent.state import create_initial_state
 from tools.wikipedia import WikipediaToolSet
 from config import MAX_AGENT_HOPS
@@ -10,16 +12,29 @@ def _get_response_text(response):
     return response.content if hasattr(response, "content") else str(response)
 
 
+def _validate_supporting_facts(facts, observed_facts):
+    observed = {tuple(fact) for fact in observed_facts or []}
+    valid = [fact for fact in facts if tuple(fact) in observed]
+    invalid = [fact for fact in facts if tuple(fact) not in observed]
+    return valid, invalid
+
+
 def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
     def agent_node(state):
         prompt = REACT_PROMPT_SYSTEM.format(
             question=state["question"], scratchpad=state.get("scratchpad", "")
         )
 
+        llm_started = time.perf_counter()
         response = llm.invoke(prompt)
+        llm_latency = time.perf_counter() - llm_started
         response_text = _get_response_text(response)
 
         thought, raw_action, action_type, action_arg = parse_react_output(response_text)
+        parsed_supporting_facts = parse_supporting_facts(response_text) if action_type == "finish" else []
+        supporting_facts, invalid_supporting_facts = _validate_supporting_facts(
+            parsed_supporting_facts, state.get("observed_supporting_facts", [])
+        )
 
         step_record = {
             "step": state.get("step_count", 0) + 1,
@@ -27,6 +42,10 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
             "action": raw_action,
             "action_type": action_type,
             "action_arg": action_arg,
+            "supporting_facts": supporting_facts,
+            "invalid_supporting_facts": invalid_supporting_facts,
+            "raw_model_output": response_text,
+            "llm_latency_seconds": round(llm_latency, 6),
             "observation": "",
         }
 
@@ -37,6 +56,8 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
 
         if action_type == "finish":
             updates["final_answer"] = action_arg
+            updates["predicted_supporting_facts"] = supporting_facts
+            updates["invalid_supporting_facts"] = invalid_supporting_facts
 
         return updates
 
@@ -51,6 +72,7 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         visited_pages = list(state.get("visited_pages", []))
 
         prev_page = getattr(toolset, "current_page_title", None)
+        tool_started = time.perf_counter()
 
         if action_type == "search":
             observation = toolset.search(action_arg)
@@ -72,9 +94,22 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         else:
             observation = "Observation: Unknown action type."
 
+        tool_latency = time.perf_counter() - tool_started
         updated_steps = list(steps)
+        observed_supporting_facts = list(state.get("observed_supporting_facts", []))
         if updated_steps:
             updated_steps[-1]["observation"] = observation
+            updated_steps[-1]["tool_latency_seconds"] = round(tool_latency, 6)
+            retrieval = getattr(toolset, "last_result", None)
+            if retrieval is not None:
+                updated_steps[-1]["retrieval"] = retrieval
+                title = retrieval.get("title") if isinstance(retrieval, dict) else None
+                sentences = retrieval.get("sentences", []) if isinstance(retrieval, dict) else []
+                for sentence in sentences:
+                    if title and isinstance(sentence, dict) and "sent_id" in sentence:
+                        fact = [title, int(sentence["sent_id"])]
+                        if fact not in observed_supporting_facts:
+                            observed_supporting_facts.append(fact)
 
         new_scratchpad = (
             state.get("scratchpad", "")
@@ -86,6 +121,7 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         updates["scratchpad"] = new_scratchpad
         updates["step_count"] = state.get("step_count", 0) + 1
         updates["visited_pages"] = visited_pages
+        updates["observed_supporting_facts"] = observed_supporting_facts
         updates["evidence_graph"] = evidence_graph
 
         return updates
@@ -95,9 +131,15 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
             question=state["question"], scratchpad=state.get("scratchpad", "")
         )
 
+        llm_started = time.perf_counter()
         response = llm.invoke(prompt)
+        llm_latency = time.perf_counter() - llm_started
         response_text = _get_response_text(response)
         thought, raw_action, action_type, action_arg = parse_react_output(response_text)
+        parsed_supporting_facts = parse_supporting_facts(response_text)
+        supporting_facts, invalid_supporting_facts = _validate_supporting_facts(
+            parsed_supporting_facts, state.get("observed_supporting_facts", [])
+        )
 
         if action_type == "finish" and action_arg.strip():
             final_answer = action_arg.strip()
@@ -112,6 +154,10 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
             "action": final_action,
             "action_type": "finish",
             "action_arg": final_answer,
+            "supporting_facts": supporting_facts,
+            "invalid_supporting_facts": invalid_supporting_facts,
+            "raw_model_output": response_text,
+            "llm_latency_seconds": round(llm_latency, 6),
             "observation": "",
         }
 
@@ -119,6 +165,8 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         updates["current_action_type"] = "finish"
         updates["current_action_arg"] = final_answer
         updates["final_answer"] = final_answer
+        updates["predicted_supporting_facts"] = supporting_facts
+        updates["invalid_supporting_facts"] = invalid_supporting_facts
         updates["steps"] = list(state.get("steps", [])) + [step_record]
         return updates
 

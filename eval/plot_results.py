@@ -13,6 +13,7 @@ def generate_eval_plots_and_report(results, output_dir="eval_results"):
     total_count = len(results)
     avg_em = sum(r["exact_match"] for r in results) / total_count
     avg_f1 = sum(r["f1"] for r in results) / total_count
+    avg_sp_em = sum(r["sp_em"] for r in results) / total_count
     avg_sp_f1 = sum(r["sp_f1"] for r in results) / total_count
     avg_joint_em = sum(r["joint_em"] for r in results) / total_count
     avg_joint_f1 = sum(r["joint_f1"] for r in results) / total_count
@@ -21,8 +22,8 @@ def generate_eval_plots_and_report(results, output_dir="eval_results"):
 
     # 1. Bar Chart of Main Leaderboard Metrics
     plt.figure(figsize=(9, 5))
-    metrics_names = ["Ans EM", "Ans F1", "SP F1", "Joint EM", "Joint F1"]
-    metrics_values = [avg_em * 100, avg_f1 * 100, avg_sp_f1 * 100, avg_joint_em * 100, avg_joint_f1 * 100]
+    metrics_names = ["Ans EM", "Ans F1", "SP EM", "SP F1", "Joint EM", "Joint F1"]
+    metrics_values = [avg_em * 100, avg_f1 * 100, avg_sp_em * 100, avg_sp_f1 * 100, avg_joint_em * 100, avg_joint_f1 * 100]
 
     palette = sns.color_palette("Blues_d", len(metrics_names))
     bars = plt.bar(metrics_names, metrics_values, color=palette)
@@ -70,11 +71,12 @@ def generate_eval_plots_and_report(results, output_dir="eval_results"):
         f.write(f"**Average Latency**: {avg_latency:.2f}s per question\n")
         f.write(f"**Average Trajectory Hops**: {avg_steps:.2f} steps\n\n")
 
-        f.write("## Official Leaderboard Summary Metrics\n\n")
+        f.write("## HotpotQA Dev Summary Metrics (Official Formulas)\n\n")
         f.write("| Metric | Score (% / Value) |\n")
         f.write("| :--- | :--- |\n")
         f.write(f"| Answer Exact Match (EM) | {avg_em * 100:.1f}% |\n")
         f.write(f"| Answer F1 Score | {avg_f1 * 100:.1f}% |\n")
+        f.write(f"| Supporting Facts EM | {avg_sp_em * 100:.1f}% |\n")
         f.write(f"| Supporting Facts F1 | {avg_sp_f1 * 100:.1f}% |\n")
         f.write(f"| **Joint Exact Match (Joint EM)** | **{avg_joint_em * 100:.1f}%** |\n")
         f.write(f"| **Joint F1 Score (Joint F1)** | **{avg_joint_f1 * 100:.1f}%** |\n")

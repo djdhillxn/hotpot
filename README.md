@@ -23,7 +23,10 @@ A ReAct (Reasoning + Acting) Agent built using Python, LangGraph, and local vLLM
   - search[entity]: Searches Wikipedia API and retrieves lead section summaries.
   - lookup[keyword]: Searches paragraphs within loaded Wikipedia pages for exact keyword matches.
 - Interactive Trajectory & Knowledge Graph Visualizer: Streamlit dashboard visualizing step-by-step reasoning traces and an interactive PyVis Knowledge Bridge Graph showing entity transitions.
-- Official HotpotQA Benchmark & Comparison Engine: Automated evaluation measuring Answer Exact Match (EM), Answer F1, Supporting Facts F1, Joint Exact Match (Joint EM), and Joint F1 on full HotpotQA validation sets, automatically generating comparative metric bar charts and markdown evaluation reports.
+- HotpotQA-Compatible Evaluation: Predicts exact sentence-level supporting facts as `[Wikipedia title, sentence_id]`, uses the official answer/support/joint scoring formulas, and exports `official_predictions.json` in the format accepted by `hotpot_evaluate_v1.py`. Page-title retrieval overlap is retained separately as a non-leaderboard diagnostic.
+- Reproducible Trajectory Artifacts: Saves raw model outputs, sentence-labeled retrieval results, predicted/gold evidence, question metadata, candidate-context oracle coverage, run configuration, failures, and complete ReAct trajectories for later analysis and portfolio visualization.
+
+> **Current retrieval scope:** `--mode offline` searches the 10 candidate paragraphs supplied with each HotpotQA FullWiki dev example. The evaluator is official-compatible, but this is not yet a global Wikipedia retrieval backend; replacing the candidate-pool matcher with a shared FullWiki index is a separate architectural step.
 
 ---
 
@@ -92,7 +95,13 @@ Generate comparative bar charts (`comparison_metrics.png`) and performance repor
 python eval/compare_results.py --baseline eval_results/baseline/results.json --react eval_results/react/results.json --output-dir eval_results/comparison
 ```
 
-Generated Output Artifacts (`eval_results/comparison/`):
+Each benchmark output directory also contains `official_predictions.json`, `official_gold.json`, `run_manifest.json`, `results.json`, and `trajectories.json`. The first two can be checked directly with the official HotpotQA evaluator:
+
+```bash
+python hotpot_evaluate_v1.py eval_results/react/official_predictions.json eval_results/react/official_gold.json
+```
+
+Generated Comparison Artifacts (`eval_results/comparison/`):
 - `comparison_metrics.png`: Side-by-side bar chart comparing Single-Pass RAG vs ReAct Multi-Hop Agent for EM, F1, and Joint F1.
 - `comparison_report.md`: Markdown summary report demonstrating the exact accuracy gain achieved by Agentic AI over static RAG.
 
@@ -130,7 +139,7 @@ hotpot/
 ├── agent/
 │   ├── baseline_rag.py    # Single-Pass RAG direct prompting baseline engine
 │   ├── engine.py          # LangGraph StateGraph agent loop
-│   ├── parser.py          # Regex ReAct output parser & error handling
+│   ├── parser.py          # ReAct/action/evidence output parsing & error handling
 │   ├── prompt.py          # System prompt & multi-hop ReAct examples
 │   └── state.py           # Agent state schema constructor
 ├── tools/
@@ -139,7 +148,8 @@ hotpot/
 ├── eval/
 │   ├── compare_results.py # Baseline vs ReAct comparative analysis script
 │   ├── dataset.py         # HotpotQA dataset loader
-│   ├── metrics.py         # Official Joint EM & Joint F1 evaluation metrics
+│   ├── metrics.py         # HotpotQA answer/support/joint metrics + retrieval diagnostics
+│   ├── artifacts.py       # Official prediction/gold files + run manifests
 │   ├── plot_results.py    # Metric plotting & markdown report generator
 │   ├── run_baseline.py    # CLI runner for Single-Pass RAG baseline
 │   └── run_eval.py        # CLI runner for ReAct Agent

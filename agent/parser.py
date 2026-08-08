@@ -1,3 +1,4 @@
+import json
 import re
 
 
@@ -25,6 +26,70 @@ def _extract_delimited_action(cleaned_output):
                 return prefix_match, action_type, cleaned_output[arg_start:index]
 
     return None
+
+
+def parse_supporting_facts(llm_output):
+    """Parse a JSON list of [title, sentence_id] pairs from a Support line."""
+    match = re.search(
+        r"(?:Supporting\s+Facts|Support)\s*:\s*(\[.*\])\s*$",
+        llm_output.strip(),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return []
+
+    try:
+        raw_facts = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    facts = []
+    if not isinstance(raw_facts, list):
+        return facts
+
+    for fact in raw_facts:
+        if not isinstance(fact, list) or len(fact) != 2:
+            continue
+        title, sent_id = fact
+        if not isinstance(title, str):
+            continue
+        try:
+            sent_id = int(sent_id)
+        except (TypeError, ValueError):
+            continue
+        facts.append([title, sent_id])
+
+    return facts
+
+
+def parse_baseline_output(llm_output):
+    """Parse the baseline JSON response, with a safe answer-only fallback."""
+    text = llm_output.strip()
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if json_match:
+        try:
+            payload = json.loads(json_match.group(0))
+            answer = str(payload.get("answer", "")).strip().strip("'\"")
+            supporting_facts = payload.get("supporting_facts", [])
+            facts = []
+            if isinstance(supporting_facts, list):
+                for fact in supporting_facts:
+                    if not isinstance(fact, list) or len(fact) != 2:
+                        continue
+                    title, sent_id = fact
+                    if not isinstance(title, str):
+                        continue
+                    try:
+                        sent_id = int(sent_id)
+                    except (TypeError, ValueError):
+                        continue
+                    facts.append([title, sent_id])
+            if answer:
+                return answer, facts
+        except json.JSONDecodeError:
+            pass
+
+    return text.strip().strip("'\""), []
 
 
 def parse_react_output(llm_output):

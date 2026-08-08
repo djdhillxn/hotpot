@@ -1,44 +1,58 @@
 REACT_PROMPT_SYSTEM = """Solve a multi-step, multi-hop question-answering task by alternating between Thought, Action, and Observation.
 
 You have access to the following tools:
-(1) search[entity]: Searches Wikipedia for the exact entity page and returns its lead paragraph summary.
-(2) lookup[keyword]: Searches the currently loaded Wikipedia page for paragraphs containing the exact keyword.
-(3) finish[answer]: Ends the task and provides the final concise answer based ONLY on evidence observed in Wikipedia.
+(1) search[entity]: Searches the available HotpotQA context for an entity page and returns sentence-labeled evidence.
+(2) lookup[keyword]: Searches the currently loaded page for sentences containing the keyword.
+(3) finish[answer]: Ends the task and provides the final concise answer based ONLY on observed evidence.
 
 STRICT FORMATTING RULES:
-Each turn MUST follow this exact format:
-Thought: <your step-by-step reasoning on what to search or extract next>
-Action: <one of: search[entity], lookup[keyword], or finish[answer]>
+For search and lookup turns, output exactly:
+Thought: <your reasoning about the next evidence needed>
+Action: <search[entity] or lookup[keyword]>
 
-DO NOT write "Observation:" yourself. The system will provide the Observation after your Action.
-DO NOT hallucinate facts. Every claim in your Thought must be backed by previous Observations.
+For the final turn, output exactly:
+Thought: <brief evidence-based synthesis>
+Action: finish[<concise answer>]
+Support: [["Exact Wikipedia title", <sentence_id>], ...]
+
+DO NOT write "Observation:" yourself. The system provides the Observation after search/lookup.
+DO NOT hallucinate facts or supporting evidence.
+When an Observation contains labels such as [Radiohead | sent 1], the integer is the exact HotpotQA sentence ID for that page.
+For Support, cite ONLY sentence labels that were actually observed, copy the Wikipedia title exactly, and include every sentence needed to justify the answer.
+If no observed sentence supports the answer, return Support: [] rather than inventing evidence.
 
 ---
 EXAMPLE 1:
 Question: Were Scott Derrickson and Ed Wood born in the same state?
-Thought: I need to search for Scott Derrickson to find his birthplace.
+Thought: I need Scott Derrickson's birthplace.
 Action: search[Scott Derrickson]
-Observation: Loaded [Scott Derrickson]: Scott Derrickson (born July 16, 1966) is an American filmmaker. He was born in Denver, Colorado.
-Thought: Scott Derrickson was born in Denver, Colorado. Now I need to search for Ed Wood to find his birthplace.
+Observation: Loaded [Scott Derrickson]. Sentence IDs are HotpotQA sentence IDs; use them exactly when citing supporting facts.
+[Scott Derrickson | sent 0] Scott Derrickson is an American filmmaker.
+[Scott Derrickson | sent 1] He was born in Denver, Colorado.
+Thought: Scott Derrickson was born in Colorado. I now need Ed Wood's birthplace.
 Action: search[Ed Wood]
-Observation: Loaded [Ed Wood]: Edward Davis Wood Jr. (October 10, 1924 – December 10, 1978) was an American filmmaker. He was born in Poughkeepsie, New York.
-Thought: Ed Wood was born in Poughkeepsie, New York. Scott Derrickson was born in Colorado, while Ed Wood was born in New York. They were born in different states.
+Observation: Loaded [Ed Wood]. Sentence IDs are HotpotQA sentence IDs; use them exactly when citing supporting facts.
+[Ed Wood | sent 0] Edward Davis Wood Jr. was an American filmmaker.
+[Ed Wood | sent 1] He was born in Poughkeepsie, New York.
+Thought: The two birthplaces are in different states.
 Action: finish[no]
+Support: [["Scott Derrickson", 1], ["Ed Wood", 1]]
 
 ---
 EXAMPLE 2:
-Question: What is the birth date of the lead singer of the band that performed 'Creep'?
-Thought: I need to search for the song 'Creep' to identify the band that performed it.
-Action: search[Creep (Radiohead song)]
-Observation: Loaded [Creep (Radiohead song)]: "Creep" is the debut single by the English alternative rock band Radiohead.
-Thought: The lead singer of Radiohead needs to be identified. Let me search for Radiohead.
+Question: What is the birth date of the lead singer of Radiohead?
+Thought: I need to identify Radiohead's lead singer.
 Action: search[Radiohead]
-Observation: Loaded [Radiohead]: Radiohead are an English rock band formed in Abingdon, Oxfordshire, in 1985. The band consists of Thom Yorke (vocals, guitar)...
-Thought: Thom Yorke is the lead singer of Radiohead. Now I need to search for Thom Yorke to find his birth date.
+Observation: Loaded [Radiohead]. Sentence IDs are HotpotQA sentence IDs; use them exactly when citing supporting facts.
+[Radiohead | sent 0] Radiohead are an English rock band formed in Abingdon, Oxfordshire, in 1985.
+[Radiohead | sent 1] The band consists of Thom Yorke (lead vocals, guitar), Jonny Greenwood, Colin Greenwood, Ed O'Brien, and Philip Selway.
+Thought: Thom Yorke is the lead singer. I need his birth date.
 Action: search[Thom Yorke]
-Observation: Loaded [Thom Yorke]: Thomas Edward Yorke (born 7 October 1968) is an English musician and main vocalist of Radiohead.
-Thought: Thom Yorke was born on 7 October 1968.
+Observation: Loaded [Thom Yorke]. Sentence IDs are HotpotQA sentence IDs; use them exactly when citing supporting facts.
+[Thom Yorke | sent 0] Thomas Edward Yorke (born 7 October 1968) is an English musician and main vocalist of Radiohead.
+Thought: The observed evidence identifies Thom Yorke as Radiohead's lead vocalist and gives his birth date.
 Action: finish[7 October 1968]
+Support: [["Radiohead", 1], ["Thom Yorke", 0]]
 
 ---
 Task Question: {question}
@@ -49,8 +63,11 @@ FORCED_SYNTHESIS_PROMPT_SYSTEM = """You have exhausted the allowed search/lookup
 
 Using ONLY the evidence already present in the trajectory below, provide the best concise final answer you can. Do not request another search or lookup. Do not return an empty answer. Even if the evidence is incomplete, synthesize the best answer supported by what you observed.
 
-Return EXACTLY one line in this format:
+Return EXACTLY these two lines:
 Action: finish[<concise answer>]
+Support: [["Exact Wikipedia title", <sentence_id>], ...]
+
+For Support, cite ONLY sentence labels that were actually observed. Copy titles and sentence IDs exactly. If no observed sentence supports the answer, return Support: [].
 
 Question: {question}
 {scratchpad}"""

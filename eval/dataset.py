@@ -123,7 +123,7 @@ def normalize_hf_item(item, idx):
                 formatted_context.append({"title": entry[0], "sentences": entry[1]})
 
     return {
-        "id": item.get("id", f"hf_{idx}"),
+        "id": item.get("id") or item.get("_id") or f"hf_{idx}",
         "question": item.get("question", ""),
         "answer": item.get("answer", ""),
         "type": item.get("type", "unknown"),
@@ -169,7 +169,7 @@ def load_hotpot_dataset(num_samples=None, source="sample"):
                 print(f"Successfully loaded {len(data)} questions from official HotpotQA JSON.")
                 if num_samples:
                     data = data[:num_samples]
-                return data
+                return [normalize_hf_item(item, i) for i, item in enumerate(data)]
             except Exception as e:
                 print(f"Warning: Failed to fetch from {url} ({str(e)}). Trying next source...")
 
