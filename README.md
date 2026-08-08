@@ -170,6 +170,7 @@ python eval/run_baseline.py \
     --retriever hybrid \
     --top-k 7 \
     --source official_json \
+    --concurrency 64 \
     --output-dir eval_results/baseline
 ```
 

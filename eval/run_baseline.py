@@ -79,9 +79,14 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
     else:
         toolset = WikipediaToolSet()
 
-    t0 = time.time()
-    agent_state = run_single_pass_rag(question=question, llm=llm, toolset=toolset)
-    latency = time.time() - t0
+    t0 = time.perf_counter()
+    try:
+        agent_state = run_single_pass_rag(question=question, llm=llm, toolset=toolset)
+    except Exception as exc:
+        latency = time.perf_counter() - t0
+        logger.exception(f"Error processing question {idx}: {exc}")
+        return build_failure_record(sample, idx, exc, latency=latency)
+    latency = time.perf_counter() - t0
 
     pred_answer = agent_state.get("final_answer") or "No Answer"
     predicted_supporting_facts = agent_state.get("predicted_supporting_facts", []) or []
@@ -120,7 +125,7 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
     })
 
     logger.info(
-        f"Prediction: '{pred_answer}' | EM: {eval_metrics['exact_match']} | "
+        f"Prediction [{idx}/{total}]: '{pred_answer}' | EM: {eval_metrics['exact_match']} | "
         f"F1: {eval_metrics['f1']:.3f} | SP F1: {eval_metrics['sp_f1']:.3f} | "
         f"Joint F1: {eval_metrics['joint_f1']:.3f} | Latency: {latency:.2f}s"
     )
@@ -161,7 +166,7 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
     return eval_metrics, trajectory_entry
 
 
-def build_failure_record(sample, idx, error):
+def build_failure_record(sample, idx, error, latency=0.0):
     gold_answer = sample.get("answer", "")
     gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
     metrics = evaluate_prediction(
@@ -189,7 +194,7 @@ def build_failure_record(sample, idx, error):
         "invalid_supporting_fact_count": 0,
         "gold_supporting_facts": gold_supporting_facts,
         "visited_pages": [],
-        "latency": 0.0,
+        "latency": round(latency, 3),
         "timestamp": timestamp,
         "failed": True,
         "error": str(error),
@@ -215,8 +220,8 @@ def build_failure_record(sample, idx, error):
         "joint_em": metrics["joint_em"],
         "joint_f1": metrics["joint_f1"],
         "supporting_document_f1": metrics["doc_f1"],
-        "step_count": 0,
-        "latency_seconds": 0.0,
+        "step_count": 1,
+        "latency_seconds": round(latency, 3),
         "visited_pages": [],
         "context_titles": context_info["context_titles"],
         "gold_titles_in_context": context_info["gold_titles_in_context"],
@@ -242,6 +247,11 @@ def run_baseline_benchmark(
     top_k=7,
     concurrency=16,
 ):
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+
     logger, log_file = setup_logger(output_dir)
     run_started_at = datetime.now().isoformat()
 
@@ -282,28 +292,34 @@ def run_baseline_benchmark(
     total = len(samples)
 
     pbar = tqdm(total=total, desc="Single-Pass RAG Evaluation", unit="question", dynamic_ncols=True)
+    completed_em_sum = 0.0
+    completed_joint_f1_sum = 0.0
 
-    if concurrency <= 1:
+    def record_completed(eval_metrics, trajectory_entry):
+        nonlocal completed_em_sum, completed_joint_f1_sum
+        results.append(eval_metrics)
+        full_trajectories.append(trajectory_entry)
+        completed_em_sum += eval_metrics["exact_match"]
+        completed_joint_f1_sum += eval_metrics["joint_f1"]
+        completed = len(results)
+        pbar.set_postfix({
+            "EM": f"{(completed_em_sum / completed) * 100:.1f}%",
+            "Joint_F1": f"{(completed_joint_f1_sum / completed) * 100:.1f}%",
+        })
+        pbar.update(1)
+
+    if concurrency == 1:
         for idx, sample in enumerate(samples, 1):
             try:
                 eval_metrics, trajectory_entry = process_single_question(
                     sample, idx, total, mode, llm, logger, fullwiki_backend, top_k
                 )
             except Exception as exc:
-                logger.exception(f"Error processing question {idx}: {exc}")
+                logger.exception(f"Unexpected worker failure for question {idx}: {exc}")
                 eval_metrics, trajectory_entry = build_failure_record(sample, idx, exc)
-            results.append(eval_metrics)
-            full_trajectories.append(trajectory_entry)
-
-            current_em = sum(r["exact_match"] for r in results) / len(results)
-            current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
-            pbar.set_postfix({
-                "EM": f"{current_em * 100:.1f}%",
-                "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
-            })
-            pbar.update(1)
+            record_completed(eval_metrics, trajectory_entry)
     else:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="baseline") as executor:
             future_to_meta = {
                 executor.submit(
                     process_single_question, sample, idx, total, mode, llm, logger,
@@ -317,19 +333,9 @@ def run_baseline_benchmark(
                 try:
                     eval_metrics, trajectory_entry = future.result()
                 except Exception as exc:
-                    logger.exception(f"Error processing question {idx}: {exc}")
+                    logger.exception(f"Unexpected worker failure for question {idx}: {exc}")
                     eval_metrics, trajectory_entry = build_failure_record(sample, idx, exc)
-
-                results.append(eval_metrics)
-                full_trajectories.append(trajectory_entry)
-
-                current_em = sum(r["exact_match"] for r in results) / len(results)
-                current_joint_f1 = sum(r["joint_f1"] for r in results) / len(results)
-                pbar.set_postfix({
-                    "EM": f"{current_em * 100:.1f}%",
-                    "Joint_F1": f"{current_joint_f1 * 100:.1f}%",
-                })
-                pbar.update(1)
+                record_completed(eval_metrics, trajectory_entry)
 
     pbar.close()
     results.sort(key=lambda r: r.get("idx", 0))
@@ -350,7 +356,7 @@ def run_baseline_benchmark(
     failed_count = sum(bool(r.get("failed")) for r in results)
 
     summary_text = (
-        "\n=== SINGLE-PASS RAG BASELINE METRICS ===\n"
+        "\n=== HOTPOTQA DEV METRICS (OFFICIAL FORMULAS) — SINGLE-PASS RAG ===\n"
         f"Answer Exact Match (EM):      {avg_em * 100:.1f}%\n"
         f"Answer F1 Score:              {avg_f1 * 100:.1f}%\n"
         f"Supporting Facts EM:          {avg_sp_em * 100:.1f}%\n"
@@ -380,7 +386,7 @@ def run_baseline_benchmark(
     manifest_path = write_run_manifest(
         output_dir,
         {
-            "runner": "baseline",
+            "runner": "single_pass_rag",
             "started_at": run_started_at,
             "finished_at": datetime.now().isoformat(),
             "model": model_name,
@@ -392,8 +398,12 @@ def run_baseline_benchmark(
             "completed_records": total_count,
             "failed_records": failed_count,
             "concurrency": concurrency,
+            "retrieval_calls_per_question": 1,
+            "generation_calls_per_question": 1,
+            "documents_per_search": top_k if mode == "fullwiki" else 1,
+            "retrieval_document_budget": top_k if mode == "fullwiki" else 1,
+            "max_retrieval_document_budget": top_k if mode == "fullwiki" else 1,
             "retriever": retriever if mode == "fullwiki" else mode,
-            "retrieved_document_budget": top_k if mode == "fullwiki" else 1,
             "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
             "total_evaluation_seconds": round(total_time, 3),
             "official_prediction_file": os.path.basename(prediction_path),
