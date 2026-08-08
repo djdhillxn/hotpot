@@ -21,6 +21,18 @@ Action: search[Scott Derrickson]"""
     assert action_arg == "Scott Derrickson"
 
 
+def test_parse_react_output_preserves_parentheses_inside_brackets():
+    llm_output = """Thought: I need the film page.
+Action: search[Kiss and Tell (1945 film)]"""
+
+    thought, raw_action, action_type, action_arg = parse_react_output(llm_output)
+
+    assert thought == "I need the film page."
+    assert raw_action == "search[Kiss and Tell (1945 film)]"
+    assert action_type == "search"
+    assert action_arg == "Kiss and Tell (1945 film)"
+
+
 def test_parse_react_output_finish():
     llm_output = """Thought: Scott Derrickson was born in Colorado, and Ed Wood was born in New York.
 Action: finish[no]"""
@@ -89,3 +101,29 @@ def test_react_agent_end_to_end():
     assert final_state["final_answer"] == "no"
     assert len(final_state["steps"]) == 3
     assert final_state["visited_pages"] == ["Scott Derrickson", "Ed Wood"]
+
+
+def test_react_agent_forces_synthesis_at_hop_budget():
+    fake_responses = [
+        "Thought: I need to search for Scott Derrickson.\nAction: search[Scott Derrickson]",
+        "Action: finish[American]",
+    ]
+    fake_llm = FakeListChatModel(responses=fake_responses)
+
+    context = [
+        {"title": "Scott Derrickson", "sentences": ["Scott Derrickson is an American filmmaker."]},
+    ]
+    retriever = LocalHotpotRetriever(context_paragraphs=context)
+
+    final_state = run_react_agent(
+        question="What nationality is Scott Derrickson?",
+        llm=fake_llm,
+        toolset=retriever,
+        max_hops=1,
+    )
+
+    assert final_state["step_count"] == 1
+    assert final_state["final_answer"] == "American"
+    assert final_state["steps"][-1]["action_type"] == "finish"
+    assert final_state["steps"][-1]["action"] == "finish[American]"
+    assert len(final_state["steps"]) == 2

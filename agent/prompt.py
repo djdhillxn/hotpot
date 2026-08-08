@@ -43,3 +43,14 @@ Action: finish[7 October 1968]
 ---
 Task Question: {question}
 {scratchpad}Thought: """
+
+
+FORCED_SYNTHESIS_PROMPT_SYSTEM = """You have exhausted the allowed search/lookup budget for this question.
+
+Using ONLY the evidence already present in the trajectory below, provide the best concise final answer you can. Do not request another search or lookup. Do not return an empty answer. Even if the evidence is incomplete, synthesize the best answer supported by what you observed.
+
+Return EXACTLY one line in this format:
+Action: finish[<concise answer>]
+
+Question: {question}
+{scratchpad}"""

@@ -1,9 +1,14 @@
 from langgraph.graph import StateGraph, END
-from agent.prompt import REACT_PROMPT_SYSTEM
+from agent.prompt import REACT_PROMPT_SYSTEM, FORCED_SYNTHESIS_PROMPT_SYSTEM
 from agent.parser import parse_react_output
 from agent.state import create_initial_state
 from tools.wikipedia import WikipediaToolSet
 from config import MAX_AGENT_HOPS
+
+
+def _get_response_text(response):
+    return response.content if hasattr(response, "content") else str(response)
+
 
 def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
     def agent_node(state):
@@ -12,7 +17,7 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         )
 
         response = llm.invoke(prompt)
-        response_text = response.content if hasattr(response, "content") else str(response)
+        response_text = _get_response_text(response)
 
         thought, raw_action, action_type, action_arg = parse_react_output(response_text)
 
@@ -85,29 +90,76 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
 
         return updates
 
-    def should_continue(state):
+    def synthesis_node(state):
+        prompt = FORCED_SYNTHESIS_PROMPT_SYSTEM.format(
+            question=state["question"], scratchpad=state.get("scratchpad", "")
+        )
+
+        response = llm.invoke(prompt)
+        response_text = _get_response_text(response)
+        thought, raw_action, action_type, action_arg = parse_react_output(response_text)
+
+        if action_type == "finish" and action_arg.strip():
+            final_answer = action_arg.strip()
+            final_action = f"finish[{final_answer}]"
+        else:
+            final_answer = response_text.strip() or "unknown"
+            final_action = f"finish[{final_answer}]"
+
+        step_record = {
+            "step": state.get("step_count", 0) + 1,
+            "thought": "Search budget exhausted; synthesizing the best answer from gathered evidence.",
+            "action": final_action,
+            "action_type": "finish",
+            "action_arg": final_answer,
+            "observation": "",
+        }
+
+        updates = dict(state)
+        updates["current_action_type"] = "finish"
+        updates["current_action_arg"] = final_answer
+        updates["final_answer"] = final_answer
+        updates["steps"] = list(state.get("steps", [])) + [step_record]
+        return updates
+
+    def route_after_agent(state):
         action_type = state.get("current_action_type")
         step_count = state.get("step_count", 0)
         if action_type == "finish":
             return "end"
         if step_count >= max_hops:
-            return "end"
+            return "synthesize"
         return "tool"
+
+    def route_after_tool(state):
+        if state.get("step_count", 0) >= max_hops:
+            return "synthesize"
+        return "agent"
 
     workflow = StateGraph(dict)
     workflow.add_node("agent", agent_node)
     workflow.add_node("tool", tool_node)
+    workflow.add_node("synthesize", synthesis_node)
 
     workflow.set_entry_point("agent")
     workflow.add_conditional_edges(
         "agent",
-        should_continue,
+        route_after_agent,
         {
             "tool": "tool",
+            "synthesize": "synthesize",
             "end": END,
         },
     )
-    workflow.add_edge("tool", "agent")
+    workflow.add_conditional_edges(
+        "tool",
+        route_after_tool,
+        {
+            "agent": "agent",
+            "synthesize": "synthesize",
+        },
+    )
+    workflow.add_edge("synthesize", END)
 
     return workflow.compile()
 

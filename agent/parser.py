@@ -1,21 +1,46 @@
 import re
 
+
+def _extract_delimited_action(cleaned_output):
+    """Extract Action: tool[argument] or Action: tool(argument) with paired delimiters."""
+    prefix_match = re.search(
+        r"Action:\s*(\w+)\s*([\[(])", cleaned_output, re.IGNORECASE
+    )
+    if not prefix_match:
+        return None
+
+    action_type = prefix_match.group(1).lower()
+    opening = prefix_match.group(2)
+    closing = "]" if opening == "[" else ")"
+    arg_start = prefix_match.end()
+    depth = 1
+
+    for index in range(arg_start, len(cleaned_output)):
+        char = cleaned_output[index]
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return prefix_match, action_type, cleaned_output[arg_start:index]
+
+    return None
+
+
 def parse_react_output(llm_output):
     cleaned_output = llm_output.strip()
 
     if "Observation:" in cleaned_output:
         cleaned_output = cleaned_output.split("Observation:")[0].strip()
 
-    action_match = re.search(
-        r"Action:\s*(\w+)\s*(?:\[|\()(.*?)(?:\]|\))", cleaned_output, re.DOTALL | re.IGNORECASE
-    )
+    action_match = _extract_delimited_action(cleaned_output)
 
     if action_match:
-        action_type = action_match.group(1).lower()
-        action_arg = action_match.group(2).strip().strip("'\"")
+        prefix_match, action_type, extracted_arg = action_match
+        action_arg = extracted_arg.strip().strip("'\"")
         raw_action = f"{action_type}[{action_arg}]"
 
-        thought_part = cleaned_output[: action_match.start()].strip()
+        thought_part = cleaned_output[: prefix_match.start()].strip()
         thought = re.sub(r"^Thought:\s*", "", thought_part, flags=re.IGNORECASE).strip()
         if not thought:
             thought = "Analyzing available information."
