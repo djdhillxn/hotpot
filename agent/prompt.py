@@ -16,7 +16,7 @@ Action: finish[<short canonical answer only>]
 Support: [["Exact Wikipedia title", <sentence_id>], ...]
 
 FINAL ANSWER RULES:
-- The content inside finish[...] must be ONLY the exact concise answer appearing in the observed evidence.
+- Derive the answer only from observed evidence. For entity, date, number, and phrase answers, copy the exact concise wording from the evidence whenever possible. For yes/no and comparison questions, infer the concise answer ("yes" or "no") from the cited facts.
 - Prefer the exact concise answer wording from the evidence whenever possible; do not paraphrase, generalize, or shorten a multiword entity or noun phrase.
 - Use exactly "yes" or "no" for yes/no questions.
 - Do NOT write "The answer is ...", "Answer: ...", explanations, evidence, or full sentences inside finish[...].
@@ -25,7 +25,7 @@ FINAL ANSWER RULES:
 DO NOT write "Observation:" yourself. The system provides the Observation after search/lookup.
 DO NOT hallucinate facts or supporting evidence.
 Active Evidence Memory is the current persistent evidence set; later searches may replace weaker documents with stronger ones. Base reasoning on the current memory plus any explicit lookup observations in the history.
-When Active Evidence Memory or an Observation contains labels such as [Radiohead | sent 1], the integer is the exact HotpotQA sentence ID for that page.
+When Active Evidence Memory or an Observation contains labels such as [Albert Einstein | sent 1], the integer is the exact HotpotQA sentence ID for that page.
 For Support, cite ONLY sentence labels that were actually observed, copy the Wikipedia title exactly, and include every sentence needed to justify the answer.
 If no observed sentence supports the answer, return Support: [] rather than inventing evidence.
 If an observation states that a search query was already performed, reformulate the query or use lookup; do not repeat identical searches.
@@ -36,83 +36,50 @@ Finish immediately as soon as you observe sufficient evidence to answer and cite
 HERE ARE FEW-SHOT EXAMPLES OF THE REQUIRED FORMAT:
 
 EXAMPLE 1:
-Question: Were Scott Derrickson and Ed Wood born in the same state?
-Thought: I need to find Scott Derrickson's birthplace first.
-Action: search[Scott Derrickson]
-Observation: Loaded [Scott Derrickson] (rank 1).
-[Scott Derrickson | sent 0] Scott Derrickson (born July 16, 1966) is an American director, screenwriter and producer.
-[Scott Derrickson | sent 1] He was born in Denver, Colorado.
-Thought: Scott Derrickson was born in Colorado. Now I need Ed Wood's birthplace.
-Action: search[Ed Wood]
-Observation: Loaded [Ed Wood] (rank 1).
-[Ed Wood | sent 0] Edward Davis Wood Jr. (October 10, 1924 – December 10, 1978) was an American filmmaker, actor, writer, producer, and director.
-[Ed Wood | sent 1] He was born in Poughkeepsie, New York.
-Thought: Scott Derrickson was born in Colorado and Ed Wood was born in New York. They were born in different states.
+Question: Were Albert Einstein and Niels Bohr born in the same country?
+Thought: I need to find Albert Einstein's birth country first.
+Action: search[Albert Einstein]
+Observation: Loaded [Albert Einstein] (rank 1).
+[Albert Einstein | sent 0] Albert Einstein (14 March 1879 – 18 April 1955) was a German-born theoretical physicist.
+[Albert Einstein | sent 1] He was born in Ulm, in the Kingdom of Württemberg in the German Empire.
+Thought: Albert Einstein was born in Germany. Now I need Niels Bohr's birth country.
+Action: search[Niels Bohr]
+Observation: Loaded [Niels Bohr] (rank 1).
+[Niels Bohr | sent 0] Niels Henrik David Bohr (7 October 1885 – 18 November 1962) was a Danish physicist.
+[Niels Bohr | sent 1] He was born in Copenhagen, Denmark.
+Thought: Einstein was born in Germany and Bohr was born in Denmark. They were born in different countries.
 Action: finish[no]
-Support: [["Scott Derrickson", 1], ["Ed Wood", 1]]
+Support: [["Albert Einstein", 1], ["Niels Bohr", 1]]
 
 ---
 EXAMPLE 2:
-Question: What is the birth date of the lead singer of Radiohead?
-Thought: I need to identify the lead singer of Radiohead.
-Action: search[Radiohead]
-Observation: Loaded [Radiohead] (rank 1).
-[Radiohead | sent 0] Radiohead are an English rock band formed in Abingdon, Oxfordshire, in 1985.
-[Radiohead | sent 1] The band consists of Thom Yorke (lead vocals, guitar), Jonny Greenwood, Colin Greenwood, Ed O'Brien, and Philip Selway.
-Thought: Thom Yorke is the lead singer. Now I need Thom Yorke's birth date.
-Action: search[Thom Yorke]
-Observation: Loaded [Thom Yorke] (rank 1).
-[Thom Yorke | sent 0] Thomas Edward Yorke (born 7 October 1968) is an English musician and main vocalist of Radiohead.
-Thought: Observed evidence gives Thom Yorke's birth date as 7 October 1968.
-Action: finish[7 October 1968]
-Support: [["Radiohead", 1], ["Thom Yorke", 0]]
-
----
-EXAMPLE 3:
-Question: What profession do Nicholas Ray and Elia Kazan have in common?
-Thought: I need to find Nicholas Ray's professions.
-Action: search[Nicholas Ray]
-Observation: Loaded [Nicholas Ray] (rank 1).
-[Nicholas Ray | sent 0] Nicholas Ray (born Raymond Nicholas Kienzle Jr., August 7, 1911 – June 16, 1979) was an American film director, screenwriter, and actor best known for Rebel Without a Cause.
-Thought: Nicholas Ray was a film director, screenwriter, and actor. Now I need Elia Kazan's professions.
-Action: search[Elia Kazan]
-Observation: Loaded [Elia Kazan] (rank 1).
-[Elia Kazan | sent 0] Elia Kazan was an American film and theatre director, producer, screenwriter, and actor.
-Thought: Both Nicholas Ray and Elia Kazan were film directors, screenwriters, and actors. The primary shared profession is director.
-Action: finish[director]
-Support: [["Nicholas Ray", 0], ["Elia Kazan", 0]]
-
----
-EXAMPLE 4:
-Question: Which film directed by Christopher Nolan stars Leonardo DiCaprio?
-Thought: I need to search for Christopher Nolan's filmography.
-Action: search[Christopher Nolan]
-Observation: Loaded [Christopher Nolan] (rank 1).
-[Christopher Nolan | sent 0] Christopher Edward Nolan (born 30 July 1970) is a British-American film director, screenwriter, and producer.
-[Christopher Nolan | sent 1] His films include Memento, The Dark Knight Trilogy, Inception, Interstellar, and Oppenheimer.
-Thought: I should search for Inception to see if it stars Leonardo DiCaprio.
+Question: What is the birthplace of the director of the 2010 film Inception?
+Thought: I need to find who directed the film Inception.
 Action: search[Inception]
 Observation: Loaded [Inception] (rank 1).
 [Inception | sent 0] Inception is a 2010 science fiction action film written and directed by Christopher Nolan.
-[Inception | sent 1] The film stars Leonardo DiCaprio as a professional thief who steals information by infiltrating the subconscious.
-Thought: Inception was directed by Christopher Nolan and stars Leonardo DiCaprio.
-Action: finish[Inception]
-Support: [["Christopher Nolan", 1], ["Inception", 0], ["Inception", 1]]
+Thought: Christopher Nolan directed Inception. Now I need to search for Christopher Nolan to find his birthplace.
+Action: search[Christopher Nolan]
+Observation: Loaded [Christopher Nolan] (rank 1).
+[Christopher Nolan | sent 0] Christopher Edward Nolan (born 30 July 1970) is a British-American film director.
+[Christopher Nolan | sent 1] He was born in London, England.
+Thought: Observed evidence states Christopher Nolan was born in London, England.
+Action: finish[London, England]
+Support: [["Inception", 0], ["Christopher Nolan", 1]]
 
 ---
-EXAMPLE 5:
+EXAMPLE 3:
 Question: In what city is the headquarters of the company founded by Bill Gates located?
 Thought: I need to search for Bill Gates to find the company he founded.
 Action: search[Bill Gates]
 Observation: Loaded [Bill Gates] (rank 1).
-[Bill Gates | sent 0] William Henry Gates III (born October 28, 1955) is an American business magnate, investor, and philanthropist.
-[Bill Gates | sent 1] He is best known for co-founding software giant Microsoft along with his late childhood friend Paul Allen.
-Thought: Bill Gates co-founded Microsoft. Now I need to search for Microsoft and find its headquarters location.
+[Bill Gates | sent 0] William Henry Gates III (born October 28, 1955) is an American business magnate.
+[Bill Gates | sent 1] He is best known for co-founding software giant Microsoft along with Paul Allen.
+Thought: Bill Gates co-founded Microsoft. Now I need to search for Microsoft to find its headquarters.
 Action: search[Microsoft]
 Observation: Loaded [Microsoft] (rank 1).
 [Microsoft | sent 0] Microsoft Corporation is an American multinational technology corporation.
-[Microsoft | sent 1] It produces computer software, consumer electronics, personal computers, and related services.
-Thought: I need to lookup where Microsoft's headquarters is located on the Microsoft page.
+Thought: I will lookup where Microsoft's headquarters is located on the Microsoft page.
 Action: lookup[headquarters]
 Observation: (Result 1/1) [Microsoft | sent 4] Its corporate headquarters is located in Redmond, Washington.
 Thought: Microsoft's headquarters is in Redmond, Washington. I have sufficient evidence to answer immediately.
@@ -129,7 +96,7 @@ Action: finish[<short canonical answer only>]
 Support: [["Exact Wikipedia title", <sentence_id>], ...]
 
 FINAL ANSWER RULES:
-- The content inside finish[...] must be ONLY the exact concise answer appearing in the observed evidence.
+- Derive the answer only from observed evidence. For entity, date, number, and phrase answers, copy the exact concise wording from the evidence whenever possible. For yes/no and comparison questions, infer the concise answer ("yes" or "no") from the cited facts.
 - Prefer the exact concise answer wording from the evidence whenever possible; do not paraphrase, generalize, or shorten a multiword entity or noun phrase.
 - Use exactly "yes" or "no" for yes/no questions.
 - Do NOT include "The answer is ...", "Answer: ...", explanations, evidence, or full sentences inside finish[...].
@@ -140,8 +107,8 @@ For Support, cite ONLY sentence labels that were actually observed. Copy titles 
 Examples of valid final answers:
 Action: finish[yes]
 Action: finish[no]
-Action: finish[Thom Yorke]
-Action: finish[7 October 1968]
+Action: finish[London, England]
+Action: finish[Redmond, Washington]
 """
 
 REACT_PROMPT_SYSTEM = REACT_SYSTEM_PROMPT

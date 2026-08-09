@@ -639,7 +639,7 @@ class FullWikiRetriever:
         self._active_memory_hits = logged_hits
         return logged_hits, omitted_due_to_char_cap
 
-    def _refresh_reranked_memory(self, current_doc_id=None):
+    def _refresh_reranked_memory(self, current_doc_id=None, is_exact_title_search=False):
         previous_ids = list(self._evidence_doc_ids)
         previous_set = set(previous_ids)
         ranked = sorted(
@@ -651,7 +651,23 @@ class FullWikiRetriever:
             ),
         )
         limit = self.max_evidence_documents or len(ranked)
-        self._evidence_doc_ids = [doc_id for doc_id, _ in ranked[:limit]]
+        selected_ids = [doc_id for doc_id, _ in ranked[:limit]]
+
+        # Exact-Title Memory Reservation:
+        # If an explicit exact title match exists (e.g. search[Inception] matched title "Inception"),
+        # reserve one slot in active memory for current_doc_id so subsequent lookup[keyword]
+        # calls on this exact entity page are guaranteed to succeed.
+        if (
+            is_exact_title_search
+            and current_doc_id
+            and current_doc_id in self._evidence_archive
+            and current_doc_id not in selected_ids
+        ):
+            if selected_ids:
+                selected_ids.pop()
+            selected_ids.append(current_doc_id)
+
+        self._evidence_doc_ids = selected_ids
         self._evidence_doc_id_set = set(self._evidence_doc_ids)
 
         added_ids = [doc_id for doc_id in self._evidence_doc_ids if doc_id not in previous_set]
@@ -671,7 +687,11 @@ class FullWikiRetriever:
     ):
         new_archive_titles, reranker_latency = self._score_new_archive_documents(query, hits)
         current_doc_id = str(self.current_document.get("doc_id", "")) if self.current_document else None
-        added_ids, evicted_ids, active_hits, observation_omitted = self._refresh_reranked_memory(current_doc_id=current_doc_id)
+        is_exact_title_search = title_match_rank is not None
+        added_ids, evicted_ids, active_hits, observation_omitted = self._refresh_reranked_memory(
+            current_doc_id=current_doc_id,
+            is_exact_title_search=is_exact_title_search,
+        )
 
         active_titles = [hit["title"] for hit in active_hits]
         active_id_set = set(self._evidence_doc_ids)

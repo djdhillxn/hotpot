@@ -44,7 +44,7 @@ HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia
 - **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings.
 - **Retrieval protocol:**
   - **Single-Pass RAG Baseline:** Retrieves top 7 passages once from the original question (1 generation pass).
-  - **ReAct Multi-Hop Agent:** Retrieves top 15 passages per `search[...]` turn (`candidate_k: 80`). Every unique retrieved document enters a per-question archive, is scored once against the original question by `BAAI/bge-reranker-base` (Sentence-Level Max-Scoring), and the 15 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
+  - **ReAct Multi-Hop Agent:** Retrieves top 20 passages per `search[...]` turn (`candidate_k: 60`). Every unique retrieved document enters a per-question archive, is scored once against the original question by `BAAI/bge-reranker-base` (Sentence-Level Max-Scoring), and the 15 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
   - **Shared Index:** Both systems query the exact same pre-built hybrid index (`indexes/fullwiki/`). Zero index rebuild required.
 - **Qwen Prompting & ChatML System Structuring:**
   - Formatted as structured `[SystemMessage(...), HumanMessage(...)]` objects passed to `llm.invoke()`, forcing vLLM to format context using Qwen's native `<|im_start|>system...` ChatML template.
