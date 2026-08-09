@@ -79,6 +79,23 @@ Observation: Loaded [Elia Kazan] (rank 1).
 Thought: Both Nicholas Ray and Elia Kazan were film directors, screenwriters, and actors. The primary shared profession is director.
 Action: finish[director]
 Support: [["Nicholas Ray", 0], ["Elia Kazan", 0]]
+
+---
+EXAMPLE 4:
+Question: Which film directed by Christopher Nolan stars Leonardo DiCaprio?
+Thought: I need to search for Christopher Nolan's filmography.
+Action: search[Christopher Nolan]
+Observation: Loaded [Christopher Nolan] (rank 1).
+[Christopher Nolan | sent 0] Christopher Edward Nolan (born 30 July 1970) is a British-American film director, screenwriter, and producer.
+[Christopher Nolan | sent 1] His films include Memento, The Dark Knight Trilogy, Inception, Interstellar, and Oppenheimer.
+Thought: I should search for Inception to see if it stars Leonardo DiCaprio.
+Action: search[Inception]
+Observation: Loaded [Inception] (rank 1).
+[Inception | sent 0] Inception is a 2010 science fiction action film written and directed by Christopher Nolan.
+[Inception | sent 1] The film stars Leonardo DiCaprio as a professional thief who steals information by infiltrating the subconscious.
+Thought: Inception was directed by Christopher Nolan and stars Leonardo DiCaprio.
+Action: finish[Inception]
+Support: [["Christopher Nolan", 1], ["Inception", 0], ["Inception", 1]]
 """
 
 FORCED_SYNTHESIS_PROMPT_SYSTEM = """You have exhausted the allowed search/lookup budget for this question.

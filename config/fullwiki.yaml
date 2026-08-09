@@ -11,7 +11,7 @@ evaluation_split: "validation"
 # First-Stage FullWiki Retrieval Settings
 retrieval_mode: "fullwiki"
 retriever: "hybrid"
-candidate_k: 20
+candidate_k: 30
 rrf_k: 60
 
 # Single-Pass Baseline Hyperparameters
@@ -19,12 +19,12 @@ baseline_top_k: 7
 
 # ReAct Multi-Hop Agent Hyperparameters
 max_tool_steps: 7
-react_top_k: 6
-max_evidence_documents: 10
-max_observation_chars: 7200
+react_top_k: 8
+max_evidence_documents: 15
+max_observation_chars: 15000
 
-# ReAct Cross-Encoder Evidence Memory Reranker
+# ReAct Cross-Encoder Evidence Memory Reranker (GPU Accelerated)
 memory_reranker_model: "cross-encoder/ms-marco-MiniLM-L6-v2"
-memory_reranker_device: "cpu"
+memory_reranker_device: "cuda"
 memory_reranker_max_length: 512
 memory_reranker_batch_size: 16
