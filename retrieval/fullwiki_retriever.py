@@ -568,7 +568,26 @@ class FullWikiRetriever:
         return observation
 
     def lookup(self, keyword):
-        if not self.current_document:
+        keyword_clean = str(keyword).strip().strip("'\"").lower()
+        if not keyword_clean:
+            return "Observation: Lookup keyword cannot be empty."
+
+        active_hits = []
+        if self.last_result and isinstance(self.last_result.get("hits"), list) and self.last_result["hits"]:
+            active_hits = self.last_result["hits"]
+        elif self.current_document:
+            active_hits = [
+                {
+                    "doc_id": self.current_document["doc_id"],
+                    "title": self.current_document["title"],
+                    "sentences": [
+                        {"sent_id": s_id, "text": text}
+                        for s_id, text in enumerate(self.current_document.get("sentences", []))
+                    ],
+                }
+            ]
+
+        if not active_hits:
             self.last_result = {
                 "action": "lookup",
                 "query": keyword,
@@ -579,46 +598,43 @@ class FullWikiRetriever:
             }
             return "Observation: No FullWiki document currently loaded. Perform a `search` first."
 
-        current_doc_id = str(self.current_document["doc_id"])
-        if current_doc_id not in self._evidence_doc_id_set:
-            self.last_result = {
-                "action": "lookup",
-                "query": keyword,
-                "status": "evidence_cap_reached",
-                "title": self.current_document["title"],
-                "sentences": [],
-                "hits": [],
-                "evidence_document_count": self.evidence_document_count,
-                "max_evidence_documents": self.max_evidence_documents,
-            }
-            return f"Observation: Could not load [{self.current_document['title']}] for lookup."
+        matched_hits = []
+        rendered_blocks = []
+        all_matches = []
 
-        keyword_clean = str(keyword).strip().strip("'\"").lower()
-        matches = []
-        for sent_id, text in enumerate(self.current_document.get("sentences", [])):
-            if keyword_clean in text.lower():
-                matches.append({"sent_id": sent_id, "text": text})
-                if len(matches) >= 3:
-                    break
+        for hit in active_hits:
+            doc_matches = []
+            for item in hit.get("sentences", []):
+                text = item.get("text", "")
+                if keyword_clean in str(text).lower():
+                    doc_matches.append({"sent_id": item["sent_id"], "text": text})
+                    all_matches.append({"title": hit["title"], "sent_id": item["sent_id"], "text": text})
+                    if len(all_matches) >= 5:
+                        break
+            if doc_matches:
+                matched_hits.append({
+                    "doc_id": str(hit.get("doc_id", "")),
+                    "title": hit["title"],
+                    "sentences": doc_matches,
+                })
+                rendered_blocks.append(
+                    f"Found matches in [{hit['title']}].\n"
+                    + self._render_sentences(hit["title"], doc_matches)
+                )
+            if len(all_matches) >= 5:
+                break
 
         self.last_result = {
             "action": "lookup",
             "query": keyword,
-            "status": "found" if matches else "not_found",
-            "title": self.current_document["title"],
-            "sentences": matches,
-            "hits": [
-                {
-                    "doc_id": self.current_document["doc_id"],
-                    "title": self.current_document["title"],
-                    "rank": 1,
-                    "sentences": matches,
-                }
-            ],
+            "status": "found" if matched_hits else "not_found",
+            "title": self.current_title,
+            "sentences": all_matches,
+            "hits": matched_hits,
         }
-        if not matches:
-            return f"Observation: Could not find '{keyword}' in [{self.current_document['title']}]."
-        return (
-            f"Observation: Found matches in [{self.current_document['title']}].\n"
-            + self._render_sentences(self.current_document["title"], matches)
-        )
+
+        if not matched_hits:
+            doc_names = ", ".join(f"[{h['title']}]" for h in active_hits[:3])
+            return f"Observation: Could not find '{keyword}' in active documents ({doc_names})."
+
+        return "Observation:\n" + "\n\n".join(rendered_blocks)

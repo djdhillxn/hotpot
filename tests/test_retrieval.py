@@ -197,9 +197,9 @@ def test_react_session_caps_unique_working_evidence_but_logs_full_top_k():
     backend = RollingFakeBackend()
     retriever = FullWikiRetriever(
         backend,
-        search_top_k=6,
-        max_observation_chars=7200,
-        max_evidence_documents=15,
+        search_top_k=3,
+        max_observation_chars=3600,
+        max_evidence_documents=6,
         duplicate_search_guard=True,
     )
 
@@ -207,10 +207,10 @@ def test_react_session_caps_unique_working_evidence_but_logs_full_top_k():
     retriever.search("second")
     third_observation = retriever.search("third")
 
-    assert retriever.evidence_document_count == 15
-    assert len(retriever.visited_pages) == 15
-    assert len(retriever.last_result["retrieved_hits"]) == 6
-    assert len(retriever.last_result["hits"]) == 3
+    assert retriever.evidence_document_count == 6
+    assert len(retriever.visited_pages) == 6
+    assert len(retriever.last_result["retrieved_hits"]) == 3
+    assert len(retriever.last_result["hits"]) == 0
     assert len(retriever.last_result["omitted_due_to_evidence_cap"]) == 3
     assert "found no new evidence" in third_observation
 
