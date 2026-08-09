@@ -246,3 +246,90 @@ def test_fullwiki_observation_respects_global_character_cap():
     observation = retriever.search("query")
     assert len(observation) <= 500
     assert len(retriever.last_result["retrieved_hits"]) == 6
+
+
+def test_lookup_uses_only_rank_one_page_and_advances_matching_sentences():
+    class LookupBackend:
+        def search(self, query, top_k=1):
+            hits = [
+                {
+                    "doc_id": "1",
+                    "title": "Rank One",
+                    "rank": 1,
+                    "bm25_rank": 1,
+                    "bm25_score": 10.0,
+                    "dense_rank": 1,
+                    "dense_score": 0.9,
+                    "fused_score": 0.03,
+                    "sentences": [
+                        "Target appears in the first sentence.",
+                        "Target also appears in the second sentence.",
+                    ],
+                },
+                {
+                    "doc_id": "2",
+                    "title": "Rank Two",
+                    "rank": 2,
+                    "bm25_rank": 2,
+                    "bm25_score": 9.0,
+                    "dense_rank": 2,
+                    "dense_score": 0.8,
+                    "fused_score": 0.02,
+                    "sentences": ["Only rank two contains UNIQUESECOND."],
+                },
+            ]
+            return {
+                "query": query,
+                "mode": "hybrid",
+                "candidate_k": 20,
+                "top_k": top_k,
+                "hits": hits[:top_k],
+                "latency_ms": {"total": 1.0},
+            }
+
+    retriever = FullWikiRetriever(
+        LookupBackend(),
+        search_top_k=2,
+        max_observation_chars=4000,
+        max_evidence_documents=15,
+    )
+    retriever.search("query")
+
+    assert "Could not find 'UNIQUESECOND' in [Rank One]" in retriever.lookup("UNIQUESECOND")
+
+    first = retriever.lookup("Target")
+    second = retriever.lookup("Target")
+    exhausted = retriever.lookup("Target")
+
+    assert "(Result 1 / 2)" in first
+    assert "[Rank One | sent 0]" in first
+    assert "(Result 2 / 2)" in second
+    assert "[Rank One | sent 1]" in second
+    assert "No more results" in exhausted
+
+
+def test_lookup_cannot_bypass_max_working_evidence_document_cap():
+    backend = RollingFakeBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=6,
+        max_observation_chars=7200,
+        max_evidence_documents=15,
+    )
+
+    retriever.search("first")
+    retriever.search("second")
+    retriever.search("third")
+    assert retriever.evidence_document_count == 15
+    assert len(retriever.visited_pages) == 15
+
+    fourth = retriever.search("fourth")
+    assert "found no new evidence" in fourth
+    assert retriever.current_page_title == "Doc 401"
+    assert retriever.current_document["doc_id"] not in retriever._evidence_doc_id_set
+
+    lookup = retriever.lookup("Sentence")
+    assert "was not admitted to the bounded working evidence" in lookup
+    assert retriever.last_result["status"] == "current_page_not_exposed"
+    assert retriever.evidence_document_count == 15
+    assert len(retriever.visited_pages) == 15

@@ -24,8 +24,8 @@ Official HotpotQA Wikipedia (Oct. 1, 2017)
             /                  \
 Single-Pass RAG                ReAct Multi-Hop Agent
 1 query -> top 7 docs     up to 7 adaptive tool turns
-1 Qwen generation          top 3 docs/search -> Qwen
-                           max 6 unique docs in working context
+1 Qwen generation          top 6 docs/search -> Qwen
+                           max 15 unique docs in working context
             \                  /
              HotpotQA official metrics
 ```
@@ -42,16 +42,16 @@ HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia
 - **Sparse retrieval:** Lucene BM25 through Pyserini/Anserini (pins `pyserini==1.6.0` requiring Java 21).
 - **Dense retrieval:** `BAAI/bge-base-en-v1.5`, L2-normalized embeddings, persisted in a memory-efficient FAISS IVF-PQ index (`IVF4096,PQ96x8`, `nprobe=32`). Corpus encoding is performed once during index construction; benchmark-time query encoding runs on CPU so it does not compete with vLLM for GPU VRAM.
 - **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings.
-- **Information Budget Alignment:**
+- **Retrieval protocol:**
   - **Single-Pass RAG Baseline:** Retrieves top 7 passages once from the original question (1 generation pass).
-  - **ReAct Multi-Hop Agent:** Retrieves top 3 passages per `search[...]` turn, retaining up to 6 unique Wikipedia documents across up to 7 adaptive turns.
+  - **ReAct Multi-Hop Agent:** Retrieves top 6 passages per `search[...]` turn, retaining up to 15 unique Wikipedia documents across up to 7 adaptive turns.
   - **Shared Index:** Both systems query the exact same pre-built hybrid index (`indexes/fullwiki/`). Zero index rebuild required.
 - **Qwen Prompting & ChatML System Structuring:**
   - Formatted as structured `[SystemMessage(...), HumanMessage(...)]` objects passed to `llm.invoke()`, forcing vLLM to format context using Qwen's native `<|im_start|>system...` ChatML template.
   - Includes 3 standard HotpotQA Few-Shot exemplars demonstrating `Action: finish[canonical answer]` AND sentence-level citations `Support: [["Title", sentence_id], ...]`, enabling high Joint F1 scores.
 - **Hard Generation Stop Sequences:** `stop=["\nObservation:", "Observation:"]` is explicitly bound on model invocations in `agent/engine.py`. This guarantees vLLM cuts off generation immediately after `Action: ...`, preventing Qwen from self-hallucinating Wikipedia observations.
-- **Generation Constraints & Repetition Guard:** `max_tokens = 150` prevents runaway monologues. Step-level repetition guards prevent infinite search loops by detecting consecutive identical actions across turns.
-- **Multi-Hit Lookup Scanning:** `lookup[keyword]` scans all currently active/visible hits in the observation window (ranks 1–3) and automatically ingests matching sentences into `observed_supporting_facts`.
+- **Generation Constraints & Repetition Guard:** `max_tokens = 150` prevents runaway monologues. Consecutive duplicate searches are guarded, while repeated `lookup[keyword]` calls are allowed because classic ReAct uses them to advance through successive matches on the current page.
+- **Classic Current-Page Lookup:** `lookup[keyword]` searches only the current rank-1 page selected by the latest search. Repeating the same lookup advances to the next matching sentence on that same page, mirroring the original ReAct Wikipedia environment.
 - **ReAct controller:** LangGraph state machine enforcing Thought -> Action -> Observation, with delimiter-safe action parsing, markdown codeblock stripping (`replace("```", "")`), and a mandatory final synthesis call at the hop budget.
 - **Official-compatible evaluation:** Answer EM/F1, Supporting Fact EM/F1, Joint EM/F1, and evaluator-format `official_predictions.json`.
 - **Structured experiment artifacts:** complete trajectories, raw model outputs, sentence-level evidence, sparse/dense/fused ranks and scores, retrieval latency, run manifests, failures, and evidence graphs.
@@ -180,8 +180,6 @@ python eval/run_baseline.py \
 python eval/run_eval.py \
     --mode fullwiki \
     --retriever hybrid \
-    --top-k 3 \
-    --max-evidence-docs 6 \
     --source official_json \
     --concurrency 16 \
     --max-hops 7 \
@@ -213,7 +211,7 @@ The ReAct trajectory for every retrieval step retains:
 - BM25 rank/score;
 - dense rank/score;
 - fused rank/score;
-- complete raw top-3 retrieval candidates plus the subset added to working evidence;
+- complete raw top-6 retrieval candidates plus the subset added to working evidence;
 - sparse/dense/fused ranks and scores for every retrieved candidate;
 - duplicate-query status, query/title-match diagnostic, evidence-memory count, and cap omissions;
 - exact exposed Wikipedia titles and sentence IDs;

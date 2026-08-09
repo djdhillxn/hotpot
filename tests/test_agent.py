@@ -269,3 +269,61 @@ def test_official_prediction_artifacts_have_hotpot_schema(tmp_path):
     }
     assert gold[0]["_id"] == "q1"
     assert gold[0]["supporting_facts"] == [["A", 0], ["B", 1]]
+
+
+def test_react_allows_repeated_lookup_to_advance_current_page_matches():
+    class SequentialLookupTool:
+        def __init__(self):
+            self.lookup_calls = 0
+            self.current_page_title = None
+            self.last_result = None
+
+        def reset(self):
+            self.lookup_calls = 0
+            self.current_page_title = None
+            self.last_result = None
+
+        def search(self, query):
+            self.current_page_title = "Example"
+            self.last_result = {
+                "action": "search",
+                "title": "Example",
+                "hits": [{
+                    "title": "Example",
+                    "sentences": [{"sent_id": 0, "text": "Example page."}],
+                }],
+            }
+            return "Observation: [Example | sent 0] Example page."
+
+        def lookup(self, keyword):
+            self.lookup_calls += 1
+            sent_id = self.lookup_calls
+            text = f"Target match {self.lookup_calls}."
+            self.last_result = {
+                "action": "lookup",
+                "title": "Example",
+                "hits": [{
+                    "title": "Example",
+                    "sentences": [{"sent_id": sent_id, "text": text}],
+                }],
+            }
+            return f"Observation: [Example | sent {sent_id}] {text}"
+
+    fake_llm = FakeListChatModel(responses=[
+        "Thought: Open the page.\nAction: search[Example]",
+        "Thought: Find the target.\nAction: lookup[target]",
+        "Thought: Get the next target match.\nAction: lookup[target]",
+        'Thought: Done.\nAction: finish[answer]\nSupport: [["Example", 2]]',
+    ])
+    toolset = SequentialLookupTool()
+
+    state = run_react_agent(
+        question="What is the answer?",
+        llm=fake_llm,
+        toolset=toolset,
+        max_hops=3,
+    )
+
+    assert toolset.lookup_calls == 2
+    assert state["final_answer"] == "answer"
+    assert state["predicted_supporting_facts"] == [["Example", 2]]

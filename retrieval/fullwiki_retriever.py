@@ -308,6 +308,9 @@ class FullWikiRetriever:
         self._evidence_doc_ids = []
         self._evidence_doc_id_set = set()
         self._seen_search_queries = {}
+        self._lookup_keyword = None
+        self._lookup_matches = []
+        self._lookup_index = 0
 
     @property
     def current_page_title(self):
@@ -325,6 +328,9 @@ class FullWikiRetriever:
         self._evidence_doc_ids = []
         self._evidence_doc_id_set = set()
         self._seen_search_queries = {}
+        self._lookup_keyword = None
+        self._lookup_matches = []
+        self._lookup_index = 0
 
     @staticmethod
     def _render_sentences(title, sentences):
@@ -480,9 +486,14 @@ class FullWikiRetriever:
             self._seen_search_queries[normalized_query] = dict(self.last_result, retrieved_titles=[])
             return f"Observation: FullWiki retrieval found no document for '{query}'."
 
-        # Rank 1 remains the classic ReAct "current page" used by lookup.
+        # Rank 1 is the single classic ReAct current page used by lookup.
+        # A successful search resets lookup iteration state, just like the
+        # original WikiEnv.
         self.current_document = hits[0]
         self.current_title = hits[0]["title"]
+        self._lookup_keyword = None
+        self._lookup_matches = []
+        self._lookup_index = 0
 
         candidate_new_hits = []
         already_retained = []
@@ -568,29 +579,23 @@ class FullWikiRetriever:
         return observation
 
     def lookup(self, keyword):
-        keyword_clean = str(keyword).strip().strip("'\"").lower()
+        """Classic ReAct lookup over the single current rank-1 page.
+
+        Search may expose multiple ranked passages, but only rank 1 becomes the
+        current page. Repeating lookup with the same keyword advances through
+        matching sentences on that page, mirroring Yao et al.'s WikiEnv. A
+        lookup can never introduce a document that was not already admitted to
+        the bounded working-evidence set.
+        """
+        keyword_raw = str(keyword).strip().strip("'\"")
+        keyword_clean = keyword_raw.lower()
         if not keyword_clean:
             return "Observation: Lookup keyword cannot be empty."
 
-        active_hits = []
-        if self.last_result and isinstance(self.last_result.get("hits"), list) and self.last_result["hits"]:
-            active_hits = self.last_result["hits"]
-        elif self.current_document:
-            active_hits = [
-                {
-                    "doc_id": self.current_document["doc_id"],
-                    "title": self.current_document["title"],
-                    "sentences": [
-                        {"sent_id": s_id, "text": text}
-                        for s_id, text in enumerate(self.current_document.get("sentences", []))
-                    ],
-                }
-            ]
-
-        if not active_hits:
+        if not self.current_document or not self.current_title:
             self.last_result = {
                 "action": "lookup",
-                "query": keyword,
+                "query": keyword_raw,
                 "status": "no_current_page",
                 "title": None,
                 "sentences": [],
@@ -598,43 +603,75 @@ class FullWikiRetriever:
             }
             return "Observation: No FullWiki document currently loaded. Perform a `search` first."
 
-        matched_hits = []
-        rendered_blocks = []
-        all_matches = []
+        current_doc_id = str(self.current_document.get("doc_id", ""))
+        if current_doc_id not in self._evidence_doc_id_set:
+            self.last_result = {
+                "action": "lookup",
+                "query": keyword_raw,
+                "status": "current_page_not_exposed",
+                "title": self.current_title,
+                "sentences": [],
+                "hits": [],
+                "evidence_document_count": self.evidence_document_count,
+                "max_evidence_documents": self.max_evidence_documents,
+            }
+            return (
+                f"Observation: The current rank-1 page [{self.current_title}] was not admitted "
+                "to the bounded working evidence, so lookup cannot expose it."
+            )
 
-        for hit in active_hits:
-            doc_matches = []
-            for item in hit.get("sentences", []):
-                text = item.get("text", "")
+        if self._lookup_keyword != keyword_clean:
+            self._lookup_keyword = keyword_clean
+            self._lookup_matches = []
+            self._lookup_index = 0
+            for sent_id, text in enumerate(self.current_document.get("sentences", [])):
                 if keyword_clean in str(text).lower():
-                    doc_matches.append({"sent_id": item["sent_id"], "text": text})
-                    all_matches.append({"sent_id": item["sent_id"], "text": text})
-                    if len(all_matches) >= 5:
-                        break
-            if doc_matches:
-                matched_hits.append({
-                    "doc_id": str(hit.get("doc_id", "")),
-                    "title": hit["title"],
-                    "sentences": doc_matches,
-                })
-                rendered_blocks.append(
-                    f"Found matches in [{hit['title']}].\n"
-                    + self._render_sentences(hit["title"], doc_matches)
-                )
-            if len(all_matches) >= 5:
-                break
+                    self._lookup_matches.append({"sent_id": sent_id, "text": str(text)})
 
+        if self._lookup_index >= len(self._lookup_matches):
+            self.last_result = {
+                "action": "lookup",
+                "query": keyword_raw,
+                "status": "no_more_results",
+                "title": self.current_title,
+                "sentences": [],
+                "hits": [],
+                "lookup_result_index": self._lookup_index,
+                "lookup_result_count": len(self._lookup_matches),
+            }
+            if self._lookup_matches:
+                return f"Observation: No more results for '{keyword_raw}' in [{self.current_title}]."
+            return f"Observation: Could not find '{keyword_raw}' in [{self.current_title}]."
+
+        match = dict(self._lookup_matches[self._lookup_index])
+        self._lookup_index += 1
+        total_matches = len(self._lookup_matches)
+        hit = {
+            "doc_id": current_doc_id,
+            "title": self.current_title,
+            "rank": 1,
+            "sentences": [match],
+        }
         self.last_result = {
             "action": "lookup",
-            "query": keyword,
-            "status": "found" if matched_hits else "not_found",
+            "query": keyword_raw,
+            "status": "found",
             "title": self.current_title,
-            "sentences": all_matches,
-            "hits": matched_hits,
+            "sentences": [match],
+            "hits": [hit],
+            "lookup_result_index": self._lookup_index,
+            "lookup_result_count": total_matches,
+            "current_page_rank": 1,
         }
 
-        if not matched_hits:
-            doc_names = ", ".join(f"[{h['title']}]" for h in active_hits[:3])
-            return f"Observation: Could not find '{keyword}' in active documents ({doc_names})."
-
-        return "Observation:\n" + "\n\n".join(rendered_blocks)
+        prefix = f"Observation: (Result {self._lookup_index} / {total_matches}) "
+        label = f"[{self.current_title} | sent {match['sent_id']}] "
+        available = max(0, self.max_observation_chars - len(prefix) - len(label))
+        text = match["text"]
+        if len(text) > available:
+            text = text[: max(0, available - 1)].rstrip() + "…"
+            match["text"] = text
+            hit["sentences"] = [match]
+            self.last_result["sentences"] = [match]
+            self.last_result["hits"] = [hit]
+        return prefix + label + text

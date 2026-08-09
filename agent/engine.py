@@ -87,11 +87,13 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         prev_page = getattr(toolset, "current_page_title", None)
         tool_started = time.perf_counter()
 
-        # Step-level repetition guard for consecutive identical actions across all toolsets
+        # Consecutive duplicate searches are useless for deterministic retrieval,
+        # but repeated lookup[keyword] is valid classic ReAct behavior: each call
+        # advances to the next matching sentence on the current page.
         is_repetition = (
             len(steps) >= 2
             and steps[-1].get("action") == steps[-2].get("action")
-            and action_type not in {"invalid", "finish"}
+            and action_type == "search"
         )
 
         if is_repetition:

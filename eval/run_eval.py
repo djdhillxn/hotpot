@@ -78,6 +78,7 @@ def _sample_metadata(sample):
 def process_single_question(
     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend=None,
     search_top_k=REACT_SEARCH_TOP_K, max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
+    max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
 ):
     question = sample["question"]
     gold_answer = sample["answer"]
@@ -90,7 +91,7 @@ def process_single_question(
             raise RuntimeError("FullWiki backend was not initialized.")
         toolset = fullwiki_backend.create_session(
             search_top_k=search_top_k,
-            max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
+            max_observation_chars=max_observation_chars,
             max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=True,
         )
@@ -273,6 +274,7 @@ def run_benchmark(
     index_dir=FULLWIKI_INDEX_DIR,
     search_top_k=REACT_SEARCH_TOP_K,
     max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
+    max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
 ):
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
@@ -280,6 +282,8 @@ def run_benchmark(
         raise ValueError("search_top_k must be >= 1")
     if max_evidence_documents < 1:
         raise ValueError("max_evidence_documents must be >= 1")
+    if max_observation_chars < 1:
+        raise ValueError("max_observation_chars must be >= 1")
 
     logger, log_file = setup_logger(output_dir)
     run_started_at = datetime.now().isoformat()
@@ -297,6 +301,7 @@ def run_benchmark(
         f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
         f"Documents per adaptive search: {search_top_k if mode == 'fullwiki' else 1}\n"
         f"Max unique working-evidence documents: {max_evidence_documents if mode == 'fullwiki' else 'n/a'}\n"
+        f"Max characters per retrieval observation: {max_observation_chars if mode == 'fullwiki' else 'n/a'}\n"
     )
     if mode == "live":
         info_msg += (
@@ -329,7 +334,7 @@ def run_benchmark(
             try:
                 eval_metrics, trajectory_entry = process_single_question(
                     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend, search_top_k,
-                    max_evidence_documents
+                    max_evidence_documents, max_observation_chars
                 )
             except Exception as exc:
                 logger.exception(f"Error processing question {idx}: {exc}")
@@ -350,7 +355,7 @@ def run_benchmark(
             future_to_meta = {
                 executor.submit(
                     process_single_question, sample, idx, total, mode, llm, max_hops, logger,
-                    fullwiki_backend, search_top_k, max_evidence_documents
+                    fullwiki_backend, search_top_k, max_evidence_documents, max_observation_chars
                 ): (idx, sample)
                 for idx, sample in enumerate(samples, 1)
             }
@@ -455,7 +460,7 @@ def run_benchmark(
             "retrieval_top_k": search_top_k if mode == "fullwiki" else 1,
             "max_working_evidence_documents": max_evidence_documents if mode == "fullwiki" else None,
             "working_evidence_policy": "first_seen_unique_until_cap" if mode == "fullwiki" else None,
-            "max_observation_characters": REACT_MAX_OBSERVATION_CHARS if mode == "fullwiki" else None,
+            "max_observation_characters": max_observation_chars if mode == "fullwiki" else None,
             "duplicate_search_guard": mode == "fullwiki",
             "exact_title_promotion": False,
             "retriever": retriever if mode == "fullwiki" else mode,
@@ -485,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
     parser.add_argument("--top-k", type=int, default=REACT_SEARCH_TOP_K, help="Documents returned by each adaptive FullWiki search")
     parser.add_argument("--max-evidence-docs", type=int, default=REACT_MAX_EVIDENCE_DOCUMENTS, help="Maximum unique FullWiki documents retained in ReAct working evidence")
+    parser.add_argument("--max-observation-chars", type=int, default=REACT_MAX_OBSERVATION_CHARS, help="Maximum characters rendered by each FullWiki search observation")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
@@ -506,4 +512,5 @@ if __name__ == "__main__":
         index_dir=args.index_dir,
         search_top_k=args.top_k,
         max_evidence_documents=args.max_evidence_docs,
+        max_observation_chars=args.max_observation_chars,
     )

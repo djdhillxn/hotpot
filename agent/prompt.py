@@ -2,7 +2,7 @@ REACT_SYSTEM_PROMPT = """Solve a multi-step, multi-hop question-answering task b
 
 You have access to the following tools:
 (1) search[query]: Searches the configured HotpotQA retrieval corpus and returns the top retrieved sentence-labeled Wikipedia passages.
-(2) lookup[keyword]: Searches the currently loaded rank-1 page for sentences containing the keyword.
+(2) lookup[keyword]: Searches ONLY the currently loaded rank-1 page and returns the next sentence containing the keyword. Repeating the same lookup advances to the next match on that same page.
 (3) finish[answer]: Ends the task and provides the final concise answer based ONLY on observed evidence.
 
 STRICT FORMATTING RULES:

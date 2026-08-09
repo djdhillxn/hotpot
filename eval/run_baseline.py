@@ -12,7 +12,14 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agent.baseline_rag import run_single_pass_rag
-from config import FULLWIKI_INDEX_DIR, LLM_MODEL_NAME, OPENAI_API_BASE, OPENAI_API_KEY
+from config import (
+    BASELINE_SEARCH_TOP_K,
+    FULLWIKI_INDEX_DIR,
+    LLM_MODEL_NAME,
+    OPENAI_API_BASE,
+    OPENAI_API_KEY,
+    REACT_MAX_OBSERVATION_CHARS,
+)
 from eval.artifacts import (
     context_diagnostics,
     observed_evidence_diagnostics,
@@ -65,7 +72,7 @@ def _sample_metadata(sample):
 
 
 
-def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_backend=None, top_k=6):
+def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_backend=None, top_k=BASELINE_SEARCH_TOP_K):
     question = sample["question"]
     gold_answer = sample["answer"]
     gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
@@ -80,7 +87,7 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
             raise RuntimeError("FullWiki backend was not initialized.")
         toolset = fullwiki_backend.create_session(
             search_top_k=top_k,
-            max_observation_chars=24000,
+            max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
         )
     else:
         toolset = WikipediaToolSet()
@@ -452,7 +459,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
-    parser.add_argument("--top-k", type=int, default=6, help="Documents retrieved in the single-pass FullWiki search")
+    parser.add_argument("--top-k", type=int, default=BASELINE_SEARCH_TOP_K, help="Documents retrieved in the single-pass FullWiki search")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
