@@ -87,7 +87,19 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         prev_page = getattr(toolset, "current_page_title", None)
         tool_started = time.perf_counter()
 
-        if action_type == "search":
+        # Step-level repetition guard for consecutive identical actions across all toolsets
+        is_repetition = (
+            len(steps) >= 2
+            and steps[-1].get("action") == steps[-2].get("action")
+            and action_type not in {"invalid", "finish"}
+        )
+
+        if is_repetition:
+            observation = (
+                f"Observation: You previously executed this exact action '{last_step['action']}'. "
+                "Do not repeat identical actions. Try a different query term or use Lookup."
+            )
+        elif action_type == "search":
             observation = toolset.search(action_arg)
         elif action_type == "lookup":
             observation = toolset.lookup(action_arg)

@@ -115,7 +115,7 @@ def parse_baseline_output(llm_output):
 
 
 def parse_react_output(llm_output):
-    cleaned_output = llm_output.strip()
+    cleaned_output = str(llm_output or "").strip().replace("```", "").strip()
 
     if "Observation:" in cleaned_output:
         cleaned_output = cleaned_output.split("Observation:")[0].strip()
