@@ -519,44 +519,50 @@ class FullWikiRetriever:
         return rows
 
     def _score_new_archive_documents(self, query, hits):
+        # Partition hits into new vs previously archived documents before updating self._evidence_archive
         new_hits = [hit for hit in hits if str(hit["doc_id"]) not in self._evidence_archive]
-        if not new_hits:
-            return [], 0.0
-
-        scores_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
-        
-        # Sub-Query Bridge Protection (Max-Score Rule):
-        # Score against both the original question and the specific search sub-query
-        # for new documents to ensure intermediate bridge documents are not prematurely evicted.
-        if query and self._normalize_query(query) != self._normalize_query(self.question):
-            scores_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
-            scores = [max(sq, ss) for sq, ss in zip(scores_q, scores_sub)]
-            latency = latency1 + latency2
-        else:
-            scores = scores_q
-            latency = latency1
-
-        if len(scores) != len(new_hits):
-            raise RuntimeError(
-                f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
-            )
+        new_doc_ids = {str(hit["doc_id"]) for hit in new_hits}
+        existing_hits = [
+            hit for hit in hits
+            if str(hit["doc_id"]) in self._evidence_archive and str(hit["doc_id"]) not in new_doc_ids
+        ]
 
         added_titles = []
-        for hit, score in zip(new_hits, scores):
-            doc_id = str(hit["doc_id"])
-            self._archive_order += 1
-            self._evidence_archive[doc_id] = {
-                "document": dict(hit),
-                "reranker_score": float(score),
-                "first_seen_order": self._archive_order,
-                "first_seen_query": query,
-            }
-            added_titles.append(hit["title"])
+        latency = 0.0
+
+        if new_hits:
+            scores_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
+            
+            # Sub-Query Bridge Protection (Max-Score Rule):
+            # Score against both the original question and the specific search sub-query
+            # for new documents to ensure intermediate bridge documents are not prematurely evicted.
+            if query and self._normalize_query(query) != self._normalize_query(self.question):
+                scores_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
+                scores = [max(sq, ss) for sq, ss in zip(scores_q, scores_sub)]
+                latency += latency1 + latency2
+            else:
+                scores = scores_q
+                latency += latency1
+
+            if len(scores) != len(new_hits):
+                raise RuntimeError(
+                    f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
+                )
+
+            for hit, score in zip(new_hits, scores):
+                doc_id = str(hit["doc_id"])
+                self._archive_order += 1
+                self._evidence_archive[doc_id] = {
+                    "document": dict(hit),
+                    "reranker_score": float(score),
+                    "first_seen_order": self._archive_order,
+                    "first_seen_query": query,
+                }
+                added_titles.append(hit["title"])
 
         # Rediscovery Score Upgrade Rule:
         # If an already-archived document is explicitly rediscovered by a later sub-query,
         # score it against that sub-query and upgrade its stored score if higher.
-        existing_hits = [hit for hit in hits if str(hit["doc_id"]) in self._evidence_archive]
         if query and self._normalize_query(query) != self._normalize_query(self.question) and existing_hits:
             scores_existing, latency_ext = self.backend.score_evidence_documents(query, existing_hits)
             latency += latency_ext
