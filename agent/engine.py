@@ -1,3 +1,4 @@
+import threading
 import time
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
@@ -7,6 +8,10 @@ from agent.parser import parse_react_output, parse_supporting_facts
 from agent.state import create_initial_state
 from tools.wikipedia import WikipediaToolSet
 from config import MAX_AGENT_HOPS
+
+
+_COMPILED_GRAPH_CACHE = {}
+_GRAPH_CACHE_LOCK = threading.Lock()
 
 
 def _get_response_text(response):
@@ -20,7 +25,7 @@ def _validate_supporting_facts(facts, observed_facts):
     return valid, invalid
 
 
-def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
+def create_react_agent_graph(llm, toolset=None, max_hops=MAX_AGENT_HOPS):
     # Bind stop sequence and max token generation constraints for Qwen / LLM inference
     bound_llm = llm.bind(stop=["\nObservation:", "Observation:"], max_tokens=150)
 
@@ -82,6 +87,7 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         return updates
 
     def tool_node(state):
+        active_toolset = state.get("toolset") or toolset
         action_type = state.get("current_action_type")
         action_arg = state.get("current_action_arg")
         steps = list(state.get("steps", []))
@@ -91,7 +97,7 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         evidence_graph = list(state.get("evidence_graph", []))
         visited_pages = list(state.get("visited_pages", []))
 
-        prev_page = getattr(toolset, "current_page_title", None)
+        prev_page = getattr(active_toolset, "current_page_title", None)
         tool_started = time.perf_counter()
 
         # Consecutive duplicate searches are useless for deterministic retrieval,
@@ -109,9 +115,9 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
                 "Do not repeat identical actions. Try a different query term or use Lookup."
             )
         elif action_type == "search":
-            observation = toolset.search(action_arg)
+            observation = active_toolset.search(action_arg)
         elif action_type == "lookup":
-            observation = toolset.lookup(action_arg)
+            observation = active_toolset.lookup(action_arg)
         elif action_type == "invalid":
             observation = (
                 "Observation: Invalid action format. Use Action: search[query], "
@@ -123,60 +129,46 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         tool_latency = time.perf_counter() - tool_started
         updated_steps = list(steps)
         observed_supporting_facts = list(state.get("observed_supporting_facts", []))
-        if updated_steps:
-            updated_steps[-1]["observation"] = observation
-            updated_steps[-1]["tool_latency_seconds"] = round(tool_latency, 6)
-            retrieval = getattr(toolset, "last_result", None)
-            if retrieval is not None:
-                updated_steps[-1]["retrieval"] = retrieval
-                if isinstance(retrieval, dict):
-                    retrieval_hits = retrieval.get("hits") or []
-                    if retrieval_hits:
-                        for hit in retrieval_hits:
-                            title = hit.get("title")
-                            if title and title not in visited_pages:
-                                visited_pages.append(title)
-                                evidence_graph.append({
-                                    "source": prev_page if prev_page in visited_pages else "Question",
-                                    "target": title,
-                                    "label": f"Retrieved for '{action_arg}'",
-                                })
-                            for sentence in hit.get("sentences", []):
-                                if title and isinstance(sentence, dict) and "sent_id" in sentence:
-                                    fact = [title, int(sentence["sent_id"])]
-                                    if fact not in observed_supporting_facts:
-                                        observed_supporting_facts.append(fact)
-                    else:
-                        title = retrieval.get("title")
-                        if title and title not in visited_pages:
-                            visited_pages.append(title)
-                            evidence_graph.append({
-                                "source": prev_page if prev_page in visited_pages else "Question",
-                                "target": title,
-                                "label": f"Retrieved for '{action_arg}'",
-                            })
-                        for sentence in retrieval.get("sentences", []):
-                            if title and isinstance(sentence, dict) and "sent_id" in sentence:
-                                fact = [title, int(sentence["sent_id"])]
-                                if fact not in observed_supporting_facts:
-                                    observed_supporting_facts.append(fact)
 
-        new_scratchpad = (
-            state.get("scratchpad", "")
-            + f"Thought: {last_step['thought']}\nAction: {last_step['action']}\n{observation}\n"
+        curr_page = getattr(active_toolset, "current_page_title", None)
+        curr_doc = getattr(active_toolset, "current_document", None)
+
+        if curr_page and curr_page not in visited_pages:
+            visited_pages.append(curr_page)
+
+        if curr_doc and "sentences" in curr_doc:
+            title = curr_doc.get("title", "")
+            for sent_idx, sentence_text in enumerate(curr_doc["sentences"]):
+                fact_pair = [title, sent_idx]
+                if fact_pair not in observed_supporting_facts:
+                    observed_supporting_facts.append(fact_pair)
+
+        last_step_updated = dict(updated_steps[-1])
+        last_step_updated["observation"] = observation
+        last_step_updated["tool_latency_seconds"] = round(tool_latency, 6)
+        updated_steps[-1] = last_step_updated
+
+        new_scratchpad = state.get("scratchpad", "")
+        if action_type in {"search", "lookup", "invalid"}:
+            new_scratchpad += (
+                f"{last_step.get('thought', '')}\n"
+                f"{last_step.get('action', '')}\n"
+                f"{observation}\n"
+            )
+
+        active_evidence_context = (
+            active_toolset.active_evidence_context()
+            if hasattr(active_toolset, "active_evidence_context")
+            else ""
         )
-
-        active_evidence_context = state.get("active_evidence_context", "")
-        if hasattr(toolset, "render_active_evidence"):
-            active_evidence_context = toolset.render_active_evidence()
 
         updates = dict(state)
         updates["steps"] = updated_steps
         updates["scratchpad"] = new_scratchpad
         updates["active_evidence_context"] = active_evidence_context
-        updates["step_count"] = state.get("step_count", 0) + 1
-        updates["visited_pages"] = visited_pages
         updates["observed_supporting_facts"] = observed_supporting_facts
+        updates["visited_pages"] = visited_pages
+        updates["step_count"] = state.get("step_count", 0) + 1
         updates["evidence_graph"] = evidence_graph
 
         return updates
@@ -278,13 +270,26 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
     return workflow.compile()
 
 
+def get_compiled_react_agent_graph(llm, max_hops=MAX_AGENT_HOPS):
+    key = (id(llm), int(max_hops))
+    with _GRAPH_CACHE_LOCK:
+        if key in _COMPILED_GRAPH_CACHE:
+            return _COMPILED_GRAPH_CACHE[key]
+
+    graph = create_react_agent_graph(llm, toolset=None, max_hops=max_hops)
+    with _GRAPH_CACHE_LOCK:
+        _COMPILED_GRAPH_CACHE[key] = graph
+    return graph
+
+
 def run_react_agent(question, llm, toolset=None, max_hops=MAX_AGENT_HOPS):
     if toolset is None:
         toolset = WikipediaToolSet()
     elif hasattr(toolset, "reset"):
         toolset.reset()
 
-    graph = create_react_agent_graph(llm, toolset, max_hops)
+    graph = get_compiled_react_agent_graph(llm, max_hops=max_hops)
     initial_state = create_initial_state(question)
+    initial_state["toolset"] = toolset
     final_state = graph.invoke(initial_state)
     return final_state

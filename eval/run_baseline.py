@@ -57,12 +57,19 @@ def setup_logger(output_dir):
 
 def get_llm_model(model_name=LLM_MODEL_NAME, api_base=OPENAI_API_BASE, api_key=OPENAI_API_KEY):
     from langchain_openai import ChatOpenAI
+    import httpx
+
+    http_client = httpx.Client(
+        limits=httpx.Limits(max_connections=250, max_keepalive_connections=150),
+        timeout=180.0,
+    )
 
     return ChatOpenAI(
         model_name=model_name,
         temperature=0.0,
         base_url=api_base,
         api_key=api_key if api_key else "EMPTY",
+        http_client=http_client,
         extra_body={
             "temperature": 0.0,
             "top_p": 1.0,
