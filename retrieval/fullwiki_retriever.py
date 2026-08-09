@@ -170,6 +170,19 @@ class FullWikiSearchBackend:
         data["sentences"] = [str(sentence) for sentence in data.get("sentences", [])]
         return data
 
+    def get_doc_by_title(self, title):
+        title = str(title or "").strip().strip("'\"")
+        if not title:
+            return None
+        norm_target = title.lower()
+        escaped_title = title.replace('"', '\\"')
+        hits = self.lucene.search(f'title:"{escaped_title}"', k=5)
+        for hit in hits:
+            doc = self._parse_lucene_doc(str(hit.docid))
+            if doc and str(doc.get("title", "")).strip().lower() == norm_target:
+                return doc
+        return None
+
     def _bm25_search(self, query, k):
         started = time.perf_counter()
         hits = self.lucene.search(query, k=k)
@@ -748,6 +761,14 @@ class FullWikiRetriever:
             is_exact_title_search=is_exact_title_search,
         )
 
+        # Update current_document and current_title to Cross-Encoder #1 page when no exact title match
+        if active_hits and not is_exact_title_search:
+            top_doc_id = active_hits[0]["doc_id"]
+            top_doc_entry = self._evidence_archive[top_doc_id]
+            self.current_document = top_doc_entry["document"]
+            self.current_title = top_doc_entry["document"]["title"]
+            current_doc_id = str(self.current_document.get("doc_id", ""))
+
         active_titles = [hit["title"] for hit in active_hits]
         active_id_set = set(self._evidence_doc_ids)
         raw_omitted_titles = [
@@ -857,6 +878,17 @@ class FullWikiRetriever:
             (hit["rank"] for hit in hits if self._normalize_title(hit["title"]) == normalized_query),
             None,
         )
+
+        # Direct Title Index Injection:
+        # If an exact title match was missed by RRF (title_match_rank is None),
+        # query the backend directly by title. If found, inject it at position 0 of hits.
+        if self.use_reranked_memory and title_match_rank is None and hasattr(self.backend, "get_doc_by_title"):
+            direct_doc = self.backend.get_doc_by_title(query)
+            if direct_doc and str(direct_doc["doc_id"]) not in {str(h["doc_id"]) for h in hits}:
+                direct_hit = dict(direct_doc, rank=1, fused_score=1.0)
+                reordered_hits = [direct_hit] + hits
+                hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
+                title_match_rank = 1
 
         # ReAct entity searches often name the exact Wikipedia page discovered on a
         # previous hop. When that exact title is already inside the retrieved top-k,
