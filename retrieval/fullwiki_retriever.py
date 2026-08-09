@@ -553,6 +553,18 @@ class FullWikiRetriever:
             }
             added_titles.append(hit["title"])
 
+        # Rediscovery Score Upgrade Rule:
+        # If an already-archived document is explicitly rediscovered by a later sub-query,
+        # score it against that sub-query and upgrade its stored score if higher.
+        existing_hits = [hit for hit in hits if str(hit["doc_id"]) in self._evidence_archive]
+        if query and self._normalize_query(query) != self._normalize_query(self.question) and existing_hits:
+            scores_existing, latency_ext = self.backend.score_evidence_documents(query, existing_hits)
+            latency += latency_ext
+            for hit, score in zip(existing_hits, scores_existing):
+                doc_id = str(hit["doc_id"])
+                entry = self._evidence_archive[doc_id]
+                entry["reranker_score"] = max(float(entry["reranker_score"]), float(score))
+
         return added_titles, latency
 
     def _render_reranked_memory(self, current_doc_id=None):

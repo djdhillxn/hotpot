@@ -301,7 +301,7 @@ from config import (
 
 def run_benchmark(
     num_samples=None,
-    mode="offline",
+    mode="fullwiki",
     model_name=LLM_MODEL_NAME,
     source="sample",
     api_base=OPENAI_API_BASE,
@@ -315,7 +315,16 @@ def run_benchmark(
     search_top_k=REACT_SEARCH_TOP_K,
     max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
     max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
+    reranker_model=None,
+    reranker_device=None,
+    reranker_max_length=None,
+    reranker_batch_size=None,
 ):
+    reranker_model = reranker_model or REACT_MEMORY_RERANKER_MODEL
+    reranker_device = reranker_device or REACT_MEMORY_RERANKER_DEVICE
+    reranker_max_length = reranker_max_length or REACT_MEMORY_RERANKER_MAX_LENGTH
+    reranker_batch_size = reranker_batch_size or REACT_MEMORY_RERANKER_BATCH_SIZE
+
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
     if search_top_k < 1:
@@ -362,10 +371,10 @@ def run_benchmark(
             mode=retriever,
             candidate_k=candidate_k,
             rrf_k=rrf_k,
-            evidence_reranker_model=REACT_MEMORY_RERANKER_MODEL,
-            evidence_reranker_device=REACT_MEMORY_RERANKER_DEVICE,
-            evidence_reranker_max_length=REACT_MEMORY_RERANKER_MAX_LENGTH,
-            evidence_reranker_batch_size=REACT_MEMORY_RERANKER_BATCH_SIZE,
+            evidence_reranker_model=reranker_model,
+            evidence_reranker_device=reranker_device,
+            evidence_reranker_max_length=reranker_max_length,
+            evidence_reranker_batch_size=reranker_batch_size,
         )
 
     results = []
@@ -568,6 +577,8 @@ if __name__ == "__main__":
     parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
     parser.add_argument("--output-dir", type=str, default="eval_results/react", help="Directory for outputs")
     parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
+    parser.add_argument("--reranker-model", type=str, default=None, help="Evidence reranker model name")
+    parser.add_argument("--reranker-device", type=str, default=None, help="Evidence reranker device (cpu/cuda)")
     parser.add_argument("--max-hops", type=int, default=None, help="Maximum hops per question")
 
     args = parser.parse_args()
@@ -585,6 +596,10 @@ if __name__ == "__main__":
 
     candidate_k = args.candidate_k or cfg.get("candidate_k") or FULLWIKI_SEARCH_CANDIDATES
     rrf_k = args.rrf_k or cfg.get("rrf_k") or FULLWIKI_RRF_K
+    reranker_model = args.reranker_model or cfg.get("memory_reranker_model") or REACT_MEMORY_RERANKER_MODEL
+    reranker_device = args.reranker_device or cfg.get("memory_reranker_device") or REACT_MEMORY_RERANKER_DEVICE
+    reranker_batch_size = cfg.get("memory_reranker_batch_size") or REACT_MEMORY_RERANKER_BATCH_SIZE
+    reranker_max_length = cfg.get("memory_reranker_max_length") or REACT_MEMORY_RERANKER_MAX_LENGTH
 
     run_benchmark(
         num_samples=args.samples,
@@ -602,4 +617,8 @@ if __name__ == "__main__":
         search_top_k=search_top_k,
         max_evidence_documents=max_evidence_docs,
         max_observation_chars=max_observation_chars,
+        reranker_model=reranker_model,
+        reranker_device=reranker_device,
+        reranker_batch_size=reranker_batch_size,
+        reranker_max_length=reranker_max_length,
     )

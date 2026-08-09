@@ -28,6 +28,7 @@ class CrossEncoderEvidenceReranker:
             max_length=self.max_length,
             device=self.device,
         )
+        print(f"[EvidenceReranker] Loaded '{self.model_name}' on device '{self.device}' (batch_size={self.batch_size}, max_length={self.max_length})")
 
     def score(self, question, passages):
         passages = [str(passage) for passage in passages]
@@ -39,7 +40,7 @@ class CrossEncoderEvidenceReranker:
         with self._lock:
             scores = self.model.predict(
                 pairs,
-                batch_size=min(self.batch_size, len(pairs)),
+                batch_size=self.batch_size,
                 show_progress_bar=False,
                 convert_to_numpy=True,
             )
