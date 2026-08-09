@@ -21,6 +21,10 @@ from config import (
     REACT_MAX_EVIDENCE_DOCUMENTS,
     REACT_MAX_OBSERVATION_CHARS,
     REACT_SEARCH_TOP_K,
+    REACT_MEMORY_RERANKER_BATCH_SIZE,
+    REACT_MEMORY_RERANKER_DEVICE,
+    REACT_MEMORY_RERANKER_MAX_LENGTH,
+    REACT_MEMORY_RERANKER_MODEL,
 )
 from eval.artifacts import (
     context_diagnostics,
@@ -94,6 +98,7 @@ def process_single_question(
             max_observation_chars=max_observation_chars,
             max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=True,
+            question=question,
         )
     else:
         toolset = WikipediaToolSet()
@@ -108,6 +113,12 @@ def process_single_question(
     invalid_supporting_facts = agent_state.get("invalid_supporting_facts", []) or []
     visited_pages = agent_state.get("visited_pages", [])
     step_count = agent_state.get("step_count", 0)
+    active_memory_documents = (
+        toolset.active_memory_snapshot() if hasattr(toolset, "active_memory_snapshot") else []
+    )
+    evidence_archive_count = (
+        toolset.evidence_archive_count if hasattr(toolset, "evidence_archive_count") else None
+    )
     observed_info = observed_evidence_diagnostics(
         gold_supporting_facts, gold_titles, observed_supporting_facts, visited_pages
     )
@@ -135,6 +146,8 @@ def process_single_question(
         "invalid_supporting_fact_count": len(invalid_supporting_facts),
         "gold_supporting_facts": gold_supporting_facts,
         "visited_pages": visited_pages,
+        "active_memory_documents": active_memory_documents,
+        "evidence_archive_count": evidence_archive_count,
         "latency": round(latency, 3),
         "timestamp": datetime.now().isoformat(),
         **observed_info,
@@ -170,6 +183,8 @@ def process_single_question(
         "step_count": step_count,
         "latency_seconds": round(latency, 3),
         "visited_pages": visited_pages,
+        "active_memory_documents": active_memory_documents,
+        "evidence_archive_count": evidence_archive_count,
         "observed_gold_document_recall": observed_info["observed_gold_document_recall"],
         "observed_gold_supporting_fact_recall": observed_info["observed_gold_supporting_fact_recall"],
         "all_gold_supporting_facts_observed": observed_info["all_gold_supporting_facts_observed"],
@@ -320,6 +335,10 @@ def run_benchmark(
             dense_index_path=os.path.join(index_dir, "dense.faiss"),
             manifest_path=os.path.join(index_dir, "manifest.json"),
             mode=retriever,
+            evidence_reranker_model=REACT_MEMORY_RERANKER_MODEL,
+            evidence_reranker_device=REACT_MEMORY_RERANKER_DEVICE,
+            evidence_reranker_max_length=REACT_MEMORY_RERANKER_MAX_LENGTH,
+            evidence_reranker_batch_size=REACT_MEMORY_RERANKER_BATCH_SIZE,
         )
 
     results = []
@@ -459,7 +478,7 @@ def run_benchmark(
             "documents_per_search": search_top_k if mode == "fullwiki" else 1,
             "retrieval_top_k": search_top_k if mode == "fullwiki" else 1,
             "max_working_evidence_documents": max_evidence_documents if mode == "fullwiki" else None,
-            "working_evidence_policy": "first_seen_unique_until_cap" if mode == "fullwiki" else None,
+            "working_evidence_policy": "cross_encoder_top_k" if mode == "fullwiki" else None,
             "max_observation_characters": max_observation_chars if mode == "fullwiki" else None,
             "duplicate_search_guard": mode == "fullwiki",
             "exact_title_promotion": False,
@@ -482,35 +501,65 @@ def run_benchmark(
     generate_eval_plots_and_report(results, output_dir=output_dir)
 
 
+from config import (
+    FULLWIKI_INDEX_DIR,
+    LLM_MODEL_NAME,
+    MAX_AGENT_HOPS,
+    OPENAI_API_BASE,
+    OPENAI_API_KEY,
+    REACT_MAX_EVIDENCE_DOCUMENTS,
+    REACT_MAX_OBSERVATION_CHARS,
+    REACT_SEARCH_TOP_K,
+    REACT_MEMORY_RERANKER_BATCH_SIZE,
+    REACT_MEMORY_RERANKER_DEVICE,
+    REACT_MEMORY_RERANKER_MAX_LENGTH,
+    REACT_MEMORY_RERANKER_MODEL,
+    load_eval_config,
+)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run ReAct HotpotQA Benchmark")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML configuration file (e.g. config/fullwiki.yaml)")
     parser.add_argument("--samples", type=int, default=None, help="Number of questions to test (default: all)")
-    parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
-    parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
+    parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default=None, help="Retrieval mode")
+    parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default=None, help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
-    parser.add_argument("--top-k", type=int, default=REACT_SEARCH_TOP_K, help="Documents returned by each adaptive FullWiki search")
-    parser.add_argument("--max-evidence-docs", type=int, default=REACT_MAX_EVIDENCE_DOCUMENTS, help="Maximum unique FullWiki documents retained in ReAct working evidence")
-    parser.add_argument("--max-observation-chars", type=int, default=REACT_MAX_OBSERVATION_CHARS, help="Maximum characters rendered by each FullWiki search observation")
-    parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
-    parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
-    parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
+    parser.add_argument("--top-k", type=int, default=None, help="Documents returned by each adaptive FullWiki search")
+    parser.add_argument("--max-evidence-docs", type=int, default=None, help="Maximum unique FullWiki documents retained in ReAct working evidence")
+    parser.add_argument("--max-observation-chars", type=int, default=None, help="Maximum characters rendered by each FullWiki search observation")
+    parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default=None, help="Dataset source")
+    parser.add_argument("--model", type=str, default=None, help="LLM model name")
+    parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
     parser.add_argument("--output-dir", type=str, default="eval_results/react", help="Directory for outputs")
     parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
-    parser.add_argument("--max-hops", type=int, default=MAX_AGENT_HOPS, help="Maximum hops per question")
+    parser.add_argument("--max-hops", type=int, default=None, help="Maximum hops per question")
 
     args = parser.parse_args()
+    cfg = load_eval_config(args.config) if args.config else {}
+
+    mode = args.mode or cfg.get("retrieval_mode") or "offline"
+    retriever = args.retriever or cfg.get("retriever") or "hybrid"
+    search_top_k = args.top_k or cfg.get("react_top_k") or REACT_SEARCH_TOP_K
+    max_evidence_docs = args.max_evidence_docs or cfg.get("max_evidence_documents") or REACT_MAX_EVIDENCE_DOCUMENTS
+    max_observation_chars = args.max_observation_chars or cfg.get("max_observation_chars") or REACT_MAX_OBSERVATION_CHARS
+    source = args.source or cfg.get("dataset_source") or "sample"
+    model = args.model or cfg.get("model_name") or LLM_MODEL_NAME
+    api_base = args.api_base or cfg.get("api_base") or OPENAI_API_BASE
+    max_hops = args.max_hops or cfg.get("max_tool_steps") or MAX_AGENT_HOPS
+
     run_benchmark(
         num_samples=args.samples,
-        mode=args.mode,
-        model_name=args.model,
-        source=args.source,
-        api_base=args.api_base,
+        mode=mode,
+        model_name=model,
+        source=source,
+        api_base=api_base,
         output_dir=args.output_dir,
         concurrency=args.concurrency,
-        max_hops=args.max_hops,
-        retriever=args.retriever,
+        max_hops=max_hops,
+        retriever=retriever,
         index_dir=args.index_dir,
-        search_top_k=args.top_k,
-        max_evidence_documents=args.max_evidence_docs,
-        max_observation_chars=args.max_observation_chars,
+        search_top_k=search_top_k,
+        max_evidence_documents=max_evidence_docs,
+        max_observation_chars=max_observation_chars,
     )

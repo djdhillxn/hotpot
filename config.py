@@ -3,6 +3,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def load_eval_config(config_path="config/fullwiki.yaml"):
+    """Load configuration dictionary from YAML file or return empty dict if missing."""
+    if not config_path or not os.path.isfile(config_path):
+        return {}
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except ImportError:
+        config_data = {}
+        with open(config_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    key = key.strip()
+                    val = val.strip().strip("'\"")
+                    if val.isdigit():
+                        val = int(val)
+                    elif val.replace(".", "", 1).isdigit() and val.count(".") == 1:
+                        val = float(val)
+                    config_data[key] = val
+        return config_data
+
+
 # Local GCE Inference Server (vLLM / Ollama / Local OpenAI Server)
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
@@ -13,8 +41,16 @@ os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY if OPENAI_API_KEY else "E
 
 MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
 REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "6"))
-REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "15"))
+REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "10"))
 REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "7200"))
+# ReAct evidence-memory reranker. The default is trained on MS MARCO rather than
+# HotpotQA so the memory policy does not use a reranker trained on this benchmark.
+REACT_MEMORY_RERANKER_MODEL = os.getenv(
+    "REACT_MEMORY_RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2"
+)
+REACT_MEMORY_RERANKER_DEVICE = os.getenv("REACT_MEMORY_RERANKER_DEVICE", "cpu")
+REACT_MEMORY_RERANKER_MAX_LENGTH = int(os.getenv("REACT_MEMORY_RERANKER_MAX_LENGTH", "512"))
+REACT_MEMORY_RERANKER_BATCH_SIZE = int(os.getenv("REACT_MEMORY_RERANKER_BATCH_SIZE", "16"))
 BASELINE_SEARCH_TOP_K = int(os.getenv("BASELINE_SEARCH_TOP_K", "7"))
 WIKIPEDIA_USER_AGENT = os.getenv(
     "USER_AGENT", "HotpotQAReActAgent/1.0 (https://github.com/example/hotpot)"

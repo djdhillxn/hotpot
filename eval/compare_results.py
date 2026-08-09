@@ -117,7 +117,7 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
         def gain_str(base, act):
             diff = act - base
             rel = (diff / base * 100) if base > 0 else 0
-            return f"+{diff:.1f}%", f"+{rel:.1f}%"
+            return f"{diff:+.1f}%", f"{rel:+.1f}%"
 
         g_em, r_em_str = gain_str(b_em, r_em)
         g_f1, r_f1_str = gain_str(b_f1, r_f1)
@@ -132,15 +132,15 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
         f.write(f"| Supporting Facts F1 | {b_sp_f1:.1f}% | {r_sp_f1:.1f}% | {g_sp} | {r_sp_str} |\n")
         f.write(f"| **Joint EM** | **{b_joint_em:.1f}%** | **{r_joint_em:.1f}%** | **{g_jem}** | **{r_jem_str}** |\n")
         f.write(f"| **Joint F1** | **{b_joint_f1:.1f}%** | **{r_joint_f1:.1f}%** | **{g_jf1}** | **{r_jf1_str}** |\n")
-        f.write(f"| Avg Trajectory Hops | {b_steps:.2f} | {r_steps:.2f} | +{r_steps - b_steps:.2f} | N/A |\n")
-        f.write(f"| Avg Question Latency | {b_lat:.2f}s | {r_lat:.2f}s | +{r_lat - b_lat:.2f}s | N/A |\n\n")
+        f.write(f"| Avg Trajectory Hops | {b_steps:.2f} | {r_steps:.2f} | {r_steps - b_steps:+.2f} | N/A |\n")
+        f.write(f"| Avg Question Latency | {b_lat:.2f}s | {r_lat:.2f}s | {r_lat - b_lat:+.2f}s | N/A |\n\n")
 
         f.write("## Visual Metric Comparison Chart\n\n")
         f.write(f"![Comparison Metrics]({os.path.basename(chart_path)})\n\n")
 
-        f.write("## Key Findings & Takeaways\n\n")
-        f.write("1. **Multi-Hop Necessity**: Single-Pass RAG fails on 2-hop bridge questions because initial retrieval cannot anticipate intermediate entity bridge requirements.\n")
-        f.write("2. **Agentic Advantage**: The ReAct Agent dynamically inspects initial observations, identifies missing bridge entities (e.g. searching Person A -> extracting birthplace -> searching Person B), and updates its search parameters iteratively.\n")
+        f.write("## Methodological Observations\n\n")
+        f.write("1. **Single-Pass Retrieval Bottleneck**: Single-pass RAG relies on a single retrieval query, which limits passage coverage when resolving multi-hop bridge entities.\n")
+        f.write("2. **Iterative Multi-Hop Retrieval**: The ReAct agent alternates between reasoning and targeted retrieval actions (`search` and `lookup`), allowing intermediate evidence discovery across multiple turns.\n")
 
     print(f"Generated comparison chart and report in: {output_dir}/")
     print(f"Saved comparison log file to: {log_file}")

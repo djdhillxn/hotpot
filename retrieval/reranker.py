@@ -1,0 +1,56 @@
+import threading
+import time
+
+
+class CrossEncoderEvidenceReranker:
+    """Shared cross-encoder scorer for ReAct evidence memory.
+
+    The model is loaded once per benchmark process and shared by all per-question
+    retrieval sessions. Scoring is serialized to avoid concurrent PyTorch model
+    forwards fighting over CPU resources when the evaluator uses many workers.
+    """
+
+    def __init__(self, model_name, device="cpu", max_length=512, batch_size=16):
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError as exc:
+            raise RuntimeError(
+                "Evidence-memory reranking requires sentence-transformers."
+            ) from exc
+
+        self.model_name = str(model_name)
+        self.device = str(device)
+        self.max_length = int(max_length)
+        self.batch_size = int(batch_size)
+        self._lock = threading.Lock()
+        self.model = CrossEncoder(
+            self.model_name,
+            max_length=self.max_length,
+            device=self.device,
+        )
+
+    def score(self, question, passages):
+        passages = [str(passage) for passage in passages]
+        if not passages:
+            return [], 0.0
+
+        pairs = [(str(question), passage) for passage in passages]
+        started = time.perf_counter()
+        with self._lock:
+            scores = self.model.predict(
+                pairs,
+                batch_size=min(self.batch_size, len(pairs)),
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+        latency = time.perf_counter() - started
+        return [float(score) for score in scores], latency
+
+    def describe(self):
+        return {
+            "model": self.model_name,
+            "device": self.device,
+            "max_length": self.max_length,
+            "batch_size": self.batch_size,
+            "training_corpus_note": "MS MARCO cross-encoder; no HotpotQA labels used by this project",
+        }

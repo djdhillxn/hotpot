@@ -25,10 +25,17 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
     bound_llm = llm.bind(stop=["\nObservation:", "Observation:"], max_tokens=150)
 
     def agent_node(state):
+        evidence_context = state.get("active_evidence_context", "").strip()
+        evidence_block = f"{evidence_context}\n\n" if evidence_context else ""
         messages = [
             SystemMessage(content=REACT_SYSTEM_PROMPT),
             HumanMessage(
-                content=f"Question: {state['question']}\n{state.get('scratchpad', '')}Thought: "
+                content=(
+                    f"Question: {state['question']}\n"
+                    f"{evidence_block}"
+                    f"Reasoning / Action History:\n{state.get('scratchpad', '')}"
+                    "Thought: "
+                )
             ),
         ]
 
@@ -159,9 +166,14 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
             + f"Thought: {last_step['thought']}\nAction: {last_step['action']}\n{observation}\n"
         )
 
+        active_evidence_context = state.get("active_evidence_context", "")
+        if hasattr(toolset, "render_active_evidence"):
+            active_evidence_context = toolset.render_active_evidence()
+
         updates = dict(state)
         updates["steps"] = updated_steps
         updates["scratchpad"] = new_scratchpad
+        updates["active_evidence_context"] = active_evidence_context
         updates["step_count"] = state.get("step_count", 0) + 1
         updates["visited_pages"] = visited_pages
         updates["observed_supporting_facts"] = observed_supporting_facts
@@ -171,10 +183,16 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
 
     def synthesis_node(state):
         synthesis_llm = llm.bind(max_tokens=150)
+        evidence_context = state.get("active_evidence_context", "").strip()
+        evidence_block = f"{evidence_context}\n\n" if evidence_context else ""
         messages = [
             SystemMessage(content=FORCED_SYNTHESIS_PROMPT_SYSTEM),
             HumanMessage(
-                content=f"Question: {state['question']}\n{state.get('scratchpad', '')}"
+                content=(
+                    f"Question: {state['question']}\n"
+                    f"{evidence_block}"
+                    f"Reasoning / Action History:\n{state.get('scratchpad', '')}"
+                )
             ),
         ]
 

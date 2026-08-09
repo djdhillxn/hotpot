@@ -270,7 +270,7 @@ def run_baseline_benchmark(
     output_dir="eval_results/baseline",
     retriever="hybrid",
     index_dir=FULLWIKI_INDEX_DIR,
-    top_k=6,
+    top_k=BASELINE_SEARCH_TOP_K,
     concurrency=16,
 ):
     if concurrency < 1:
@@ -453,29 +453,50 @@ def run_baseline_benchmark(
     generate_eval_plots_and_report(results, output_dir=output_dir)
 
 
+from config import (
+    BASELINE_SEARCH_TOP_K,
+    FULLWIKI_INDEX_DIR,
+    LLM_MODEL_NAME,
+    OPENAI_API_BASE,
+    OPENAI_API_KEY,
+    REACT_MAX_OBSERVATION_CHARS,
+    load_eval_config,
+)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Single-Pass RAG Baseline Benchmark")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML configuration file (e.g. config/fullwiki.yaml)")
     parser.add_argument("--samples", type=int, default=None, help="Number of questions to test (default: all)")
-    parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
-    parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
+    parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default=None, help="Retrieval mode")
+    parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default=None, help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
-    parser.add_argument("--top-k", type=int, default=BASELINE_SEARCH_TOP_K, help="Documents retrieved in the single-pass FullWiki search")
-    parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
-    parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
-    parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")
+    parser.add_argument("--top-k", type=int, default=None, help="Documents retrieved in the single-pass FullWiki search")
+    parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default=None, help="Dataset source")
+    parser.add_argument("--model", type=str, default=None, help="LLM model name")
+    parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
     parser.add_argument("--output-dir", type=str, default="eval_results/baseline", help="Directory for outputs")
     parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
 
     args = parser.parse_args()
+    cfg = load_eval_config(args.config) if args.config else {}
+
+    mode = args.mode or cfg.get("retrieval_mode") or "offline"
+    retriever = args.retriever or cfg.get("retriever") or "hybrid"
+    top_k = args.top_k or cfg.get("baseline_top_k") or BASELINE_SEARCH_TOP_K
+    source = args.source or cfg.get("dataset_source") or "sample"
+    model = args.model or cfg.get("model_name") or LLM_MODEL_NAME
+    api_base = args.api_base or cfg.get("api_base") or OPENAI_API_BASE
+
     run_baseline_benchmark(
         num_samples=args.samples,
-        mode=args.mode,
-        model_name=args.model,
-        source=args.source,
-        api_base=args.api_base,
+        mode=mode,
+        model_name=model,
+        source=source,
+        api_base=api_base,
         output_dir=args.output_dir,
-        retriever=args.retriever,
+        retriever=retriever,
         index_dir=args.index_dir,
-        top_k=args.top_k,
+        top_k=top_k,
         concurrency=args.concurrency,
     )

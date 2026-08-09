@@ -1,0 +1,30 @@
+# HotpotQA FullWiki Evaluation Configuration
+
+# Model and Server Settings
+model_name: "Qwen/Qwen2.5-7B-Instruct"
+api_base: "http://localhost:8000/v1"
+api_key: "EMPTY"
+
+# Dataset Evaluation Split
+evaluation_split: "validation"
+
+# First-Stage FullWiki Retrieval Settings
+retrieval_mode: "fullwiki"
+retriever: "hybrid"
+candidate_k: 20
+rrf_k: 60
+
+# Single-Pass Baseline Hyperparameters
+baseline_top_k: 7
+
+# ReAct Multi-Hop Agent Hyperparameters
+max_tool_steps: 7
+react_top_k: 6
+max_evidence_documents: 10
+max_observation_chars: 7200
+
+# ReAct Cross-Encoder Evidence Memory Reranker
+memory_reranker_model: "cross-encoder/ms-marco-MiniLM-L6-v2"
+memory_reranker_device: "cpu"
+memory_reranker_max_length: 512
+memory_reranker_batch_size: 16

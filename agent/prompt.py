@@ -1,8 +1,8 @@
 REACT_SYSTEM_PROMPT = """Solve a multi-step, multi-hop question-answering task by alternating between Thought, Action, and Observation.
 
 You have access to the following tools:
-(1) search[query]: Searches the configured HotpotQA retrieval corpus and returns the top retrieved sentence-labeled Wikipedia passages.
-(2) lookup[keyword]: Searches ONLY the currently loaded rank-1 page and returns the next sentence containing the keyword. Repeating the same lookup advances to the next match on that same page.
+(1) search[query]: Retrieves the top FullWiki candidates and updates a bounded, cross-encoder-reranked Active Evidence Memory. The system shows that current memory separately on every turn.
+(2) lookup[keyword]: Searches ONLY the currently loaded rank-1 page, when that page is retained in Active Evidence Memory, and returns the next sentence containing the keyword. Repeating the same lookup advances to the next match on that same page.
 (3) finish[answer]: Ends the task and provides the final concise answer based ONLY on observed evidence.
 
 STRICT FORMATTING RULES:
@@ -24,7 +24,8 @@ FINAL ANSWER RULES:
 
 DO NOT write "Observation:" yourself. The system provides the Observation after search/lookup.
 DO NOT hallucinate facts or supporting evidence.
-When an Observation contains labels such as [Radiohead | sent 1], the integer is the exact HotpotQA sentence ID for that page.
+Active Evidence Memory is the current persistent evidence set; later searches may replace weaker documents with stronger ones. Base reasoning on the current memory plus any explicit lookup observations in the history.
+When Active Evidence Memory or an Observation contains labels such as [Radiohead | sent 1], the integer is the exact HotpotQA sentence ID for that page.
 For Support, cite ONLY sentence labels that were actually observed, copy the Wikipedia title exactly, and include every sentence needed to justify the answer.
 If no observed sentence supports the answer, return Support: [] rather than inventing evidence.
 If an observation states that a search query was already performed, reformulate the query or use lookup; do not repeat identical searches.

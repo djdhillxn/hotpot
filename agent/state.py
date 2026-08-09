@@ -2,6 +2,7 @@ def create_initial_state(question):
     return {
         "question": question,
         "scratchpad": "",
+        "active_evidence_context": "",
         "steps": [],
         "current_action_type": None,
         "current_action_arg": None,

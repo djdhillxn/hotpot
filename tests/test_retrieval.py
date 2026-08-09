@@ -333,3 +333,140 @@ def test_lookup_cannot_bypass_max_working_evidence_document_cap():
     assert retriever.last_result["status"] == "current_page_not_exposed"
     assert retriever.evidence_document_count == 15
     assert len(retriever.visited_pages) == 15
+
+
+class FakeEvidenceReranker:
+    def describe(self):
+        return {"model": "fake-cross-encoder", "device": "cpu"}
+
+
+class RerankedRollingBackend(RollingFakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.evidence_reranker = FakeEvidenceReranker()
+        self.scored_doc_ids = []
+
+    def score_evidence_documents(self, question, documents):
+        self.scored_doc_ids.extend(str(doc["doc_id"]) for doc in documents)
+        # Deterministic fake relevance: later/larger doc ids are more relevant.
+        return [float(int(doc["doc_id"])) for doc in documents], 0.001
+
+
+def test_cross_encoder_memory_evicts_weaker_early_documents_and_keeps_archive():
+    backend = RerankedRollingBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=6,
+        max_observation_chars=7200,
+        max_evidence_documents=15,
+        duplicate_search_guard=True,
+        question="Which evidence answers the original question?",
+    )
+
+    first = retriever.search("first")
+    second = retriever.search("second")
+    third = retriever.search("third")
+
+    assert "Consult the Active Evidence Memory" in first
+    assert "Consult the Active Evidence Memory" in second
+    assert "Consult the Active Evidence Memory" in third
+    assert retriever.evidence_archive_count == 18
+    assert retriever.evidence_document_count == 15
+    assert len(backend.scored_doc_ids) == 18
+
+    active_ids = [row["doc_id"] for row in retriever.active_memory_snapshot()]
+    assert "101" not in active_ids
+    assert "102" not in active_ids
+    assert "103" not in active_ids
+    assert "301" in active_ids
+    assert "306" in active_ids
+    assert set(retriever.last_result["evicted_evidence_documents"]) == {
+        "Doc 101",
+        "Doc 102",
+        "Doc 103",
+    }
+    assert retriever.last_result["memory_policy"] == "cross_encoder_top_k"
+    assert retriever.last_result["evidence_archive_count"] == 18
+
+    memory = retriever.render_active_evidence()
+    assert "[Doc 101]" not in memory
+    assert "[Doc 306]" in memory
+
+
+def test_cross_encoder_memory_scores_each_unique_document_only_once():
+    class OverlapBackend(RerankedRollingBackend):
+        def search(self, query, top_k=1):
+            self.calls.append(query)
+            if len(self.calls) == 1:
+                ids = ["1", "2", "3"]
+            else:
+                ids = ["2", "3", "4"]
+            hits = [
+                {
+                    "doc_id": doc_id,
+                    "title": f"Doc {doc_id}",
+                    "rank": rank,
+                    "bm25_rank": rank,
+                    "bm25_score": 10.0 - rank,
+                    "dense_rank": rank,
+                    "dense_score": 1.0 / rank,
+                    "fused_score": 1.0 / (60 + rank),
+                    "sentences": [f"Sentence for {doc_id}."],
+                }
+                for rank, doc_id in enumerate(ids[:top_k], 1)
+            ]
+            return {
+                "query": query,
+                "mode": "hybrid",
+                "candidate_k": 20,
+                "top_k": top_k,
+                "hits": hits,
+                "latency_ms": {"total": 1.0},
+            }
+
+    backend = OverlapBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=3,
+        max_observation_chars=4000,
+        max_evidence_documents=15,
+        question="question",
+    )
+
+    retriever.search("first")
+    retriever.search("second")
+
+    assert backend.scored_doc_ids == ["1", "2", "3", "4"]
+    assert retriever.evidence_archive_count == 4
+
+
+def test_cross_encoder_memory_does_not_allow_lookup_on_evicted_rank_one_page():
+    class LowScoreFourthSearchBackend(RerankedRollingBackend):
+        def score_evidence_documents(self, question, documents):
+            self.scored_doc_ids.extend(str(doc["doc_id"]) for doc in documents)
+            scores = []
+            for doc in documents:
+                doc_id = int(doc["doc_id"])
+                # First three searches get strong scores; fourth search is weak.
+                scores.append(float(doc_id if doc_id < 400 else -doc_id))
+            return scores, 0.001
+
+    backend = LowScoreFourthSearchBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=6,
+        max_observation_chars=7200,
+        max_evidence_documents=15,
+        question="question",
+    )
+
+    retriever.search("first")
+    retriever.search("second")
+    retriever.search("third")
+    fourth = retriever.search("fourth")
+
+    assert retriever.current_page_title == "Doc 401"
+    assert retriever.current_document["doc_id"] not in retriever._evidence_doc_id_set
+    assert "rank-1 page was not retained" in fourth
+    lookup = retriever.lookup("Sentence")
+    assert "was not admitted to the bounded working evidence" in lookup

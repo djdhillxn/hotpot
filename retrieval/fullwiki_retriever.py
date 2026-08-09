@@ -15,6 +15,8 @@ from config import (
     FULLWIKI_SEARCH_CANDIDATES,
 )
 
+from retrieval.reranker import CrossEncoderEvidenceReranker
+
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
 
@@ -73,6 +75,10 @@ class FullWikiSearchBackend:
         candidate_k=FULLWIKI_SEARCH_CANDIDATES,
         rrf_k=FULLWIKI_RRF_K,
         dense_query_device=DENSE_QUERY_DEVICE,
+        evidence_reranker_model=None,
+        evidence_reranker_device="cpu",
+        evidence_reranker_max_length=512,
+        evidence_reranker_batch_size=16,
     ):
         if mode not in {"bm25", "dense", "hybrid"}:
             raise ValueError("mode must be one of: bm25, dense, hybrid")
@@ -108,6 +114,15 @@ class FullWikiSearchBackend:
         self.dense_nprobe = None
         if self.mode in {"dense", "hybrid"}:
             self._load_dense_backend()
+
+        self.evidence_reranker = None
+        if evidence_reranker_model:
+            self.evidence_reranker = CrossEncoderEvidenceReranker(
+                evidence_reranker_model,
+                device=evidence_reranker_device,
+                max_length=evidence_reranker_max_length,
+                batch_size=evidence_reranker_batch_size,
+            )
 
     def _load_manifest(self):
         if not os.path.isfile(self.manifest_path):
@@ -247,12 +262,25 @@ class FullWikiSearchBackend:
             },
         }
 
+    @staticmethod
+    def _reranker_passage(document):
+        title = str(document.get("title", "")).strip()
+        sentences = " ".join(str(x).strip() for x in document.get("sentences", []) if str(x).strip())
+        return f"{title}\n{sentences}".strip()
+
+    def score_evidence_documents(self, question, documents):
+        if self.evidence_reranker is None:
+            raise RuntimeError("Evidence reranker is not configured on this FullWiki backend.")
+        passages = [self._reranker_passage(document) for document in documents]
+        return self.evidence_reranker.score(question, passages)
+
     def create_session(
         self,
         search_top_k=1,
         max_observation_chars=2200,
         max_evidence_documents=None,
         duplicate_search_guard=False,
+        question=None,
     ):
         return FullWikiRetriever(
             self,
@@ -260,6 +288,7 @@ class FullWikiSearchBackend:
             max_observation_chars=max_observation_chars,
             max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=duplicate_search_guard,
+            question=question,
         )
 
     def describe(self):
@@ -273,6 +302,9 @@ class FullWikiSearchBackend:
             "dense_model": self.dense_model_name,
             "dense_query_device": self.dense_query_device if self.mode in {"dense", "hybrid"} else None,
             "dense_nprobe": self.dense_nprobe,
+            "evidence_memory_reranker": (
+                self.evidence_reranker.describe() if self.evidence_reranker is not None else None
+            ),
             "index_manifest": self.manifest,
         }
 
@@ -280,10 +312,12 @@ class FullWikiSearchBackend:
 class FullWikiRetriever:
     """Per-question ReAct-compatible session over a shared FullWiki backend.
 
-    The backend always retrieves ``search_top_k`` results. For iterative ReAct
-    runs, ``max_evidence_documents`` bounds how many unique Wikipedia documents
-    are ever exposed in the recurrent working context. Raw top-k results remain
-    in ``last_result['retrieved_hits']`` for later analysis.
+    The backend always retrieves ``search_top_k`` results. When a shared evidence
+    reranker is configured, every unique retrieved document is archived and scored
+    once against the original question; only the best ``max_evidence_documents``
+    remain in the recurrent Active Evidence Memory. Raw top-k results remain in
+    ``last_result['retrieved_hits']`` for later analysis. Without a reranker, the
+    legacy first-seen bounded-memory behavior is preserved for compatibility.
     """
 
     def __init__(
@@ -293,6 +327,7 @@ class FullWikiRetriever:
         max_observation_chars=2200,
         max_evidence_documents=None,
         duplicate_search_guard=False,
+        question=None,
     ):
         self.backend = backend
         self.search_top_k = int(search_top_k)
@@ -301,12 +336,22 @@ class FullWikiRetriever:
             int(max_evidence_documents) if max_evidence_documents is not None else None
         )
         self.duplicate_search_guard = bool(duplicate_search_guard)
+        self.question = str(question).strip() if question is not None else None
+        self.use_reranked_memory = (
+            getattr(self.backend, "evidence_reranker", None) is not None
+            and self.max_evidence_documents is not None
+            and bool(self.question)
+        )
         self.current_title = None
         self.current_document = None
         self.last_result = None
         self.visited_pages = []
         self._evidence_doc_ids = []
         self._evidence_doc_id_set = set()
+        self._evidence_archive = {}
+        self._archive_order = 0
+        self._active_memory_context = ""
+        self._active_memory_hits = []
         self._seen_search_queries = {}
         self._lookup_keyword = None
         self._lookup_matches = []
@@ -327,6 +372,10 @@ class FullWikiRetriever:
         self.visited_pages = []
         self._evidence_doc_ids = []
         self._evidence_doc_id_set = set()
+        self._evidence_archive = {}
+        self._archive_order = 0
+        self._active_memory_context = ""
+        self._active_memory_hits = []
         self._seen_search_queries = {}
         self._lookup_keyword = None
         self._lookup_matches = []
@@ -421,6 +470,239 @@ class FullWikiRetriever:
 
         return "\n\n".join(rendered_blocks), logged_hits, remaining
 
+    @property
+    def evidence_archive_count(self):
+        return len(self._evidence_archive)
+
+    def render_active_evidence(self):
+        return self._active_memory_context
+
+    def active_memory_snapshot(self):
+        rows = []
+        for memory_rank, doc_id in enumerate(self._evidence_doc_ids, 1):
+            entry = self._evidence_archive.get(doc_id, {})
+            document = entry.get("document", {})
+            rows.append({
+                "memory_rank": memory_rank,
+                "doc_id": doc_id,
+                "title": document.get("title"),
+                "reranker_score": entry.get("reranker_score"),
+                "first_seen_order": entry.get("first_seen_order"),
+                "first_seen_query": entry.get("first_seen_query"),
+            })
+        return rows
+
+    def _score_new_archive_documents(self, query, hits):
+        new_hits = [hit for hit in hits if str(hit["doc_id"]) not in self._evidence_archive]
+        if not new_hits:
+            return [], 0.0
+
+        scores_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
+        
+        # Sub-Query Bridge Protection (Max-Score Rule):
+        # Score against both the original question and the specific search sub-query
+        # to ensure intermediate bridge documents are not prematurely evicted.
+        if query and self._normalize_query(query) != self._normalize_query(self.question):
+            scores_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
+            scores = [max(sq, ss) for sq, ss in zip(scores_q, scores_sub)]
+            latency = latency1 + latency2
+        else:
+            scores = scores_q
+            latency = latency1
+
+        if len(scores) != len(new_hits):
+            raise RuntimeError(
+                f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
+            )
+
+        added_titles = []
+        for hit, score in zip(new_hits, scores):
+            doc_id = str(hit["doc_id"])
+            self._archive_order += 1
+            self._evidence_archive[doc_id] = {
+                "document": dict(hit),
+                "reranker_score": float(score),
+                "first_seen_order": self._archive_order,
+                "first_seen_query": query,
+            }
+            added_titles.append(hit["title"])
+        return added_titles, latency
+
+    def _render_reranked_memory(self):
+        if not self._evidence_doc_ids:
+            self._active_memory_context = ""
+            self._active_memory_hits = []
+            return [], []
+
+        prefix = (
+            "Active Evidence Memory (cross-encoder reranked; use ONLY sentence labels shown here "
+            "or in lookup observations as evidence):\n"
+        )
+        remaining = max(0, self.max_observation_chars - len(prefix))
+        rendered_blocks = []
+        logged_hits = []
+        omitted_due_to_char_cap = []
+
+        for index, doc_id in enumerate(self._evidence_doc_ids):
+            entry = self._evidence_archive[doc_id]
+            document = entry["document"]
+            docs_left = len(self._evidence_doc_ids) - index
+            memory_rank = index + 1
+            header = f"Memory [{memory_rank}] [{document['title']}]\n"
+            if len(header) >= remaining:
+                omitted_due_to_char_cap.extend(
+                    self._evidence_archive[x]["document"]["title"]
+                    for x in self._evidence_doc_ids[index:]
+                )
+                break
+
+            per_doc_budget = max(0, remaining // docs_left)
+            sentence_budget = max(0, per_doc_budget - len(header) - 2)
+            visible = self._visible_sentences(document, sentence_budget)
+            if not visible:
+                omitted_due_to_char_cap.append(document["title"])
+                continue
+
+            block = header + self._render_sentences(document["title"], visible)
+            if len(block) > remaining:
+                omitted_due_to_char_cap.extend(
+                    self._evidence_archive[x]["document"]["title"]
+                    for x in self._evidence_doc_ids[index:]
+                )
+                break
+
+            rendered_blocks.append(block)
+            remaining = max(0, remaining - len(block) - 2)
+            logged_hits.append({
+                "doc_id": doc_id,
+                "title": document["title"],
+                "rank": document.get("rank"),
+                "memory_rank": memory_rank,
+                "bm25_rank": document.get("bm25_rank"),
+                "bm25_score": document.get("bm25_score"),
+                "dense_rank": document.get("dense_rank"),
+                "dense_score": document.get("dense_score"),
+                "fused_score": document.get("fused_score"),
+                "reranker_score": float(entry["reranker_score"]),
+                "sentences": visible,
+            })
+
+        body = "\n\n".join(rendered_blocks)
+        self._active_memory_context = prefix + body if body else ""
+        self._active_memory_hits = logged_hits
+        return logged_hits, omitted_due_to_char_cap
+
+    def _refresh_reranked_memory(self, current_doc_id=None):
+        previous_ids = list(self._evidence_doc_ids)
+        previous_set = set(previous_ids)
+        ranked = sorted(
+            self._evidence_archive.items(),
+            key=lambda item: (
+                -float(item[1]["reranker_score"]),
+                int(item[1]["first_seen_order"]),
+                item[0],
+            ),
+        )
+        limit = self.max_evidence_documents or len(ranked)
+        selected_ids = [doc_id for doc_id, _ in ranked[:limit]]
+
+        # Rank-1 Pin Protection: Guarantee current_doc_id is retained in active memory
+        if current_doc_id and current_doc_id in self._evidence_archive and current_doc_id not in selected_ids:
+            if selected_ids:
+                selected_ids.pop()
+            selected_ids.append(current_doc_id)
+
+        self._evidence_doc_ids = selected_ids
+        self._evidence_doc_id_set = set(self._evidence_doc_ids)
+
+        added_ids = [doc_id for doc_id in self._evidence_doc_ids if doc_id not in previous_set]
+        evicted_ids = [doc_id for doc_id in previous_ids if doc_id not in self._evidence_doc_id_set]
+        active_hits, observation_omitted = self._render_reranked_memory()
+
+        for hit in active_hits:
+            if hit["title"] not in self.visited_pages:
+                self.visited_pages.append(hit["title"])
+
+        return added_ids, evicted_ids, active_hits, observation_omitted
+
+    def _search_with_reranked_memory(
+        self, query, normalized_query, result, hits, raw_logged_hits, title_match_rank
+    ):
+        new_archive_titles, reranker_latency = self._score_new_archive_documents(query, hits)
+        current_doc_id = str(self.current_document.get("doc_id", "")) if self.current_document else None
+        added_ids, evicted_ids, active_hits, observation_omitted = self._refresh_reranked_memory(current_doc_id=current_doc_id)
+
+        active_titles = [hit["title"] for hit in active_hits]
+        active_id_set = set(self._evidence_doc_ids)
+        raw_omitted_titles = [
+            hit["title"] for hit in hits if str(hit["doc_id"]) not in active_id_set
+        ]
+        added_titles = [self._evidence_archive[x]["document"]["title"] for x in added_ids]
+        evicted_titles = [self._evidence_archive[x]["document"]["title"] for x in evicted_ids]
+        rank1_in_memory = current_doc_id in active_id_set if current_doc_id else False
+
+        observation = (
+            f"Observation: FullWiki retrieved {len(hits)} candidates for '{query}'. "
+            f"Cross-encoder evidence memory now retains {self.evidence_document_count} of "
+            f"{self.evidence_archive_count} unique documents. Current rank-1 page: "
+            f"[{self.current_title}]. Consult the Active Evidence Memory block above."
+        )
+        if not rank1_in_memory:
+            observation += " The rank-1 page was not retained by the evidence-memory reranker."
+        observation = observation[: self.max_observation_chars]
+
+        self.last_result = {
+            "action": "search",
+            "query": query,
+            "status": "loaded",
+            "retriever": result.get("mode"),
+            "duplicate_query": False,
+            "query_matches_retrieved_title": title_match_rank is not None,
+            "query_title_match_rank": title_match_rank,
+            "candidate_k": result.get("candidate_k"),
+            "top_k": result.get("top_k"),
+            # hits = active evidence actually rendered into the recurrent model context.
+            "hits": active_hits,
+            # retrieved_hits = complete raw top-k search result before memory reranking.
+            "retrieved_hits": raw_logged_hits,
+            "new_archive_documents": new_archive_titles,
+            "new_evidence_documents": added_titles,
+            "evicted_evidence_documents": evicted_titles,
+            "already_retained_documents": [
+                title for title in active_titles if title not in added_titles
+            ],
+            "omitted_due_to_evidence_cap": raw_omitted_titles,
+            "omitted_due_to_observation_cap": observation_omitted,
+            "evidence_document_count": self.evidence_document_count,
+            "evidence_archive_count": self.evidence_archive_count,
+            "max_evidence_documents": self.max_evidence_documents,
+            "memory_policy": "cross_encoder_top_k",
+            "memory_reranker": self.backend.evidence_reranker.describe(),
+            "active_memory_documents": self.active_memory_snapshot(),
+            "rank1_in_active_memory": rank1_in_memory,
+            "latency_ms": {
+                **result.get("latency_ms", {}),
+                "memory_reranker": round(reranker_latency * 1000, 3),
+            },
+            "title": self.current_title,
+            "sentences": (
+                next(
+                    (hit["sentences"] for hit in active_hits if hit["doc_id"] == current_doc_id),
+                    [],
+                )
+            ),
+        }
+        self._seen_search_queries[normalized_query] = {
+            "retriever": result.get("mode"),
+            "candidate_k": result.get("candidate_k"),
+            "retrieved_hits": raw_logged_hits,
+            "retrieved_titles": [hit["title"] for hit in hits],
+            "retained_titles": active_titles,
+            "query_matches_retrieved_title": title_match_rank is not None,
+            "query_title_match_rank": title_match_rank,
+        }
+        return observation
+
     def search(self, query):
         query = str(query).strip().strip("'\"")
         normalized_query = self._normalize_query(query)
@@ -494,6 +776,11 @@ class FullWikiRetriever:
         self._lookup_keyword = None
         self._lookup_matches = []
         self._lookup_index = 0
+
+        if self.use_reranked_memory:
+            return self._search_with_reranked_memory(
+                query, normalized_query, result, hits, raw_logged_hits, title_match_rank
+            )
 
         candidate_new_hits = []
         already_retained = []
