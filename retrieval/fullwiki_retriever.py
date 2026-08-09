@@ -358,7 +358,7 @@ class FullWikiSearchBackend:
         if self.evidence_reranker is None:
             raise RuntimeError("Evidence reranker is not configured on this FullWiki backend.")
         if not documents:
-            return ([], []), 0.0
+            return ([], [], []), 0.0
 
         all_passages = []
         doc_slice_bounds = []
@@ -375,6 +375,7 @@ class FullWikiSearchBackend:
 
         doc_max_scores = []
         doc_best_sents = []
+        doc_sent_scores_list = []
         for doc, (s_idx, e_idx) in zip(documents, doc_slice_bounds):
             doc_scores = scores[s_idx:e_idx]
             max_rel_idx = max(range(len(doc_scores)), key=lambda i: doc_scores[i])
