@@ -149,7 +149,8 @@ class FullWikiSearchBackend:
 
         dense_manifest = self.manifest.get("dense", {})
         self.dense_model_name = dense_manifest.get("model", "BAAI/bge-base-en-v1.5")
-        self.dense_nprobe = int(dense_manifest.get("nprobe", 16))
+        nprobe_default = dense_manifest.get("nprobe", 16)
+        self.dense_nprobe = int(os.getenv("FULLWIKI_DENSE_NPROBE", str(nprobe_default)))
         self.faiss = faiss
         self.dense_index = faiss.read_index(self.dense_index_path)
         if hasattr(self.dense_index, "nprobe"):
@@ -496,49 +497,30 @@ class FullWikiRetriever:
 
     def _score_new_archive_documents(self, query, hits):
         new_hits = [hit for hit in hits if str(hit["doc_id"]) not in self._evidence_archive]
-        existing_hits = [hit for hit in hits if str(hit["doc_id"]) in self._evidence_archive]
-        query_is_subquery = (
-            bool(query)
-            and self._normalize_query(query) != self._normalize_query(self.question)
-        )
-        latency = 0.0
+        if not new_hits:
+            return [], 0.0
 
-        original_scores = {}
-        if new_hits:
-            scores_q, latency_q = self.backend.score_evidence_documents(self.question, new_hits)
-            if len(scores_q) != len(new_hits):
-                raise RuntimeError(
-                    f"Evidence reranker returned {len(scores_q)} scores for "
-                    f"{len(new_hits)} new documents."
-                )
-            latency += latency_q
-            original_scores = {
-                str(hit["doc_id"]): float(score) for hit, score in zip(new_hits, scores_q)
-            }
+        scores_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
+        
+        # Sub-Query Bridge Protection (Max-Score Rule):
+        # Score against both the original question and the specific search sub-query
+        # for new documents to ensure intermediate bridge documents are not prematurely evicted.
+        if query and self._normalize_query(query) != self._normalize_query(self.question):
+            scores_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
+            scores = [max(sq, ss) for sq, ss in zip(scores_q, scores_sub)]
+            latency = latency1 + latency2
+        else:
+            scores = scores_q
+            latency = latency1
 
-        # Sub-query bridge protection (running max-score rule): score every document
-        # retrieved by a later search against that search itself. This both protects
-        # newly discovered bridge evidence and lets a previously archived document
-        # become more relevant when the agent explicitly rediscovers it later.
-        subquery_scores = {}
-        if query_is_subquery and hits:
-            scores_sub, latency_sub = self.backend.score_evidence_documents(query, hits)
-            if len(scores_sub) != len(hits):
-                raise RuntimeError(
-                    f"Evidence reranker returned {len(scores_sub)} scores for "
-                    f"{len(hits)} sub-query documents."
-                )
-            latency += latency_sub
-            subquery_scores = {
-                str(hit["doc_id"]): float(score) for hit, score in zip(hits, scores_sub)
-            }
+        if len(scores) != len(new_hits):
+            raise RuntimeError(
+                f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
+            )
 
         added_titles = []
-        for hit in new_hits:
+        for hit, score in zip(new_hits, scores):
             doc_id = str(hit["doc_id"])
-            score = original_scores[doc_id]
-            if doc_id in subquery_scores:
-                score = max(score, subquery_scores[doc_id])
             self._archive_order += 1
             self._evidence_archive[doc_id] = {
                 "document": dict(hit),
@@ -548,15 +530,6 @@ class FullWikiRetriever:
             }
             added_titles.append(hit["title"])
 
-        for hit in existing_hits:
-            doc_id = str(hit["doc_id"])
-            if doc_id not in subquery_scores:
-                continue
-            entry = self._evidence_archive[doc_id]
-            entry["reranker_score"] = max(
-                float(entry["reranker_score"]),
-                subquery_scores[doc_id],
-            )
         return added_titles, latency
 
     def _render_reranked_memory(self, current_doc_id=None):
@@ -574,9 +547,8 @@ class FullWikiRetriever:
         logged_hits = []
         omitted_due_to_char_cap = []
 
-        # The current search target is the page the ReAct agent intentionally chose
-        # to inspect next. Render it first so a pinned low-score bridge page cannot
-        # sit at the end of memory and disappear behind the global character cap.
+        # When current_doc_id is present in active memory, render it first so it
+        # cannot be cut off by the global character budget on the turn it was searched.
         render_doc_ids = list(self._evidence_doc_ids)
         if current_doc_id in self._evidence_doc_id_set and render_doc_ids[0] != current_doc_id:
             render_doc_ids.remove(current_doc_id)
@@ -623,7 +595,7 @@ class FullWikiRetriever:
                 "dense_rank": document.get("dense_rank"),
                 "dense_score": document.get("dense_score"),
                 "fused_score": document.get("fused_score"),
-                "reranker_score": float(entry["reranker_score"]),
+                "reranker_score": entry["reranker_score"],
                 "sentences": visible,
             })
 
@@ -644,15 +616,7 @@ class FullWikiRetriever:
             ),
         )
         limit = self.max_evidence_documents or len(ranked)
-        selected_ids = [doc_id for doc_id, _ in ranked[:limit]]
-
-        # Rank-1 Pin Protection: Guarantee current_doc_id is retained in active memory
-        if current_doc_id and current_doc_id in self._evidence_archive and current_doc_id not in selected_ids:
-            if selected_ids:
-                selected_ids.pop()
-            selected_ids.append(current_doc_id)
-
-        self._evidence_doc_ids = selected_ids
+        self._evidence_doc_ids = [doc_id for doc_id, _ in ranked[:limit]]
         self._evidence_doc_id_set = set(self._evidence_doc_ids)
 
         added_ids = [doc_id for doc_id in self._evidence_doc_ids if doc_id not in previous_set]

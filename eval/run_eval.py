@@ -281,6 +281,24 @@ def build_failure_record(sample, idx, error):
     return metrics, trajectory
 
 
+from config import (
+    FULLWIKI_INDEX_DIR,
+    FULLWIKI_RRF_K,
+    FULLWIKI_SEARCH_CANDIDATES,
+    LLM_MODEL_NAME,
+    MAX_AGENT_HOPS,
+    OPENAI_API_BASE,
+    OPENAI_API_KEY,
+    REACT_MAX_EVIDENCE_DOCUMENTS,
+    REACT_MAX_OBSERVATION_CHARS,
+    REACT_SEARCH_TOP_K,
+    REACT_MEMORY_RERANKER_BATCH_SIZE,
+    REACT_MEMORY_RERANKER_DEVICE,
+    REACT_MEMORY_RERANKER_MAX_LENGTH,
+    REACT_MEMORY_RERANKER_MODEL,
+)
+
+
 def run_benchmark(
     num_samples=None,
     mode="offline",
@@ -291,6 +309,8 @@ def run_benchmark(
     concurrency=16,
     max_hops=MAX_AGENT_HOPS,
     retriever="hybrid",
+    candidate_k=FULLWIKI_SEARCH_CANDIDATES,
+    rrf_k=FULLWIKI_RRF_K,
     index_dir=FULLWIKI_INDEX_DIR,
     search_top_k=REACT_SEARCH_TOP_K,
     max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
@@ -340,6 +360,8 @@ def run_benchmark(
             dense_index_path=os.path.join(index_dir, "dense.faiss"),
             manifest_path=os.path.join(index_dir, "manifest.json"),
             mode=retriever,
+            candidate_k=candidate_k,
+            rrf_k=rrf_k,
             evidence_reranker_model=REACT_MEMORY_RERANKER_MODEL,
             evidence_reranker_device=REACT_MEMORY_RERANKER_DEVICE,
             evidence_reranker_max_length=REACT_MEMORY_RERANKER_MAX_LENGTH,
@@ -539,6 +561,8 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=None, help="Documents returned by each adaptive FullWiki search")
     parser.add_argument("--max-evidence-docs", type=int, default=None, help="Maximum unique FullWiki documents retained in ReAct working evidence")
     parser.add_argument("--max-observation-chars", type=int, default=None, help="Maximum characters rendered by each FullWiki search observation")
+    parser.add_argument("--candidate-k", type=int, default=None, help="First-stage RRF candidate pool size")
+    parser.add_argument("--rrf-k", type=int, default=None, help="Reciprocal Rank Fusion smoothing parameter")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default=None, help="Dataset source")
     parser.add_argument("--model", type=str, default=None, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
@@ -559,6 +583,9 @@ if __name__ == "__main__":
     api_base = args.api_base or cfg.get("api_base") or OPENAI_API_BASE
     max_hops = args.max_hops or cfg.get("max_tool_steps") or MAX_AGENT_HOPS
 
+    candidate_k = args.candidate_k or cfg.get("candidate_k") or FULLWIKI_SEARCH_CANDIDATES
+    rrf_k = args.rrf_k or cfg.get("rrf_k") or FULLWIKI_RRF_K
+
     run_benchmark(
         num_samples=args.samples,
         mode=mode,
@@ -569,6 +596,8 @@ if __name__ == "__main__":
         concurrency=args.concurrency,
         max_hops=max_hops,
         retriever=retriever,
+        candidate_k=candidate_k,
+        rrf_k=rrf_k,
         index_dir=args.index_dir,
         search_top_k=search_top_k,
         max_evidence_documents=max_evidence_docs,

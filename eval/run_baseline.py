@@ -266,6 +266,18 @@ def build_failure_record(sample, idx, error, latency=0.0):
     return metrics, trajectory
 
 
+from config import (
+    BASELINE_SEARCH_TOP_K,
+    FULLWIKI_INDEX_DIR,
+    FULLWIKI_RRF_K,
+    FULLWIKI_SEARCH_CANDIDATES,
+    LLM_MODEL_NAME,
+    OPENAI_API_BASE,
+    OPENAI_API_KEY,
+    REACT_MAX_OBSERVATION_CHARS,
+)
+
+
 def run_baseline_benchmark(
     num_samples=None,
     mode="offline",
@@ -274,6 +286,8 @@ def run_baseline_benchmark(
     api_base=OPENAI_API_BASE,
     output_dir="eval_results/baseline",
     retriever="hybrid",
+    candidate_k=FULLWIKI_SEARCH_CANDIDATES,
+    rrf_k=FULLWIKI_RRF_K,
     index_dir=FULLWIKI_INDEX_DIR,
     top_k=BASELINE_SEARCH_TOP_K,
     concurrency=16,
@@ -315,6 +329,8 @@ def run_baseline_benchmark(
             dense_index_path=os.path.join(index_dir, "dense.faiss"),
             manifest_path=os.path.join(index_dir, "manifest.json"),
             mode=retriever,
+            candidate_k=candidate_k,
+            rrf_k=rrf_k,
         )
 
     results = []
@@ -483,6 +499,8 @@ if __name__ == "__main__":
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default=None, help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
     parser.add_argument("--top-k", type=int, default=None, help="Documents retrieved in the single-pass FullWiki search")
+    parser.add_argument("--candidate-k", type=int, default=None, help="First-stage RRF candidate pool size")
+    parser.add_argument("--rrf-k", type=int, default=None, help="Reciprocal Rank Fusion smoothing parameter")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default=None, help="Dataset source")
     parser.add_argument("--model", type=str, default=None, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
@@ -499,6 +517,9 @@ if __name__ == "__main__":
     model = args.model or cfg.get("model_name") or LLM_MODEL_NAME
     api_base = args.api_base or cfg.get("api_base") or OPENAI_API_BASE
 
+    candidate_k = args.candidate_k or cfg.get("candidate_k") or FULLWIKI_SEARCH_CANDIDATES
+    rrf_k = args.rrf_k or cfg.get("rrf_k") or FULLWIKI_RRF_K
+
     run_baseline_benchmark(
         num_samples=args.samples,
         mode=mode,
@@ -507,6 +528,8 @@ if __name__ == "__main__":
         api_base=api_base,
         output_dir=args.output_dir,
         retriever=retriever,
+        candidate_k=candidate_k,
+        rrf_k=rrf_k,
         index_dir=args.index_dir,
         top_k=top_k,
         concurrency=args.concurrency,
