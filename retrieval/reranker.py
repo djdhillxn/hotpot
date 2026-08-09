@@ -15,7 +15,7 @@ class CrossEncoderEvidenceReranker:
        all evaluation threads into optimal GPU batches.
     """
 
-    def __init__(self, model_name, device="cpu", max_length=512, batch_size=64):
+    def __init__(self, model_name, device="cpu", max_length=512, batch_size=32):
         try:
             import torch
             from sentence_transformers import CrossEncoder
@@ -101,7 +101,7 @@ class CrossEncoderEvidenceReranker:
                 with torch.inference_mode():
                     scores = self.model.predict(
                         pairs,
-                        batch_size=max(self.batch_size, len(pairs)),
+                        batch_size=self.batch_size,
                         show_progress_bar=False,
                         convert_to_numpy=True,
                     )
@@ -127,10 +127,13 @@ class CrossEncoderEvidenceReranker:
                         )
                 else:
                     raise oom_exc
+            finally:
+                if "cuda" in self.device.lower():
+                    torch.cuda.empty_cache()
         return [float(s) for s in scores]
 
     def _microbatch_worker_loop(self):
-        max_batch = max(128, self.batch_size * 2)
+        max_batch = self.batch_size
         while True:
             try:
                 first_item = self._queue.get(timeout=0.1)
