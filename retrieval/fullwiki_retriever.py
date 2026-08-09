@@ -314,10 +314,12 @@ class FullWikiRetriever:
 
     The backend always retrieves ``search_top_k`` results. When a shared evidence
     reranker is configured, every unique retrieved document is archived and scored
-    once against the original question; only the best ``max_evidence_documents``
-    remain in the recurrent Active Evidence Memory. Raw top-k results remain in
-    ``last_result['retrieved_hits']`` for later analysis. Without a reranker, the
-    legacy first-seen bounded-memory behavior is preserved for compatibility.
+    against the original question and, when different, the current search sub-query.
+    Rediscovered archive documents may improve their running relevance score under a
+    later sub-query. Only the best ``max_evidence_documents`` remain in the recurrent
+    Active Evidence Memory. Raw top-k results remain in ``last_result['retrieved_hits']``
+    for later analysis. Without a reranker, the legacy first-seen bounded-memory
+    behavior is preserved for compatibility.
     """
 
     def __init__(
@@ -494,30 +496,49 @@ class FullWikiRetriever:
 
     def _score_new_archive_documents(self, query, hits):
         new_hits = [hit for hit in hits if str(hit["doc_id"]) not in self._evidence_archive]
-        if not new_hits:
-            return [], 0.0
+        existing_hits = [hit for hit in hits if str(hit["doc_id"]) in self._evidence_archive]
+        query_is_subquery = (
+            bool(query)
+            and self._normalize_query(query) != self._normalize_query(self.question)
+        )
+        latency = 0.0
 
-        scores_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
-        
-        # Sub-Query Bridge Protection (Max-Score Rule):
-        # Score against both the original question and the specific search sub-query
-        # to ensure intermediate bridge documents are not prematurely evicted.
-        if query and self._normalize_query(query) != self._normalize_query(self.question):
-            scores_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
-            scores = [max(sq, ss) for sq, ss in zip(scores_q, scores_sub)]
-            latency = latency1 + latency2
-        else:
-            scores = scores_q
-            latency = latency1
+        original_scores = {}
+        if new_hits:
+            scores_q, latency_q = self.backend.score_evidence_documents(self.question, new_hits)
+            if len(scores_q) != len(new_hits):
+                raise RuntimeError(
+                    f"Evidence reranker returned {len(scores_q)} scores for "
+                    f"{len(new_hits)} new documents."
+                )
+            latency += latency_q
+            original_scores = {
+                str(hit["doc_id"]): float(score) for hit, score in zip(new_hits, scores_q)
+            }
 
-        if len(scores) != len(new_hits):
-            raise RuntimeError(
-                f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
-            )
+        # Sub-query bridge protection (running max-score rule): score every document
+        # retrieved by a later search against that search itself. This both protects
+        # newly discovered bridge evidence and lets a previously archived document
+        # become more relevant when the agent explicitly rediscovers it later.
+        subquery_scores = {}
+        if query_is_subquery and hits:
+            scores_sub, latency_sub = self.backend.score_evidence_documents(query, hits)
+            if len(scores_sub) != len(hits):
+                raise RuntimeError(
+                    f"Evidence reranker returned {len(scores_sub)} scores for "
+                    f"{len(hits)} sub-query documents."
+                )
+            latency += latency_sub
+            subquery_scores = {
+                str(hit["doc_id"]): float(score) for hit, score in zip(hits, scores_sub)
+            }
 
         added_titles = []
-        for hit, score in zip(new_hits, scores):
+        for hit in new_hits:
             doc_id = str(hit["doc_id"])
+            score = original_scores[doc_id]
+            if doc_id in subquery_scores:
+                score = max(score, subquery_scores[doc_id])
             self._archive_order += 1
             self._evidence_archive[doc_id] = {
                 "document": dict(hit),
@@ -526,9 +547,19 @@ class FullWikiRetriever:
                 "first_seen_query": query,
             }
             added_titles.append(hit["title"])
+
+        for hit in existing_hits:
+            doc_id = str(hit["doc_id"])
+            if doc_id not in subquery_scores:
+                continue
+            entry = self._evidence_archive[doc_id]
+            entry["reranker_score"] = max(
+                float(entry["reranker_score"]),
+                subquery_scores[doc_id],
+            )
         return added_titles, latency
 
-    def _render_reranked_memory(self):
+    def _render_reranked_memory(self, current_doc_id=None):
         if not self._evidence_doc_ids:
             self._active_memory_context = ""
             self._active_memory_hits = []
@@ -543,16 +574,26 @@ class FullWikiRetriever:
         logged_hits = []
         omitted_due_to_char_cap = []
 
-        for index, doc_id in enumerate(self._evidence_doc_ids):
+        # The current search target is the page the ReAct agent intentionally chose
+        # to inspect next. Render it first so a pinned low-score bridge page cannot
+        # sit at the end of memory and disappear behind the global character cap.
+        render_doc_ids = list(self._evidence_doc_ids)
+        if current_doc_id in self._evidence_doc_id_set and render_doc_ids[0] != current_doc_id:
+            render_doc_ids.remove(current_doc_id)
+            render_doc_ids.insert(0, current_doc_id)
+        memory_rank_by_id = {
+            doc_id: memory_rank for memory_rank, doc_id in enumerate(self._evidence_doc_ids, 1)
+        }
+
+        for index, doc_id in enumerate(render_doc_ids):
             entry = self._evidence_archive[doc_id]
             document = entry["document"]
-            docs_left = len(self._evidence_doc_ids) - index
-            memory_rank = index + 1
+            memory_rank = memory_rank_by_id[doc_id]
             header = f"Memory [{memory_rank}] [{document['title']}]\n"
             if len(header) >= remaining:
                 omitted_due_to_char_cap.extend(
                     self._evidence_archive[x]["document"]["title"]
-                    for x in self._evidence_doc_ids[index:]
+                    for x in render_doc_ids[index:]
                 )
                 break
 
@@ -566,7 +607,7 @@ class FullWikiRetriever:
             if len(block) > remaining:
                 omitted_due_to_char_cap.extend(
                     self._evidence_archive[x]["document"]["title"]
-                    for x in self._evidence_doc_ids[index:]
+                    for x in render_doc_ids[index:]
                 )
                 break
 
@@ -616,7 +657,9 @@ class FullWikiRetriever:
 
         added_ids = [doc_id for doc_id in self._evidence_doc_ids if doc_id not in previous_set]
         evicted_ids = [doc_id for doc_id in previous_ids if doc_id not in self._evidence_doc_id_set]
-        active_hits, observation_omitted = self._render_reranked_memory()
+        active_hits, observation_omitted = self._render_reranked_memory(
+            current_doc_id=current_doc_id
+        )
 
         for hit in active_hits:
             if hit["title"] not in self.visited_pages:
@@ -740,6 +783,23 @@ class FullWikiRetriever:
             (hit["rank"] for hit in hits if self._normalize_title(hit["title"]) == normalized_query),
             None,
         )
+
+        # ReAct entity searches often name the exact Wikipedia page discovered on a
+        # previous hop. When that exact title is already inside the retrieved top-k,
+        # promote it to the session's rank-1/current page so lookup operates on the
+        # intended entity. Keep raw_logged_hits above untouched for retrieval audits.
+        if self.use_reranked_memory and title_match_rank not in {None, 1}:
+            title_match_index = next(
+                index
+                for index, hit in enumerate(hits)
+                if self._normalize_title(hit["title"]) == normalized_query
+            )
+            reordered_hits = (
+                [hits[title_match_index]]
+                + hits[:title_match_index]
+                + hits[title_match_index + 1:]
+            )
+            hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
 
         if not hits:
             self.last_result = {

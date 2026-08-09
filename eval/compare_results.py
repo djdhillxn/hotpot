@@ -4,6 +4,9 @@ import logging
 import argparse
 import matplotlib.pyplot as plt
 
+from eval.metrics import compute_metrics_by_type, print_segmented_report
+
+
 def setup_logger(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     log_file = os.path.join(output_dir, "comparison.log")
@@ -40,35 +43,27 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
     with open(react_json_path, "r") as f:
         react_data = json.load(f)
 
-    def calc_metrics(data):
-        count = len(data)
-        if count == 0:
-            return 0, 0, 0, 0, 0, 0, 0, 0
-        em = sum(r["exact_match"] for r in data) / count
-        f1 = sum(r["f1"] for r in data) / count
-        sp_em = sum(r["sp_em"] for r in data) / count
-        sp_f1 = sum(r["sp_f1"] for r in data) / count
-        joint_em = sum(r["joint_em"] for r in data) / count
-        joint_f1 = sum(r["joint_f1"] for r in data) / count
-        steps = sum(r.get("step_count", 1) for r in data) / count
-        lat = sum(r.get("latency", 0) for r in data) / count
-        return em * 100, f1 * 100, sp_em * 100, sp_f1 * 100, joint_em * 100, joint_f1 * 100, steps, lat
+    b_summary = compute_metrics_by_type(baseline_data)
+    r_summary = compute_metrics_by_type(react_data)
 
-    b_em, b_f1, b_sp_em, b_sp_f1, b_joint_em, b_joint_f1, b_steps, b_lat = calc_metrics(baseline_data)
-    r_em, r_f1, r_sp_em, r_sp_f1, r_joint_em, r_joint_f1, r_steps, r_lat = calc_metrics(react_data)
+    print_segmented_report(b_summary, model_name="Single-Pass RAG (Baseline)")
+    print_segmented_report(r_summary, model_name="ReAct Agent (Multi-Hop)")
+
+    b_over = b_summary.get("overall", {})
+    r_over = r_summary.get("overall", {})
 
     info = (
         f"=== COMPARATIVE STUDY: SINGLE-PASS RAG vs REACT AGENT ===\n"
         f"Baseline Dataset Size: {len(baseline_data)} | ReAct Dataset Size: {len(react_data)}\n"
-        f"Single-Pass RAG Joint F1: {b_joint_f1:.2f}% | Latency: {b_lat:.2f}s | Steps: {b_steps:.1f}\n"
-        f"ReAct Agent Joint F1:     {r_joint_f1:.2f}% | Latency: {r_lat:.2f}s | Steps: {r_steps:.1f}\n"
+        f"Single-Pass RAG Joint F1: {b_over.get('joint_f1', 0):.2f}% | Latency: {b_over.get('latency', 0):.2f}s | Steps: {b_over.get('steps', 1):.1f}\n"
+        f"ReAct Agent Joint F1:     {r_over.get('joint_f1', 0):.2f}% | Latency: {r_over.get('latency', 0):.2f}s | Steps: {r_over.get('steps', 1):.1f}\n"
     )
     print(info)
     logger.info(info)
 
     metrics_names = ["Ans EM", "Ans F1", "SP EM", "SP F1", "Joint EM", "Joint F1"]
-    baseline_scores = [b_em, b_f1, b_sp_em, b_sp_f1, b_joint_em, b_joint_f1]
-    react_scores = [r_em, r_f1, r_sp_em, r_sp_f1, r_joint_em, r_joint_f1]
+    b_scores = [b_over.get("em", 0), b_over.get("f1", 0), b_over.get("sp_em", 0), b_over.get("sp_f1", 0), b_over.get("joint_em", 0), b_over.get("joint_f1", 0)]
+    r_scores = [r_over.get("em", 0), r_over.get("f1", 0), r_over.get("sp_em", 0), r_over.get("sp_f1", 0), r_over.get("joint_em", 0), r_over.get("joint_f1", 0)]
 
     # Plot Side-by-Side Comparison Bar Chart
     plt.figure(figsize=(10, 6))
@@ -76,8 +71,8 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
     width = 0.35
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    rects1 = ax.bar([i - width/2 for i in x], baseline_scores, width, label="Single-Pass RAG (Baseline)", color="#888888")
-    rects2 = ax.bar([i + width/2 for i in x], react_scores, width, label="ReAct Agent (Multi-Hop)", color="#2b5c8f")
+    rects1 = ax.bar([i - width/2 for i in x], b_scores, width, label="Single-Pass RAG (Baseline)", color="#888888")
+    rects2 = ax.bar([i + width/2 for i in x], r_scores, width, label="ReAct Agent (Multi-Hop)", color="#2b5c8f")
 
     ax.set_ylabel("Score (%)", fontsize=12)
     ax.set_title("HotpotQA FullWiki: Single-Pass RAG vs ReAct Multi-Hop Agent", fontsize=14, fontweight="bold")
@@ -108,39 +103,53 @@ def compare_results(baseline_json_path, react_json_path, output_dir="eval_result
     report_path = os.path.join(output_dir, "comparison_report.md")
     with open(report_path, "w") as f:
         f.write("# HotpotQA FullWiki: Single-Pass RAG vs ReAct Agent Study\n\n")
-        f.write("This study compares **Single-Pass RAG (Direct Prompting Baseline)** against the **ReAct Multi-Hop Agent**.\n\n")
-
-        f.write("## Quantitative Metric Comparison\n\n")
-        f.write("| Metric | Single-Pass RAG | ReAct Agent | Absolute Gain | Relative Improvement |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: |\n")
+        f.write("This study compares **Single-Pass RAG (Direct Prompting Baseline)** against the **ReAct Multi-Hop Agent** across overall and segmented question types.\n\n")
 
         def gain_str(base, act):
             diff = act - base
             rel = (diff / base * 100) if base > 0 else 0
-            return f"{diff:+.1f}%", f"{rel:+.1f}%"
+            return f"{diff:+.2f}%", f"{rel:+.2f}%"
 
-        g_em, r_em_str = gain_str(b_em, r_em)
-        g_f1, r_f1_str = gain_str(b_f1, r_f1)
-        g_sp_em, r_sp_em_str = gain_str(b_sp_em, r_sp_em)
-        g_sp, r_sp_str = gain_str(b_sp_f1, r_sp_f1)
-        g_jem, r_jem_str = gain_str(b_joint_em, r_joint_em)
-        g_jf1, r_jf1_str = gain_str(b_joint_f1, r_joint_f1)
+        for group in ["overall", "bridge", "comparison"]:
+            bg = b_summary.get(group, {})
+            rg = r_summary.get(group, {})
+            g_label = group.capitalize()
 
-        f.write(f"| Answer EM | {b_em:.1f}% | {r_em:.1f}% | {g_em} | {r_em_str} |\n")
-        f.write(f"| Answer F1 | {b_f1:.1f}% | {r_f1:.1f}% | {g_f1} | {r_f1_str} |\n")
-        f.write(f"| Supporting Facts EM | {b_sp_em:.1f}% | {r_sp_em:.1f}% | {g_sp_em} | {r_sp_em_str} |\n")
-        f.write(f"| Supporting Facts F1 | {b_sp_f1:.1f}% | {r_sp_f1:.1f}% | {g_sp} | {r_sp_str} |\n")
-        f.write(f"| **Joint EM** | **{b_joint_em:.1f}%** | **{r_joint_em:.1f}%** | **{g_jem}** | **{r_jem_str}** |\n")
-        f.write(f"| **Joint F1** | **{b_joint_f1:.1f}%** | **{r_joint_f1:.1f}%** | **{g_jf1}** | **{r_jf1_str}** |\n")
-        f.write(f"| Avg Trajectory Hops | {b_steps:.2f} | {r_steps:.2f} | {r_steps - b_steps:+.2f} | N/A |\n")
-        f.write(f"| Avg Question Latency | {b_lat:.2f}s | {r_lat:.2f}s | {r_lat - b_lat:+.2f}s | N/A |\n\n")
+            f.write(f"## {g_label} Question Performance (n = {rg.get('count', 0)})\n\n")
+            f.write("| Metric | Single-Pass RAG | ReAct Agent | Absolute Gain | Relative Gain |\n")
+            f.write("| :--- | :---: | :---: | :---: | :---: |\n")
+
+            metrics_map = [
+                ("Answer EM", "em"),
+                ("Answer F1", "f1"),
+                ("Supporting Facts EM", "sp_em"),
+                ("Supporting Facts F1", "sp_f1"),
+                ("Joint EM", "joint_em"),
+                ("Joint F1", "joint_f1"),
+            ]
+
+            for label, key in metrics_map:
+                bv = bg.get(key, 0.0)
+                rv = rg.get(key, 0.0)
+                abs_g, rel_g = gain_str(bv, rv)
+                if "Joint" in label:
+                    f.write(f"| **{label}** | **{bv:.2f}%** | **{rv:.2f}%** | **{abs_g}** | **{rel_g}** |\n")
+                else:
+                    f.write(f"| {label} | {bv:.2f}% | {rv:.2f}% | {abs_g} | {rel_g} |\n")
+
+            b_st = bg.get("steps", 1.0)
+            r_st = rg.get("steps", 1.0)
+            b_lt = bg.get("latency", 0.0)
+            r_lt = rg.get("latency", 0.0)
+            f.write(f"| Avg Trajectory Hops | {b_st:.2f} | {r_st:.2f} | {r_st - b_st:+.2f} | N/A |\n")
+            f.write(f"| Avg Question Latency | {b_lt:.2f}s | {r_lt:.2f}s | {r_lt - b_lt:+.2f}s | N/A |\n\n")
 
         f.write("## Visual Metric Comparison Chart\n\n")
         f.write(f"![Comparison Metrics]({os.path.basename(chart_path)})\n\n")
 
         f.write("## Methodological Observations\n\n")
-        f.write("1. **Single-Pass Retrieval Bottleneck**: Single-pass RAG relies on a single retrieval query, which limits passage coverage when resolving multi-hop bridge entities.\n")
-        f.write("2. **Iterative Multi-Hop Retrieval**: The ReAct agent alternates between reasoning and targeted retrieval actions (`search` and `lookup`), allowing intermediate evidence discovery across multiple turns.\n")
+        f.write("1. **Bridge Questions (Multi-Hop Reasoning)**: Bridge questions require sequential multi-hop retrieval (finding Entity A to discover Entity B). The ReAct agent's iterative reasoning and active memory excel at these multi-turn hops.\n")
+        f.write("2. **Comparison Questions (Parallel Retrieval)**: Comparison questions require parallel retrieval of two independent entities. Single-pass RAG struggles when both entities cannot be retrieved in a single query.\n")
 
     print(f"Generated comparison chart and report in: {output_dir}/")
     print(f"Saved comparison log file to: {log_file}")

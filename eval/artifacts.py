@@ -103,3 +103,24 @@ def write_run_manifest(output_dir, manifest):
     with open(path, "w") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     return path
+
+
+def save_portfolio_trajectories(eval_records, summary_stats, output_path="eval_results/portfolio_trajectories.json"):
+    """Saves the full evaluation payload including segmented stats and trajectory logs."""
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    payload = {
+        "metadata": {
+            "description": "HotpotQA Portfolio Evaluation Run with Segmented Question-Type Metrics",
+            "metrics_summary": summary_stats,
+        },
+        "trajectories": eval_records,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    return output_path
+

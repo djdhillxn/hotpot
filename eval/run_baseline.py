@@ -23,11 +23,16 @@ from config import (
 from eval.artifacts import (
     context_diagnostics,
     observed_evidence_diagnostics,
+    save_portfolio_trajectories,
     write_official_files,
     write_run_manifest,
 )
 from eval.dataset import load_hotpot_dataset
-from eval.metrics import evaluate_prediction
+from eval.metrics import (
+    compute_metrics_by_type,
+    evaluate_prediction,
+    print_segmented_report,
+)
 from eval.plot_results import generate_eval_plots_and_report
 from tools.local_retriever import LocalHotpotRetriever
 from tools.wikipedia import WikipediaToolSet
@@ -414,7 +419,12 @@ def run_baseline_benchmark(
     with open(trajectories_json_path, "w") as f:
         json.dump(full_trajectories, f, indent=2, ensure_ascii=False)
 
+    segmented_summary = compute_metrics_by_type(results)
+    print_segmented_report(segmented_summary, model_name=f"Single-Pass RAG ({model_name})")
+
     prediction_path, gold_path = write_official_files(samples, full_trajectories, output_dir)
+    save_portfolio_trajectories(full_trajectories, segmented_summary, os.path.join(output_dir, "portfolio_trajectories.json"))
+
     manifest_path = write_run_manifest(
         output_dir,
         {
@@ -437,6 +447,7 @@ def run_baseline_benchmark(
             "exact_title_promotion": False,
             "retriever": retriever if mode == "fullwiki" else mode,
             "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
+            "segmented_metrics": segmented_summary,
             "total_evaluation_seconds": round(total_time, 3),
             "official_prediction_file": os.path.basename(prediction_path),
             "official_gold_file": os.path.basename(gold_path),

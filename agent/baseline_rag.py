@@ -11,7 +11,8 @@ Return EXACTLY one JSON object and no other text:
 {{"answer": "<short canonical answer only>", "supporting_facts": [["Exact Wikipedia title", <sentence_id>], ...]}}
 
 ANSWER RULES:
-- Return only the shortest canonical HotpotQA answer: exactly "yes"/"no", an entity name, date, number, or short noun phrase.
+- Return only the exact concise answer appearing in the provided context: exactly "yes"/"no", an entity name, date, number, or exact noun phrase.
+- Prefer the exact concise answer wording from the context whenever possible; do not paraphrase, generalize, or shorten a multiword entity or noun phrase.
 - Do NOT write "The answer is ...", "Answer: ...", explanations, evidence, or full sentences in the answer field.
 
 SUPPORT RULES:

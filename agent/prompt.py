@@ -16,9 +16,9 @@ Action: finish[<short canonical answer only>]
 Support: [["Exact Wikipedia title", <sentence_id>], ...]
 
 FINAL ANSWER RULES:
-- The content inside finish[...] must be ONLY the shortest canonical HotpotQA answer.
+- The content inside finish[...] must be ONLY the exact concise answer appearing in the observed evidence.
+- Prefer the exact concise answer wording from the evidence whenever possible; do not paraphrase, generalize, or shorten a multiword entity or noun phrase.
 - Use exactly "yes" or "no" for yes/no questions.
-- For entity/date/number answers, output only the exact entity, date, number, or short noun phrase.
 - Do NOT write "The answer is ...", "Answer: ...", explanations, evidence, or full sentences inside finish[...].
 - Put evidence citations only on the Support line.
 
@@ -29,6 +29,8 @@ When Active Evidence Memory or an Observation contains labels such as [Radiohead
 For Support, cite ONLY sentence labels that were actually observed, copy the Wikipedia title exactly, and include every sentence needed to justify the answer.
 If no observed sentence supports the answer, return Support: [] rather than inventing evidence.
 If an observation states that a search query was already performed, reformulate the query or use lookup; do not repeat identical searches.
+When you identify a bridge entity or exact Wikipedia title, search the entity or title directly rather than repeating the full original question.
+Finish immediately as soon as you observe sufficient evidence to answer and cite the required supporting facts; do not perform redundant confirmation searches.
 
 ---
 HERE ARE FEW-SHOT EXAMPLES OF THE REQUIRED FORMAT:
@@ -96,6 +98,26 @@ Observation: Loaded [Inception] (rank 1).
 Thought: Inception was directed by Christopher Nolan and stars Leonardo DiCaprio.
 Action: finish[Inception]
 Support: [["Christopher Nolan", 1], ["Inception", 0], ["Inception", 1]]
+
+---
+EXAMPLE 5:
+Question: In what city is the headquarters of the company founded by Bill Gates located?
+Thought: I need to search for Bill Gates to find the company he founded.
+Action: search[Bill Gates]
+Observation: Loaded [Bill Gates] (rank 1).
+[Bill Gates | sent 0] William Henry Gates III (born October 28, 1955) is an American business magnate, investor, and philanthropist.
+[Bill Gates | sent 1] He is best known for co-founding software giant Microsoft along with his late childhood friend Paul Allen.
+Thought: Bill Gates co-founded Microsoft. Now I need to search for Microsoft and find its headquarters location.
+Action: search[Microsoft]
+Observation: Loaded [Microsoft] (rank 1).
+[Microsoft | sent 0] Microsoft Corporation is an American multinational technology corporation.
+[Microsoft | sent 1] It produces computer software, consumer electronics, personal computers, and related services.
+Thought: I need to lookup where Microsoft's headquarters is located on the Microsoft page.
+Action: lookup[headquarters]
+Observation: (Result 1/1) [Microsoft | sent 4] Its corporate headquarters is located in Redmond, Washington.
+Thought: Microsoft's headquarters is in Redmond, Washington. I have sufficient evidence to answer immediately.
+Action: finish[Redmond, Washington]
+Support: [["Bill Gates", 1], ["Microsoft", 4]]
 """
 
 FORCED_SYNTHESIS_PROMPT_SYSTEM = """You have exhausted the allowed search/lookup budget for this question.
@@ -107,9 +129,9 @@ Action: finish[<short canonical answer only>]
 Support: [["Exact Wikipedia title", <sentence_id>], ...]
 
 FINAL ANSWER RULES:
-- The content inside finish[...] must be ONLY the shortest canonical HotpotQA answer.
+- The content inside finish[...] must be ONLY the exact concise answer appearing in the observed evidence.
+- Prefer the exact concise answer wording from the evidence whenever possible; do not paraphrase, generalize, or shorten a multiword entity or noun phrase.
 - Use exactly "yes" or "no" for yes/no questions.
-- For entity/date/number answers, output only the exact entity, date, number, or short noun phrase.
 - Do NOT include "The answer is ...", "Answer: ...", explanations, evidence, or full sentences inside finish[...].
 - Put evidence citations only on the Support line.
 

@@ -159,3 +159,90 @@ def evaluate_prediction(
         "doc_f1": doc_f1,
         "step_count": step_count,
     }
+
+
+def compute_metrics_by_type(records):
+    """Computes full HotpotQA metrics overall and segmented by question type ('bridge' vs 'comparison')."""
+    groups = {
+        "overall": [],
+        "bridge": [],
+        "comparison": [],
+    }
+
+    for item in records or []:
+        q_type = str(item.get("question_type") or item.get("type") or "unknown").lower()
+
+        em = float(item.get("exact_match", 0))
+        f1 = float(item.get("f1", item.get("answer_f1", 0)))
+        sp_em = float(item.get("sp_em", item.get("supporting_fact_em", 0)))
+        sp_f1 = float(item.get("sp_f1", item.get("supporting_fact_f1", 0)))
+        joint_em = float(item.get("joint_em", 0))
+        joint_f1 = float(item.get("joint_f1", 0))
+        steps = float(item.get("step_count", 1))
+        lat = float(item.get("latency", item.get("latency_seconds", 0)))
+
+        entry = {
+            "em": em,
+            "f1": f1,
+            "sp_em": sp_em,
+            "sp_f1": sp_f1,
+            "joint_em": joint_em,
+            "joint_f1": joint_f1,
+            "steps": steps,
+            "latency": lat,
+        }
+
+        groups["overall"].append(entry)
+        if q_type in groups:
+            groups[q_type].append(entry)
+
+    summary = {}
+    for group_name, entries in groups.items():
+        count = len(entries)
+        if count == 0:
+            summary[group_name] = {
+                "count": 0,
+                "em": 0.0,
+                "f1": 0.0,
+                "sp_em": 0.0,
+                "sp_f1": 0.0,
+                "joint_em": 0.0,
+                "joint_f1": 0.0,
+                "steps": 0.0,
+                "latency": 0.0,
+            }
+            continue
+
+        summary[group_name] = {
+            "count": count,
+            "em": round(sum(e["em"] for e in entries) / count * 100.0, 2),
+            "f1": round(sum(e["f1"] for e in entries) / count * 100.0, 2),
+            "sp_em": round(sum(e["sp_em"] for e in entries) / count * 100.0, 2),
+            "sp_f1": round(sum(e["sp_f1"] for e in entries) / count * 100.0, 2),
+            "joint_em": round(sum(e["joint_em"] for e in entries) / count * 100.0, 2),
+            "joint_f1": round(sum(e["joint_f1"] for e in entries) / count * 100.0, 2),
+            "steps": round(sum(e["steps"] for e in entries) / count, 2),
+            "latency": round(sum(e["latency"] for e in entries) / count, 2),
+        }
+
+    return summary
+
+
+def print_segmented_report(summary, model_name="Evaluation Run"):
+    """Print clean ASCII summary table broken down by HotpotQA question type."""
+    print(f"\n{'='*75}")
+    print(f"  HotpotQA Segmented Performance Report: {model_name}")
+    print(f"{'='*75}")
+    print(f"{'Type':<12} | {'Count':<6} | {'Ans EM':<8} | {'Ans F1':<8} | {'SP F1':<8} | {'Joint EM':<9} | {'Joint F1':<8}")
+    print(f"{'-'*12}-+-{'-'*6}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*9}-+-{'-'*8}")
+
+    for group_name in ["overall", "bridge", "comparison"]:
+        data = summary.get(group_name, {"count": 0, "em": 0.0, "f1": 0.0, "sp_f1": 0.0, "joint_em": 0.0, "joint_f1": 0.0})
+        label = group_name.capitalize()
+        print(
+            f"{label:<12} | {data['count']:<6} | {data['em']:<7.2f}% | {data['f1']:<7.2f}% | "
+            f"{data['sp_f1']:<7.2f}% | {data['joint_em']:<8.2f}% | {data['joint_f1']:<7.2f}%"
+        )
+
+    print(f"{'='*75}\n")
+
