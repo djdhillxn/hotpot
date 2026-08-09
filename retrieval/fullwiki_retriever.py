@@ -124,6 +124,29 @@ class FullWikiSearchBackend:
                 batch_size=evidence_reranker_batch_size,
             )
 
+        self.title_graph_path = os.path.join(os.path.dirname(self.manifest_path), "title_graph.json")
+        self.title_graph = self._load_title_graph()
+
+    def _load_title_graph(self):
+        if os.path.isfile(self.title_graph_path):
+            try:
+                with open(self.title_graph_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def get_outgoing_links(self, title):
+        if not title or not self.title_graph:
+            return []
+        norm = str(title).strip().lower()
+        if title in self.title_graph:
+            return self.title_graph[title]
+        for t, links in self.title_graph.items():
+            if t.lower() == norm:
+                return links
+        return []
+
     def _load_manifest(self):
         if not os.path.isfile(self.manifest_path):
             raise FileNotFoundError(
@@ -889,6 +912,29 @@ class FullWikiRetriever:
                 reordered_hits = [direct_hit] + hits
                 hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
                 title_match_rank = 1
+
+        # Hyperlink Graph Candidate Expansion:
+        # Extract 1-hop outgoing links from all Active Memory documents and visited pages.
+        # Fetch those candidate documents and merge them into hits before Cross-Encoder scoring.
+        if self.use_reranked_memory and hasattr(self.backend, "get_outgoing_links"):
+            graph_targets = set()
+            active_titles = [self._evidence_archive[doc_id]["document"]["title"] for doc_id in self._evidence_doc_ids]
+            for page_title in active_titles + self.visited_pages:
+                links = self.backend.get_outgoing_links(page_title)
+                for target in links[:15]:
+                    graph_targets.add(target)
+
+            existing_hit_ids = {str(h["doc_id"]) for h in hits}
+            injected_graph_count = 0
+            for target_title in graph_targets:
+                if injected_graph_count >= 20:
+                    break
+                graph_doc = self.backend.get_doc_by_title(target_title)
+                if graph_doc and str(graph_doc["doc_id"]) not in existing_hit_ids:
+                    graph_hit = dict(graph_doc, rank=len(hits) + 1, fused_score=0.5)
+                    hits.append(graph_hit)
+                    existing_hit_ids.add(str(graph_doc["doc_id"]))
+                    injected_graph_count += 1
 
         # ReAct entity searches often name the exact Wikipedia page discovered on a
         # previous hop. When that exact title is already inside the retrieved top-k,
