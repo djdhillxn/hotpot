@@ -32,16 +32,35 @@ class CrossEncoderEvidenceReranker:
             num_threads = min(4, max(1, (os.cpu_count() or 4) // 4))
             torch.set_num_threads(num_threads)
 
+        model_kwargs = {}
+        self.dtype_str = "float32"
+        if "cuda" in self.device.lower():
+            model_kwargs["torch_dtype"] = torch.float16
+            self.dtype_str = "float16"
+
         try:
-            self.model = CrossEncoder(
-                self.model_name,
-                max_length=self.max_length,
-                device=self.device,
-            )
+            try:
+                self.model = CrossEncoder(
+                    self.model_name,
+                    max_length=self.max_length,
+                    device=self.device,
+                    model_kwargs=model_kwargs,
+                )
+            except (TypeError, ValueError):
+                self.model = CrossEncoder(
+                    self.model_name,
+                    max_length=self.max_length,
+                    device=self.device,
+                )
+
+            if "cuda" in self.device.lower() and hasattr(self.model, "model"):
+                self.model.model.to(torch.float16)
+
         except Exception as exc:
             if "cuda" in self.device.lower():
                 print(f"[EvidenceReranker WARNING] Failed to load on {self.device} ({exc}). Falling back to CPU.")
                 self.device = "cpu"
+                self.dtype_str = "float32"
                 num_threads = min(4, max(1, (os.cpu_count() or 4) // 4))
                 torch.set_num_threads(num_threads)
                 self.model = CrossEncoder(
@@ -49,12 +68,14 @@ class CrossEncoderEvidenceReranker:
                     max_length=self.max_length,
                     device="cpu",
                 )
+                if hasattr(self.model, "model"):
+                    self.model.model.to("cpu").to(torch.float32)
             else:
                 raise exc
 
         print(
             f"[EvidenceReranker] Successfully initialized '{self.model_name}' on device '{self.device}' "
-            f"(batch_size={self.batch_size}, max_length={self.max_length})"
+            f"(torch_dtype={self.dtype_str}, batch_size={self.batch_size}, max_length={self.max_length})"
         )
 
     def score(self, question, passages):
@@ -83,7 +104,9 @@ class CrossEncoderEvidenceReranker:
                     )
                     torch.cuda.empty_cache()
                     self.device = "cpu"
-                    self.model.model.to("cpu")
+                    self.dtype_str = "float32"
+                    if hasattr(self.model, "model"):
+                        self.model.model.to("cpu").to(torch.float32)
                     num_threads = min(4, max(1, (os.cpu_count() or 4) // 4))
                     torch.set_num_threads(num_threads)
                     with torch.inference_mode():
