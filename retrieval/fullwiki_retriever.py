@@ -134,6 +134,11 @@ class FullWikiSearchBackend:
                 batch_size=evidence_reranker_batch_size,
             )
 
+        self.db_path = os.path.join(os.path.dirname(self.manifest_path), "hyperlink_graph.db")
+        alt_db_path = os.path.join("data", "fullwiki", "hyperlink_graph.db")
+        if not os.path.isfile(self.db_path) and os.path.isfile(alt_db_path):
+            self.db_path = alt_db_path
+
         self.title_graph_path = os.path.join(os.path.dirname(self.manifest_path), "title_graph.json")
         alt_graph_path = os.path.join("data", "fullwiki", "title_graph.json")
         if not os.path.isfile(self.title_graph_path) and os.path.isfile(alt_graph_path):
@@ -182,6 +187,80 @@ class FullWikiSearchBackend:
             if t.lower() == norm:
                 return links
         return []
+
+    def _get_db_conn(self):
+        if not hasattr(self, "_db_conn") or self._db_conn is None:
+            if hasattr(self, "db_path") and os.path.isfile(self.db_path):
+                try:
+                    import sqlite3
+                    self._db_conn = sqlite3.connect(
+                        f"file:{self.db_path}?mode=ro",
+                        uri=True,
+                        check_same_thread=False,
+                    )
+                except Exception:
+                    self._db_conn = None
+            else:
+                self._db_conn = None
+        return self._db_conn
+
+    def get_outgoing_edges(self, title):
+        if not title:
+            return []
+        conn = self._get_db_conn()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT source_title, source_doc_id, source_sent_id, anchor_text, target_title, target_doc_id "
+                    "FROM edges WHERE source_title = ? COLLATE NOCASE",
+                    (title,)
+                )
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "source_title": r[0],
+                        "source_doc_id": r[1],
+                        "source_sent_id": r[2],
+                        "anchor_text": r[3],
+                        "target_title": r[4],
+                        "target_doc_id": r[5],
+                    }
+                    for r in rows
+                ]
+            except Exception:
+                pass
+
+        links = self.get_outgoing_links(title)
+        return [
+            {
+                "source_title": title,
+                "source_doc_id": "",
+                "source_sent_id": 0,
+                "anchor_text": target,
+                "target_title": target,
+                "target_doc_id": "",
+            }
+            for target in links
+        ]
+
+    def get_target_outdegree(self, target_title):
+        if not target_title:
+            return 1
+        conn = self._get_db_conn()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT count FROM outdegree WHERE target_title = ?",
+                    (target_title.strip().lower(),)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+            except Exception:
+                pass
+        return 1
 
     def _load_manifest(self):
         if not os.path.isfile(self.manifest_path):
@@ -432,6 +511,12 @@ class FullWikiSearchBackend:
         duplicate_search_guard=False,
         question=None,
         use_graph_expansion=False,
+        graph_focus_doc_count=2,
+        graph_candidate_quota=10,
+        graph_weight_source_sent_score=2.0,
+        graph_weight_anchor_overlap=1.5,
+        graph_weight_title_overlap=1.0,
+        graph_weight_outdegree_penalty=0.3,
     ):
         return FullWikiRetriever(
             self,
@@ -441,6 +526,12 @@ class FullWikiSearchBackend:
             duplicate_search_guard=duplicate_search_guard,
             question=question,
             use_graph_expansion=use_graph_expansion,
+            graph_focus_doc_count=graph_focus_doc_count,
+            graph_candidate_quota=graph_candidate_quota,
+            graph_weight_source_sent_score=graph_weight_source_sent_score,
+            graph_weight_anchor_overlap=graph_weight_anchor_overlap,
+            graph_weight_title_overlap=graph_weight_title_overlap,
+            graph_weight_outdegree_penalty=graph_weight_outdegree_penalty,
         )
 
     def describe(self):
@@ -473,6 +564,12 @@ class FullWikiRetriever:
         duplicate_search_guard=False,
         question=None,
         use_graph_expansion=False,
+        graph_focus_doc_count=2,
+        graph_candidate_quota=10,
+        graph_weight_source_sent_score=2.0,
+        graph_weight_anchor_overlap=1.5,
+        graph_weight_title_overlap=1.0,
+        graph_weight_outdegree_penalty=0.3,
     ):
         self.backend = backend
         self.search_top_k = int(search_top_k)
@@ -483,6 +580,12 @@ class FullWikiRetriever:
         self.duplicate_search_guard = bool(duplicate_search_guard)
         self.question = str(question).strip() if question is not None else None
         self.use_graph_expansion = bool(use_graph_expansion)
+        self.graph_focus_doc_count = int(graph_focus_doc_count)
+        self.graph_candidate_quota = int(graph_candidate_quota)
+        self.graph_w_src = float(graph_weight_source_sent_score)
+        self.graph_w_anchor = float(graph_weight_anchor_overlap)
+        self.graph_w_title = float(graph_weight_title_overlap)
+        self.graph_w_outdegree = float(graph_weight_outdegree_penalty)
         self.use_reranked_memory = (
             getattr(self.backend, "evidence_reranker", None) is not None
             and self.max_evidence_documents is not None
@@ -865,7 +968,7 @@ class FullWikiRetriever:
         return added_ids, evicted_ids, active_hits, observation_omitted
 
     def _search_with_reranked_memory(
-        self, query, normalized_query, result, hits, raw_logged_hits, title_match_rank
+        self, query, normalized_query, result, hits, raw_logged_hits, title_match_rank, graph_expansion_logs=None
     ):
         new_archive_titles, reranker_latency = self._score_new_archive_documents(query, hits)
 
@@ -949,6 +1052,7 @@ class FullWikiRetriever:
             "memory_reranker": self.backend.evidence_reranker.describe(),
             "active_memory_documents": self.active_memory_snapshot(),
             "rank1_in_active_memory": rank1_in_memory,
+            "graph_expansion_info": graph_expansion_logs or [],
             "latency_ms": {
                 **result.get("latency_ms", {}),
                 "memory_reranker": round(reranker_latency * 1000, 3),
@@ -1022,46 +1126,101 @@ class FullWikiRetriever:
                 hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
                 title_match_rank = 1
 
-        # Smart Hyperlink Graph Candidate Expansion:
-        # Extract 1-hop outgoing links from all Active Memory documents and visited pages.
-        # Filter out generic titles and rank by overlap with question/query before fetching top 20.
-        if self.use_graph_expansion and self.use_reranked_memory and hasattr(self.backend, "get_outgoing_links"):
-            GENERIC_TITLES = {
-                "united states", "english language", "actor", "film director", "film",
-                "television series", "california", "new york city", "united kingdom",
-                "japan", "france", "germany", "music", "album", "single (music)",
-                "rock music", "pop music", "hip hop music", "country", "city", "state", "year"
-            }
-            graph_targets = set()
-            active_titles = [self._evidence_archive[doc_id]["document"]["title"] for doc_id in self._evidence_doc_ids]
-            for page_title in active_titles + self.visited_pages:
-                links = self.backend.get_outgoing_links(page_title)
-                for target in links:
-                    norm_target = str(target).strip().lower()
-                    if norm_target not in GENERIC_TITLES and norm_target not in {t.lower() for t in self.visited_pages}:
-                        graph_targets.add(target)
+        # Precision Hyperlink Graph Expansion:
+        # Expand outgoing links strictly from self.current_title and top 1-2 active memory pages.
+        # Rank candidates using source sentence score, anchor text overlap, target title overlap,
+        # and an IDF outdegree penalty -log(1 + outdegree) to penalize generic hub pages automatically.
+        # Quota: top 10 candidates max.
+        graph_expansion_logs = []
+        if self.use_graph_expansion and self.use_reranked_memory and hasattr(self.backend, "get_outgoing_edges"):
+            focus_titles = []
+            if self.current_title:
+                focus_titles.append(self.current_title)
 
-            # Rank candidate graph targets by token overlap with question and active query
+            top_active_titles = [
+                self._evidence_archive[did]["document"]["title"]
+                for did in self._evidence_doc_ids[: self.graph_focus_doc_count]
+                if self._evidence_archive[did]["document"]["title"] not in focus_titles
+            ]
+            focus_titles.extend(top_active_titles)
+
             q_tokens = set(self._normalize_query(self.question).split() + normalized_query.split())
+            candidate_edges = []
+            seen_target_norms = {self._normalize_title(t) for t in self.visited_pages}
 
-            def _graph_target_score(target):
-                t_tokens = set(self._normalize_title(target).split())
-                overlap = len(q_tokens & t_tokens)
-                return overlap
+            for source_title in focus_titles:
+                edges = self.backend.get_outgoing_edges(source_title)
+                source_doc_id = None
+                if hasattr(self.backend, "title_to_doc_id"):
+                    source_doc_id = self.backend.title_to_doc_id.get(source_title.lower())
 
-            sorted_graph_targets = sorted(graph_targets, key=_graph_target_score, reverse=True)
+                sent_scores = {}
+                if source_doc_id and source_doc_id in self._evidence_archive:
+                    sent_scores = self._evidence_archive[source_doc_id].get("sentence_scores", {})
+
+                for edge in edges:
+                    target_title = edge["target_title"]
+                    target_norm = self._normalize_title(target_title)
+                    if target_norm in seen_target_norms:
+                        continue
+
+                    source_sent_id = edge.get("source_sent_id", 0)
+                    source_sent_score = sent_scores.get(source_sent_id, 0.0)
+
+                    anchor_text = edge.get("anchor_text", target_title)
+                    anchor_tokens = set(self._normalize_title(anchor_text).split())
+                    anchor_overlap = len(q_tokens & anchor_tokens)
+
+                    target_tokens = set(target_norm.split())
+                    title_overlap = len(q_tokens & target_tokens)
+
+                    outdegree = self.backend.get_target_outdegree(target_title)
+                    outdegree_penalty = math.log1p(outdegree)
+
+                    # Multi-signal precision graph score
+                    score = (
+                        (self.graph_w_src * source_sent_score)
+                        + (self.graph_w_anchor * anchor_overlap)
+                        + (self.graph_w_title * title_overlap)
+                        - (self.graph_w_outdegree * outdegree_penalty)
+                    )
+
+                    candidate_edges.append({
+                        "source_title": source_title,
+                        "source_doc_id": edge.get("source_doc_id", ""),
+                        "source_sent_id": source_sent_id,
+                        "anchor_text": anchor_text,
+                        "target_title": target_title,
+                        "score": score,
+                    })
+
+            best_edges_by_target = {}
+            for edge in candidate_edges:
+                t = edge["target_title"]
+                if t not in best_edges_by_target or edge["score"] > best_edges_by_target[t]["score"]:
+                    best_edges_by_target[t] = edge
+
+            sorted_graph_edges = sorted(best_edges_by_target.values(), key=lambda e: e["score"], reverse=True)
 
             existing_hit_ids = {str(h["doc_id"]) for h in hits}
             injected_graph_count = 0
-            for target_title in sorted_graph_targets[:30]:
-                if injected_graph_count >= 20:
+
+            for edge in sorted_graph_edges:
+                if injected_graph_count >= self.graph_candidate_quota:
                     break
-                graph_doc = self.backend.get_doc_by_title(target_title)
+                graph_doc = self.backend.get_doc_by_title(edge["target_title"])
                 if graph_doc and str(graph_doc["doc_id"]) not in existing_hit_ids:
-                    graph_hit = dict(graph_doc, rank=len(hits) + 1, fused_score=0.5)
+                    graph_hit = dict(graph_doc, rank=len(hits) + 1, fused_score=0.5 + edge["score"])
                     hits.append(graph_hit)
                     existing_hit_ids.add(str(graph_doc["doc_id"]))
                     injected_graph_count += 1
+                    graph_expansion_logs.append({
+                        "source_title": edge["source_title"],
+                        "source_sent_id": edge["source_sent_id"],
+                        "anchor_text": edge["anchor_text"],
+                        "target_title": edge["target_title"],
+                        "score": round(edge["score"], 4),
+                    })
 
         # ReAct entity searches often name the exact Wikipedia page discovered on a
         # previous hop. When that exact title is already inside the retrieved top-k,
@@ -1117,7 +1276,7 @@ class FullWikiRetriever:
 
         if self.use_reranked_memory:
             return self._search_with_reranked_memory(
-                query, normalized_query, result, hits, raw_logged_hits, title_match_rank
+                query, normalized_query, result, hits, raw_logged_hits, title_match_rank, graph_expansion_logs
             )
 
         candidate_new_hits = []

@@ -23,6 +23,12 @@ react_top_k: 40
 max_evidence_documents: 20
 max_observation_chars: 22000
 use_graph_expansion: false
+graph_focus_doc_count: 2
+graph_candidate_quota: 10
+graph_weight_source_sent_score: 2.0
+graph_weight_anchor_overlap: 1.5
+graph_weight_title_overlap: 1.0
+graph_weight_outdegree_penalty: 0.3
 
 # ReAct Cross-Encoder Evidence Memory Reranker (CUDA Execution)
 memory_reranker_model: "BAAI/bge-reranker-base"

@@ -90,15 +90,19 @@ python --version
 java -version
 ```
 
-### Step 2: Build Global FullWiki Retrieval Indexes (Done Once)
+### Step 2: Build Global FullWiki Retrieval Indexes & Hyperlink Graph (Done Once)
 
 Do this **before launching vLLM**, because the one-time BGE corpus encoding uses the L4 GPU.
 
 ```bash
+# 1. Build Lucene BM25 and BGE FAISS Hybrid Indexes:
 python retrieval/build_fullwiki_index.py
+
+# 2. Build Precision Hyperlink Graph SQLite Database & Indexes:
+python tools/build_hyperlink_graph.py --output-dir indexes/fullwiki
 ```
 
-This single command:
+This commands:
 1. downloads the official HotpotQA Wikipedia intro archive if needed;
 2. verifies its official MD5 checksum (`01edf64cd120ecc03a2745352779514c`);
 3. streams the archive into sharded JSONL without materializing an expanded Wikipedia dump;
@@ -106,10 +110,25 @@ This single command:
 5. builds a Lucene BM25 index with stored raw documents;
 6. encodes the corpus with `BAAI/bge-base-en-v1.5`;
 7. builds a FAISS IVF-PQ dense index;
-8. verifies Lucene/FAISS document counts; and
-9. writes `indexes/fullwiki/manifest.json` with the exact corpus/index configuration.
+8. extracts Wikipedia HTML hyperlinks `<a href="...">` with sentence IDs, anchor text, target titles, and outdegree statistics into a high-performance SQLite database (`indexes/fullwiki/hyperlink_graph.db`) with case-insensitive `COLLATE NOCASE` indexes;
+9. verifies Lucene/FAISS/Graph document counts; and
+10. writes `indexes/fullwiki/manifest.json` with the exact corpus/index configuration.
 
-The build is idempotent. Existing verified stages are reused unless `--force-*` is supplied.
+> [!TIP]
+> **What does `--force` do?**
+> By default, `python tools/build_hyperlink_graph.py` checks if `hyperlink_graph.db`, `title_graph.json`, and `title_to_doc_id.json` already exist in `--output-dir`. If present, it skips re-processing to save time (~2 min). Passing `--force` deletes existing graph files and forces a full re-extraction from the source Wikipedia archive.
+
+The build is idempotent. Existing verified stages are reused unless `--force` or `--force-*` is supplied.
+
+### Precision Hyperlink Graph Candidate Expansion
+
+When `--enable-graph-expansion` is passed to `run_eval.py` (or `use_graph_expansion: true` in `config/fullwiki.yaml`), the ReAct agent dynamically expands 1-hop outgoing links to discover bridge entities that lack direct word overlap with the original query.
+
+- **Focus Pages**: Outgoing edges are expanded strictly from the current search page (`current_title`) and top 1-2 active memory pages, avoiding noisy multi-document fan-outs.
+- **Multi-Signal Candidate Ranking**: Edges are scored using:
+  $$\text{Score} = 2.0 \times \text{SourceSentScore} + 1.5 \times \text{AnchorOverlap} + 1.0 \times \text{TitleOverlap} - 0.3 \times \log(1 + \text{TargetOutDegree})$$
+- **Automatic IDF Outdegree Penalty**: $-\log(1 + \text{TargetOutDegree})$ automatically penalizes generic high-outdegree hubs (e.g. `United States`, `Film`) without hard-coded stop lists.
+- **Quota & Logging**: Capped at **top 10 precision candidates**, with edge metadata logged in `last_result["graph_expansion_info"]`.
 
 ### Step 3: Verify FullWiki Retrieval Before Spending LLM Compute
 
@@ -179,12 +198,21 @@ Inspect `eval_results/test_reranker/trajectories.json` to confirm:
 ### Step 7: Execute Full 7,405 Evaluation Benchmark
 
 ```bash
-# ReAct Multi-Hop Agent (Concurrent 64 Workers):
+# 1. Standard ReAct Multi-Hop Agent (Concurrent 64 Workers):
 python eval/run_eval.py \
     --config config/fullwiki.yaml \
     --source official_json \
     --concurrency 64 \
-    --output-dir eval_results/react
+    --disable-graph-expansion \
+    --output-dir eval_results/react_standard
+
+# 2. Precision Graph-Enhanced ReAct Multi-Hop Agent (Concurrent 64 Workers):
+python eval/run_eval.py \
+    --config config/fullwiki.yaml \
+    --source official_json \
+    --concurrency 64 \
+    --enable-graph-expansion \
+    --output-dir eval_results/react_graph
 ```
 
 ### Step 8: Generate Baseline vs. ReAct Comparative Analysis

@@ -100,6 +100,9 @@ def process_single_question(
     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend=None,
     search_top_k=REACT_SEARCH_TOP_K, max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
     max_observation_chars=REACT_MAX_OBSERVATION_CHARS, use_graph_expansion=USE_GRAPH_EXPANSION,
+    graph_focus_doc_count=GRAPH_FOCUS_DOC_COUNT, graph_candidate_quota=GRAPH_CANDIDATE_QUOTA,
+    graph_w_src=GRAPH_WEIGHT_SOURCE_SENT_SCORE, graph_w_anchor=GRAPH_WEIGHT_ANCHOR_OVERLAP,
+    graph_w_title=GRAPH_WEIGHT_TITLE_OVERLAP, graph_w_out=GRAPH_WEIGHT_OUTDEGREE_PENALTY,
 ):
     question = sample["question"]
     gold_answer = sample["answer"]
@@ -117,6 +120,12 @@ def process_single_question(
             duplicate_search_guard=True,
             question=question,
             use_graph_expansion=use_graph_expansion,
+            graph_focus_doc_count=graph_focus_doc_count,
+            graph_candidate_quota=graph_candidate_quota,
+            graph_weight_source_sent_score=graph_w_src,
+            graph_weight_anchor_overlap=graph_w_anchor,
+            graph_weight_title_overlap=graph_w_title,
+            graph_weight_outdegree_penalty=graph_w_out,
         )
     else:
         toolset = WikipediaToolSet()
@@ -298,17 +307,24 @@ from config import (
     FULLWIKI_INDEX_DIR,
     FULLWIKI_RRF_K,
     FULLWIKI_SEARCH_CANDIDATES,
+    GRAPH_CANDIDATE_QUOTA,
+    GRAPH_FOCUS_DOC_COUNT,
+    GRAPH_WEIGHT_ANCHOR_OVERLAP,
+    GRAPH_WEIGHT_OUTDEGREE_PENALTY,
+    GRAPH_WEIGHT_SOURCE_SENT_SCORE,
+    GRAPH_WEIGHT_TITLE_OVERLAP,
     LLM_MODEL_NAME,
     MAX_AGENT_HOPS,
     OPENAI_API_BASE,
     OPENAI_API_KEY,
     REACT_MAX_EVIDENCE_DOCUMENTS,
     REACT_MAX_OBSERVATION_CHARS,
-    REACT_SEARCH_TOP_K,
     REACT_MEMORY_RERANKER_BATCH_SIZE,
     REACT_MEMORY_RERANKER_DEVICE,
     REACT_MEMORY_RERANKER_MAX_LENGTH,
     REACT_MEMORY_RERANKER_MODEL,
+    REACT_SEARCH_TOP_K,
+    USE_GRAPH_EXPANSION,
 )
 
 
@@ -328,6 +344,13 @@ def run_benchmark(
     search_top_k=REACT_SEARCH_TOP_K,
     max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
     max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
+    use_graph_expansion=USE_GRAPH_EXPANSION,
+    graph_focus_doc_count=GRAPH_FOCUS_DOC_COUNT,
+    graph_candidate_quota=GRAPH_CANDIDATE_QUOTA,
+    graph_w_src=GRAPH_WEIGHT_SOURCE_SENT_SCORE,
+    graph_w_anchor=GRAPH_WEIGHT_ANCHOR_OVERLAP,
+    graph_w_title=GRAPH_WEIGHT_TITLE_OVERLAP,
+    graph_w_out=GRAPH_WEIGHT_OUTDEGREE_PENALTY,
     reranker_model=None,
     reranker_device=None,
     reranker_max_length=None,
@@ -361,6 +384,9 @@ def run_benchmark(
         f"Concurrency Workers: {concurrency}\n"
         f"Max Hops Limit: {max_hops}\n"
         f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
+        f"Graph Expansion Enabled: {use_graph_expansion if mode == 'fullwiki' else 'n/a'}\n"
+        f"Graph Focus Doc Count: {graph_focus_doc_count if mode == 'fullwiki' and use_graph_expansion else 'n/a'}\n"
+        f"Graph Candidate Quota: {graph_candidate_quota if mode == 'fullwiki' and use_graph_expansion else 'n/a'}\n"
         f"Documents per adaptive search: {search_top_k if mode == 'fullwiki' else 1}\n"
         f"Max unique working-evidence documents: {max_evidence_documents if mode == 'fullwiki' else 'n/a'}\n"
         f"Max characters per retrieval observation: {max_observation_chars if mode == 'fullwiki' else 'n/a'}\n"
@@ -402,7 +428,9 @@ def run_benchmark(
             try:
                 eval_metrics, trajectory_entry = process_single_question(
                     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend, search_top_k,
-                    max_evidence_documents, max_observation_chars
+                    max_evidence_documents, max_observation_chars, use_graph_expansion,
+                    graph_focus_doc_count, graph_candidate_quota, graph_w_src, graph_w_anchor,
+                    graph_w_title, graph_w_out
                 )
             except Exception as exc:
                 logger.exception(f"Error processing question {idx}: {exc}")
@@ -423,7 +451,9 @@ def run_benchmark(
             future_to_meta = {
                 executor.submit(
                     process_single_question, sample, idx, total, mode, llm, max_hops, logger,
-                    fullwiki_backend, search_top_k, max_evidence_documents, max_observation_chars
+                    fullwiki_backend, search_top_k, max_evidence_documents, max_observation_chars,
+                    use_graph_expansion, graph_focus_doc_count, graph_candidate_quota,
+                    graph_w_src, graph_w_anchor, graph_w_title, graph_w_out
                 ): (idx, sample)
                 for idx, sample in enumerate(samples, 1)
             }
@@ -593,6 +623,8 @@ if __name__ == "__main__":
     parser.add_argument("--reranker-model", type=str, default=None, help="Evidence reranker model name")
     parser.add_argument("--reranker-device", type=str, default=None, help="Evidence reranker device (cpu/cuda)")
     parser.add_argument("--max-hops", type=int, default=None, help="Maximum hops per question")
+    parser.add_argument("--enable-graph-expansion", action="store_true", default=False, help="Enable precision hyperlink graph expansion")
+    parser.add_argument("--disable-graph-expansion", action="store_true", default=False, help="Disable precision hyperlink graph expansion")
 
     args = parser.parse_args()
     cfg = load_eval_config(args.config) if args.config else {}
@@ -614,6 +646,21 @@ if __name__ == "__main__":
     reranker_batch_size = cfg.get("memory_reranker_batch_size") or REACT_MEMORY_RERANKER_BATCH_SIZE
     reranker_max_length = cfg.get("memory_reranker_max_length") or REACT_MEMORY_RERANKER_MAX_LENGTH
 
+    if args.enable_graph_expansion:
+        use_graph_expansion = True
+    elif args.disable_graph_expansion:
+        use_graph_expansion = False
+    else:
+        cfg_graph = cfg.get("use_graph_expansion")
+        use_graph_expansion = bool(cfg_graph) if cfg_graph is not None else USE_GRAPH_EXPANSION
+
+    graph_focus_doc_count = cfg.get("graph_focus_doc_count") or GRAPH_FOCUS_DOC_COUNT
+    graph_candidate_quota = cfg.get("graph_candidate_quota") or GRAPH_CANDIDATE_QUOTA
+    graph_w_src = cfg.get("graph_weight_source_sent_score") or GRAPH_WEIGHT_SOURCE_SENT_SCORE
+    graph_w_anchor = cfg.get("graph_weight_anchor_overlap") or GRAPH_WEIGHT_ANCHOR_OVERLAP
+    graph_w_title = cfg.get("graph_weight_title_overlap") or GRAPH_WEIGHT_TITLE_OVERLAP
+    graph_w_out = cfg.get("graph_weight_outdegree_penalty") or GRAPH_WEIGHT_OUTDEGREE_PENALTY
+
     run_benchmark(
         num_samples=args.samples,
         mode=mode,
@@ -630,6 +677,13 @@ if __name__ == "__main__":
         search_top_k=search_top_k,
         max_evidence_documents=max_evidence_docs,
         max_observation_chars=max_observation_chars,
+        use_graph_expansion=use_graph_expansion,
+        graph_focus_doc_count=graph_focus_doc_count,
+        graph_candidate_quota=graph_candidate_quota,
+        graph_w_src=graph_w_src,
+        graph_w_anchor=graph_w_anchor,
+        graph_w_title=graph_w_title,
+        graph_w_out=graph_w_out,
         reranker_model=reranker_model,
         reranker_device=reranker_device,
         reranker_batch_size=reranker_batch_size,
