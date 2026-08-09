@@ -868,20 +868,38 @@ class FullWikiRetriever:
         self, query, normalized_query, result, hits, raw_logged_hits, title_match_rank
     ):
         new_archive_titles, reranker_latency = self._score_new_archive_documents(query, hits)
-        current_doc_id = str(self.current_document.get("doc_id", "")) if self.current_document else None
-        is_exact_title_search = title_match_rank is not None
+
+        # Select current_document strictly from the candidates returned by the CURRENT search
+        exact_match_hit = next(
+            (h for h in hits if self._normalize_title(h["title"]) == normalized_query),
+            None,
+        )
+        if exact_match_hit is None and title_match_rank == 1 and hits:
+            exact_match_hit = hits[0]
+
+        is_exact_title_search = exact_match_hit is not None or title_match_rank is not None
+
+        if exact_match_hit and str(exact_match_hit["doc_id"]) in self._evidence_archive:
+            current_doc_id = str(exact_match_hit["doc_id"])
+        else:
+            search_doc_ids = [str(h["doc_id"]) for h in hits if str(h["doc_id"]) in self._evidence_archive]
+            if search_doc_ids:
+                current_doc_id = max(
+                    search_doc_ids,
+                    key=lambda did: self._evidence_archive[did]["reranker_score"],
+                )
+            else:
+                current_doc_id = str(self.current_document.get("doc_id", "")) if self.current_document else None
+
+        if current_doc_id and current_doc_id in self._evidence_archive:
+            self.current_document = self._evidence_archive[current_doc_id]["document"]
+            self.current_title = self._evidence_archive[current_doc_id]["document"]["title"]
+
+        # Independently refresh and render global recurrent evidence memory
         added_ids, evicted_ids, active_hits, observation_omitted = self._refresh_reranked_memory(
             current_doc_id=current_doc_id,
             is_exact_title_search=is_exact_title_search,
         )
-
-        # Update current_document and current_title to Cross-Encoder #1 page when no exact title match
-        if active_hits and not is_exact_title_search:
-            top_doc_id = active_hits[0]["doc_id"]
-            top_doc_entry = self._evidence_archive[top_doc_id]
-            self.current_document = top_doc_entry["document"]
-            self.current_title = top_doc_entry["document"]["title"]
-            current_doc_id = str(self.current_document.get("doc_id", ""))
 
         active_titles = [hit["title"] for hit in active_hits]
         active_id_set = set(self._evidence_doc_ids)
