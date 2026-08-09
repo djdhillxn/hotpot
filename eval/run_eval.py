@@ -69,6 +69,12 @@ def get_llm_model(model_name=LLM_MODEL_NAME, api_base=OPENAI_API_BASE, api_key=O
         "temperature": 0.0,
         "base_url": api_base,
         "api_key": api_key if api_key else "EMPTY",
+        "model_kwargs": {
+            "extra_body": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+            }
+        },
     }
     return ChatOpenAI(**kwargs)
 

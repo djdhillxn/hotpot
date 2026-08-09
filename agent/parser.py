@@ -32,10 +32,14 @@ def _extract_delimited_action(cleaned_output):
 
 
 def _canonical_answer_text(value):
-    """Conservatively strip common answer wrappers without rewriting content."""
+    """Conservatively strip common answer wrappers and trailing period punctuation without rewriting content."""
     answer = str(value or "").strip().strip("'\"")
     answer = _ANSWER_PREFIX_RE.sub("", answer, count=1)
     answer = _THE_ANSWER_IS_RE.sub("", answer, count=1)
+    answer = answer.strip().strip("'\"")
+    if answer.endswith(".") and not answer.endswith("..") and len(answer) > 1:
+        if not (len(answer) >= 4 and answer[-3] == "." and answer[-1] == "."):
+            answer = answer[:-1].strip()
     return answer.strip().strip("'\"")
 
 
