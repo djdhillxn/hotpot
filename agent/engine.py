@@ -139,6 +139,13 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
                                         observed_supporting_facts.append(fact)
                     else:
                         title = retrieval.get("title")
+                        if title and title not in visited_pages:
+                            visited_pages.append(title)
+                            evidence_graph.append({
+                                "source": prev_page if prev_page in visited_pages else "Question",
+                                "target": title,
+                                "label": f"Retrieved for '{action_arg}'",
+                            })
                         for sentence in retrieval.get("sentences", []):
                             if title and isinstance(sentence, dict) and "sent_id" in sentence:
                                 fact = [title, int(sentence["sent_id"])]

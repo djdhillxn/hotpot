@@ -608,7 +608,7 @@ class FullWikiRetriever:
                 text = item.get("text", "")
                 if keyword_clean in str(text).lower():
                     doc_matches.append({"sent_id": item["sent_id"], "text": text})
-                    all_matches.append({"title": hit["title"], "sent_id": item["sent_id"], "text": text})
+                    all_matches.append({"sent_id": item["sent_id"], "text": text})
                     if len(all_matches) >= 5:
                         break
             if doc_matches:
