@@ -556,8 +556,7 @@ class FullWikiRetriever:
                 )
                 break
 
-            per_doc_budget = max(0, remaining // docs_left)
-            sentence_budget = max(0, per_doc_budget - len(header) - 2)
+            sentence_budget = max(0, min(remaining - len(header) - 2, 3000))
             visible = self._visible_sentences(document, sentence_budget)
             if not visible:
                 omitted_due_to_char_cap.append(document["title"])

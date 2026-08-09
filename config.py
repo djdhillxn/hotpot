@@ -40,9 +40,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
 os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY if OPENAI_API_KEY else "EMPTY")
 
 MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
-REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "8"))
+REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "10"))
 REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "15"))
-REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "15000"))
+REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "22000"))
 # ReAct evidence-memory reranker. The default is trained on MS MARCO rather than
 # HotpotQA so the memory policy does not use a reranker trained on this benchmark.
 REACT_MEMORY_RERANKER_MODEL = os.getenv(
@@ -84,5 +84,5 @@ DENSE_QUERY_DEVICE = os.getenv("DENSE_QUERY_DEVICE", "cpu")
 FULLWIKI_FAISS_FACTORY = os.getenv("FULLWIKI_FAISS_FACTORY", "IVF4096,PQ96x8")
 FULLWIKI_DENSE_TRAIN_SIZE = int(os.getenv("FULLWIKI_DENSE_TRAIN_SIZE", "200000"))
 FULLWIKI_DENSE_NPROBE = int(os.getenv("FULLWIKI_DENSE_NPROBE", "32"))
-FULLWIKI_SEARCH_CANDIDATES = int(os.getenv("FULLWIKI_SEARCH_CANDIDATES", "30"))
+FULLWIKI_SEARCH_CANDIDATES = int(os.getenv("FULLWIKI_SEARCH_CANDIDATES", "40"))
 FULLWIKI_RRF_K = int(os.getenv("FULLWIKI_RRF_K", "60"))
