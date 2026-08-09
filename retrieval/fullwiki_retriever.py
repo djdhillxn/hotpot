@@ -135,14 +135,40 @@ class FullWikiSearchBackend:
             )
 
         self.title_graph_path = os.path.join(os.path.dirname(self.manifest_path), "title_graph.json")
+        alt_graph_path = os.path.join("data", "fullwiki", "title_graph.json")
+        if not os.path.isfile(self.title_graph_path) and os.path.isfile(alt_graph_path):
+            self.title_graph_path = alt_graph_path
         self.title_graph = self._load_title_graph()
 
+        self.title_to_doc_id_path = os.path.join(os.path.dirname(self.manifest_path), "title_to_doc_id.json")
+        alt_title_path = os.path.join("data", "fullwiki", "title_to_doc_id.json")
+        if not os.path.isfile(self.title_to_doc_id_path) and os.path.isfile(alt_title_path):
+            self.title_to_doc_id_path = alt_title_path
+        self.title_to_doc_id = self._load_title_to_doc_id()
+
     def _load_title_graph(self):
+        import logging
+        logger = logging.getLogger("fullwiki_retriever")
         if os.path.isfile(self.title_graph_path):
             try:
                 with open(self.title_graph_path, encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"Failed to load title_graph at {self.title_graph_path}: {exc}")
+                return {}
+        else:
+            logger.warning(f"title_graph.json not found at {self.title_graph_path}")
+        return {}
+
+    def _load_title_to_doc_id(self):
+        import logging
+        logger = logging.getLogger("fullwiki_retriever")
+        if os.path.isfile(self.title_to_doc_id_path):
+            try:
+                with open(self.title_to_doc_id_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                logger.warning(f"Failed to load title_to_doc_id at {self.title_to_doc_id_path}: {exc}")
                 return {}
         return {}
 
@@ -222,14 +248,19 @@ class FullWikiSearchBackend:
                 res = self._title_doc_cache[norm_target]
                 return dict(res) if res else None
 
-        escaped_title = title.replace('"', '\\"')
-        hits = self.lucene.search(f'title:"{escaped_title}"', k=5)
         found_doc = None
-        for hit in hits:
-            doc = self._parse_lucene_doc(str(hit.docid))
-            if doc and str(doc.get("title", "")).strip().lower() == norm_target:
-                found_doc = doc
-                break
+        if self.title_to_doc_id and norm_target in self.title_to_doc_id:
+            doc_id = self.title_to_doc_id[norm_target]
+            found_doc = self._parse_lucene_doc(doc_id)
+
+        if not found_doc:
+            escaped_title = title.replace('"', '\\"')
+            hits = self.lucene.search(f'"{escaped_title}"', k=10)
+            for hit in hits:
+                doc = self._parse_lucene_doc(str(hit.docid))
+                if doc and str(doc.get("title", "")).strip().lower() == norm_target:
+                    found_doc = doc
+                    break
 
         with self._title_cache_lock:
             if len(self._title_doc_cache) < 100000:
@@ -400,6 +431,7 @@ class FullWikiSearchBackend:
         max_evidence_documents=None,
         duplicate_search_guard=False,
         question=None,
+        use_graph_expansion=False,
     ):
         return FullWikiRetriever(
             self,
@@ -408,6 +440,7 @@ class FullWikiSearchBackend:
             max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=duplicate_search_guard,
             question=question,
+            use_graph_expansion=use_graph_expansion,
         )
 
     def describe(self):
@@ -429,17 +462,7 @@ class FullWikiSearchBackend:
 
 
 class FullWikiRetriever:
-    """Per-question ReAct-compatible session over a shared FullWiki backend.
-
-    The backend always retrieves ``search_top_k`` results. When a shared evidence
-    reranker is configured, every unique retrieved document is archived and scored
-    against the original question and, when different, the current search sub-query.
-    Rediscovered archive documents may improve their running relevance score under a
-    later sub-query. Only the best ``max_evidence_documents`` remain in the recurrent
-    Active Evidence Memory. Raw top-k results remain in ``last_result['retrieved_hits']``
-    for later analysis. Without a reranker, the legacy first-seen bounded-memory
-    behavior is preserved for compatibility.
-    """
+    """Per-question ReAct-compatible session over a shared FullWiki backend."""
 
     def __init__(
         self,
@@ -449,6 +472,7 @@ class FullWikiRetriever:
         max_evidence_documents=None,
         duplicate_search_guard=False,
         question=None,
+        use_graph_expansion=False,
     ):
         self.backend = backend
         self.search_top_k = int(search_top_k)
@@ -458,6 +482,7 @@ class FullWikiRetriever:
         )
         self.duplicate_search_guard = bool(duplicate_search_guard)
         self.question = str(question).strip() if question is not None else None
+        self.use_graph_expansion = bool(use_graph_expansion)
         self.use_reranked_memory = (
             getattr(self.backend, "evidence_reranker", None) is not None
             and self.max_evidence_documents is not None
@@ -982,7 +1007,7 @@ class FullWikiRetriever:
         # Smart Hyperlink Graph Candidate Expansion:
         # Extract 1-hop outgoing links from all Active Memory documents and visited pages.
         # Filter out generic titles and rank by overlap with question/query before fetching top 20.
-        if self.use_reranked_memory and hasattr(self.backend, "get_outgoing_links"):
+        if self.use_graph_expansion and self.use_reranked_memory and hasattr(self.backend, "get_outgoing_links"):
             GENERIC_TITLES = {
                 "united states", "english language", "actor", "film director", "film",
                 "television series", "california", "new york city", "united kingdom",

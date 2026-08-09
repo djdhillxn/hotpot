@@ -22,6 +22,7 @@ max_tool_steps: 7
 react_top_k: 40
 max_evidence_documents: 20
 max_observation_chars: 22000
+use_graph_expansion: false
 
 # ReAct Cross-Encoder Evidence Memory Reranker (CUDA Execution)
 memory_reranker_model: "BAAI/bge-reranker-base"

@@ -43,6 +43,7 @@ MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
 REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "40"))
 REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "20"))
 REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "22000"))
+USE_GRAPH_EXPANSION = os.getenv("USE_GRAPH_EXPANSION", "false").lower() in {"true", "1", "yes"}
 # ReAct evidence-memory reranker using BAAI/bge-reranker-base.
 REACT_MEMORY_RERANKER_MODEL = os.getenv(
     "REACT_MEMORY_RERANKER_MODEL", "BAAI/bge-reranker-base"

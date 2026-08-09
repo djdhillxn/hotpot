@@ -24,8 +24,19 @@ except Exception:
 
 from retrieval.corpus import iter_hotpot_intro_records
 
-# Matches [[Target Title|Anchor]] or [[Target Title]]
-LINK_REGEX = re.compile(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")
+import urllib.parse
+
+# Matches <a href="TARGET_URL">ANCHOR_TEXT</a> or [[MediaWiki]]
+HTML_LINK_REGEX = re.compile(r'<a\s+href="([^"]+)">([^<]+)</a>', re.IGNORECASE)
+MEDIAWIKI_LINK_REGEX = re.compile(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")
+
+
+def clean_link_href(raw_href):
+    decoded = urllib.parse.unquote(raw_href)
+    if "#" in decoded:
+        decoded = decoded.split("#", 1)[0]
+    clean = " ".join(decoded.replace("_", " ").split()).strip()
+    return clean
 
 
 def extract_hyperlinks(record):
@@ -46,23 +57,34 @@ def extract_hyperlinks(record):
         else:
             sentence_str = str(sentence)
 
-        matches = LINK_REGEX.findall(sentence_str)
-        for target in matches:
-            clean_target = str(target).strip()
+        # Parse HTML links <a href="Target">Anchor</a>
+        html_matches = HTML_LINK_REGEX.findall(sentence_str)
+        for raw_href, anchor in html_matches:
+            clean_target = clean_link_href(raw_href)
             if clean_target and clean_target.lower() != title.lower() and clean_target.lower() not in seen:
                 seen.add(clean_target.lower())
                 linked_titles.append(clean_target)
 
+        # Fallback to MediaWiki [[Target]] links if HTML links not present
+        if not html_matches:
+            mw_matches = MEDIAWIKI_LINK_REGEX.findall(sentence_str)
+            for raw_target in mw_matches:
+                clean_target = clean_link_href(raw_target)
+                if clean_target and clean_target.lower() != title.lower() and clean_target.lower() not in seen:
+                    seen.add(clean_target.lower())
+                    linked_titles.append(clean_target)
+
     return title, linked_titles
 
 
-def build_hyperlink_graph(archive_path=FULLWIKI_ARCHIVE_PATH, output_dir=FULLWIKI_DATA_DIR, force=False):
+def build_hyperlink_graph(archive_path=FULLWIKI_ARCHIVE_PATH, output_dir="indexes/fullwiki", force=False):
     archive_path = Path(archive_path)
     output_dir = Path(output_dir)
     graph_path = output_dir / "title_graph.json"
+    title_to_doc_id_path = output_dir / "title_to_doc_id.json"
 
-    if graph_path.exists() and not force:
-        print(f"Hyperlink graph already exists at {graph_path}; skipping.")
+    if graph_path.exists() and title_to_doc_id_path.exists() and not force:
+        print(f"Hyperlink graph and title index already exist at {graph_path}; skipping.")
         return str(graph_path)
 
     if not archive_path.exists():
@@ -70,19 +92,28 @@ def build_hyperlink_graph(archive_path=FULLWIKI_ARCHIVE_PATH, output_dir=FULLWIK
 
     output_dir.mkdir(parents=True, exist_ok=True)
     graph = {}
+    title_to_doc_id = {}
     total_links = 0
 
-    for record in tqdm(iter_hotpot_intro_records(archive_path), desc="Extracting Wikipedia hyperlink graph", unit="doc"):
+    for record in tqdm(iter_hotpot_intro_records(archive_path), desc="Extracting Wikipedia hyperlink graph & title map", unit="doc"):
+        doc_id = str(record.get("_id", record.get("id", "")))
         title, links = extract_hyperlinks(record)
-        if title and links:
-            graph[title] = links
-            total_links += len(links)
+        if title:
+            if doc_id:
+                title_to_doc_id[title.lower()] = doc_id
+            if links:
+                graph[title] = links
+                total_links += len(links)
 
     print(f"Extracted hyperlinks for {len(graph)} documents ({total_links} total edges). Writing to {graph_path}...")
     with open(graph_path, "w", encoding="utf-8") as f:
         json.dump(graph, f, ensure_ascii=False, indent=None, separators=(",", ":"))
 
-    print(f"Hyperlink graph saved successfully to {graph_path}.")
+    print(f"Writing title to doc_id index ({len(title_to_doc_id)} titles) to {title_to_doc_id_path}...")
+    with open(title_to_doc_id_path, "w", encoding="utf-8") as f:
+        json.dump(title_to_doc_id, f, ensure_ascii=False, indent=None, separators=(",", ":"))
+
+    print(f"Hyperlink graph and title index saved successfully to {output_dir}.")
     return str(graph_path)
 
 

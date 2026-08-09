@@ -25,6 +25,7 @@ from config import (
     REACT_MEMORY_RERANKER_DEVICE,
     REACT_MEMORY_RERANKER_MAX_LENGTH,
     REACT_MEMORY_RERANKER_MODEL,
+    USE_GRAPH_EXPANSION,
 )
 from eval.artifacts import (
     context_diagnostics,
@@ -98,7 +99,7 @@ def _sample_metadata(sample):
 def process_single_question(
     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend=None,
     search_top_k=REACT_SEARCH_TOP_K, max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
-    max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
+    max_observation_chars=REACT_MAX_OBSERVATION_CHARS, use_graph_expansion=USE_GRAPH_EXPANSION,
 ):
     question = sample["question"]
     gold_answer = sample["answer"]
@@ -115,6 +116,7 @@ def process_single_question(
             max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=True,
             question=question,
+            use_graph_expansion=use_graph_expansion,
         )
     else:
         toolset = WikipediaToolSet()

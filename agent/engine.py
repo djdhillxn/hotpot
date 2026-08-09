@@ -121,8 +121,9 @@ def create_react_agent_graph(llm, toolset=None, max_hops=MAX_AGENT_HOPS):
         observation = ""
         evidence_graph = list(state.get("evidence_graph", []))
         visited_pages = list(state.get("visited_pages", []))
+        observed_supporting_facts = list(state.get("observed_supporting_facts", []))
 
-        prev_page = getattr(active_toolset, "current_page_title", None)
+        prev_page = getattr(active_toolset, "current_page_title", None) or "Question"
         tool_started = time.perf_counter()
 
         # Consecutive duplicate searches are useless for deterministic retrieval,
@@ -153,38 +154,67 @@ def create_react_agent_graph(llm, toolset=None, max_hops=MAX_AGENT_HOPS):
 
         tool_latency = time.perf_counter() - tool_started
         updated_steps = list(steps)
-        observed_supporting_facts = list(state.get("observed_supporting_facts", []))
-
-        curr_page = getattr(active_toolset, "current_page_title", None)
-        curr_doc = getattr(active_toolset, "current_document", None)
-
-        if curr_page and curr_page not in visited_pages:
-            visited_pages.append(curr_page)
-
-        if curr_doc and "sentences" in curr_doc:
-            title = curr_doc.get("title", "")
-            for sent_idx, sentence_text in enumerate(curr_doc["sentences"]):
-                fact_pair = [title, sent_idx]
-                if fact_pair not in observed_supporting_facts:
-                    observed_supporting_facts.append(fact_pair)
 
         last_step_updated = dict(updated_steps[-1])
         last_step_updated["observation"] = observation
         last_step_updated["tool_latency_seconds"] = round(tool_latency, 6)
+
+        retrieval = getattr(active_toolset, "last_result", None)
+        if retrieval is not None:
+            last_step_updated["retrieval"] = retrieval
+            if isinstance(retrieval, dict):
+                hits = retrieval.get("hits") or []
+                if hits:
+                    for hit in hits:
+                        title = hit.get("title")
+                        if title and title not in visited_pages:
+                            visited_pages.append(title)
+                            evidence_graph.append({
+                                "source": prev_page if prev_page in visited_pages else "Question",
+                                "target": title,
+                                "label": f"Retrieved for '{action_arg}'",
+                            })
+                        for sentence in hit.get("sentences", []):
+                            if title and isinstance(sentence, dict) and "sent_id" in sentence:
+                                fact = [title, int(sentence["sent_id"])]
+                                if fact not in observed_supporting_facts:
+                                    observed_supporting_facts.append(fact)
+                else:
+                    title = retrieval.get("title")
+                    if title and title not in visited_pages:
+                        visited_pages.append(title)
+                        evidence_graph.append({
+                            "source": prev_page if prev_page in visited_pages else "Question",
+                            "target": title,
+                            "label": f"Retrieved for '{action_arg}'",
+                        })
+                    for sentence in retrieval.get("sentences", []):
+                        if title and isinstance(sentence, dict) and "sent_id" in sentence:
+                            fact = [title, int(sentence["sent_id"])]
+                            if fact not in observed_supporting_facts:
+                                observed_supporting_facts.append(fact)
+
         updated_steps[-1] = last_step_updated
 
         new_scratchpad = state.get("scratchpad", "")
         if action_type in {"search", "lookup", "invalid"}:
-            new_scratchpad += (
-                f"{last_step.get('thought', '')}\n"
-                f"{last_step.get('action', '')}\n"
-                f"{observation}\n"
-            )
+            t_text = str(last_step.get("thought", "")).strip()
+            a_text = str(last_step.get("action", "")).strip()
+            if t_text and not t_text.startswith("Thought:"):
+                t_text = f"Thought: {t_text}"
+            if a_text and not a_text.startswith("Action:"):
+                a_text = f"Action: {a_text}"
+
+            new_scratchpad += f"{t_text}\n{a_text}\n{observation}\n"
 
         active_evidence_context = (
-            active_toolset.active_evidence_context()
-            if hasattr(active_toolset, "active_evidence_context")
-            else ""
+            active_toolset.render_active_evidence()
+            if hasattr(active_toolset, "render_active_evidence")
+            else (
+                active_toolset.active_evidence_context()
+                if hasattr(active_toolset, "active_evidence_context")
+                else ""
+            )
         )
 
         updates = dict(state)
