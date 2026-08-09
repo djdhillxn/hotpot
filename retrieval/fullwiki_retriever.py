@@ -93,6 +93,16 @@ class FullWikiSearchBackend:
         self.manifest = self._load_manifest()
         self._dense_lock = threading.Lock()
 
+        # Thread-safe retrieval caches
+        self._doc_id_cache = {}
+        self._doc_cache_lock = threading.Lock()
+
+        self._title_doc_cache = {}
+        self._title_cache_lock = threading.Lock()
+
+        self._query_embed_cache = {}
+        self._embed_cache_lock = threading.Lock()
+
         try:
             os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
             from pyserini.search.lucene import LuceneSearcher
@@ -181,7 +191,12 @@ class FullWikiSearchBackend:
         self.encoder = SentenceTransformer(self.dense_model_name, device=self.dense_query_device)
 
     def _parse_lucene_doc(self, doc_id):
-        doc = self.lucene.doc(str(doc_id))
+        doc_id_str = str(doc_id)
+        with self._doc_cache_lock:
+            if doc_id_str in self._doc_id_cache:
+                return dict(self._doc_id_cache[doc_id_str])
+
+        doc = self.lucene.doc(doc_id_str)
         if doc is None:
             return None
         raw = doc.raw()
@@ -191,20 +206,36 @@ class FullWikiSearchBackend:
         data["id"] = str(data.get("id", doc_id))
         data["doc_id"] = data["id"]
         data["sentences"] = [str(sentence) for sentence in data.get("sentences", [])]
-        return data
+
+        with self._doc_cache_lock:
+            if len(self._doc_id_cache) < 200000:
+                self._doc_id_cache[doc_id_str] = data
+        return dict(data)
 
     def get_doc_by_title(self, title):
         title = str(title or "").strip().strip("'\"")
         if not title:
             return None
         norm_target = title.lower()
+        with self._title_cache_lock:
+            if norm_target in self._title_doc_cache:
+                res = self._title_doc_cache[norm_target]
+                return dict(res) if res else None
+
         escaped_title = title.replace('"', '\\"')
         hits = self.lucene.search(f'title:"{escaped_title}"', k=5)
+        found_doc = None
         for hit in hits:
             doc = self._parse_lucene_doc(str(hit.docid))
             if doc and str(doc.get("title", "")).strip().lower() == norm_target:
-                return doc
-        return None
+                found_doc = doc
+                break
+
+        with self._title_cache_lock:
+            if len(self._title_doc_cache) < 100000:
+                self._title_doc_cache[norm_target] = found_doc
+
+        return dict(found_doc) if found_doc else None
 
     def _bm25_search(self, query, k):
         started = time.perf_counter()
@@ -214,14 +245,28 @@ class FullWikiSearchBackend:
 
     def _dense_search(self, query, k):
         started = time.perf_counter()
-        with self._dense_lock:
-            encoded = self.encoder.encode(
-                [BGE_QUERY_INSTRUCTION + query],
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            ).astype("float32")
-            scores, ids = self.dense_index.search(encoded, k)
+        query_key = (query, int(k))
+
+        with self._embed_cache_lock:
+            cached_encoded = self._query_embed_cache.get(query_key)
+
+        if cached_encoded is None:
+            with self._dense_lock:
+                encoded = self.encoder.encode(
+                    [BGE_QUERY_INSTRUCTION + query],
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                ).astype("float32")
+            with self._embed_cache_lock:
+                if len(self._query_embed_cache) < 50000:
+                    self._query_embed_cache[query_key] = encoded
+        else:
+            encoded = cached_encoded
+
+        # FAISS C++ search is 100% thread-safe for read-only index: run OUTSIDE self._dense_lock!
+        scores, ids = self.dense_index.search(encoded, k)
+
         rows = []
         for doc_id, score in zip(ids[0], scores[0]):
             if int(doc_id) < 0:
