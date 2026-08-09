@@ -1,7 +1,8 @@
 import time
-
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-from agent.prompt import REACT_PROMPT_SYSTEM, FORCED_SYNTHESIS_PROMPT_SYSTEM
+
+from agent.prompt import REACT_SYSTEM_PROMPT, FORCED_SYNTHESIS_PROMPT_SYSTEM
 from agent.parser import parse_react_output, parse_supporting_facts
 from agent.state import create_initial_state
 from tools.wikipedia import WikipediaToolSet
@@ -20,15 +21,27 @@ def _validate_supporting_facts(facts, observed_facts):
 
 
 def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
+    # Bind stop sequence and max token generation constraints for Qwen / LLM inference
+    bound_llm = llm.bind(stop=["\nObservation:", "Observation:"], max_tokens=150)
+
     def agent_node(state):
-        prompt = REACT_PROMPT_SYSTEM.format(
-            question=state["question"], scratchpad=state.get("scratchpad", "")
-        )
+        messages = [
+            SystemMessage(content=REACT_SYSTEM_PROMPT),
+            HumanMessage(
+                content=f"Question: {state['question']}\n{state.get('scratchpad', '')}Thought: "
+            ),
+        ]
 
         llm_started = time.perf_counter()
-        response = llm.invoke(prompt)
+        response = bound_llm.invoke(messages)
         llm_latency = time.perf_counter() - llm_started
-        response_text = _get_response_text(response)
+        raw_text = _get_response_text(response)
+
+        # Prepend 'Thought: ' if LLM continued straight from the prompt prefix
+        if not raw_text.startswith("Thought:") and not raw_text.startswith("Action:"):
+            response_text = f"Thought: {raw_text}"
+        else:
+            response_text = raw_text
 
         thought, raw_action, action_type, action_arg = parse_react_output(response_text)
         parsed_supporting_facts = parse_supporting_facts(response_text) if action_type == "finish" else []
@@ -76,21 +89,13 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
 
         if action_type == "search":
             observation = toolset.search(action_arg)
-            new_page = getattr(toolset, "current_page_title", None)
-            if new_page and new_page not in visited_pages:
-                visited_pages.append(new_page)
-                if prev_page and prev_page != new_page:
-                    evidence_graph.append(
-                        {"source": prev_page, "target": new_page, "label": f"Searched '{action_arg}'"}
-                    )
-                elif not prev_page and new_page:
-                    evidence_graph.append(
-                        {"source": "Question", "target": new_page, "label": f"Initial search '{action_arg}'"}
-                    )
         elif action_type == "lookup":
             observation = toolset.lookup(action_arg)
         elif action_type == "invalid":
-            observation = f"Observation: {action_arg}"
+            observation = (
+                "Observation: Invalid action format. Use Action: search[query], "
+                "Action: lookup[keyword], or Action: finish[answer]."
+            )
         else:
             observation = "Observation: Unknown action type."
 
@@ -108,6 +113,13 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
                     if retrieval_hits:
                         for hit in retrieval_hits:
                             title = hit.get("title")
+                            if title and title not in visited_pages:
+                                visited_pages.append(title)
+                                evidence_graph.append({
+                                    "source": prev_page if prev_page in visited_pages else "Question",
+                                    "target": title,
+                                    "label": f"Retrieved for '{action_arg}'",
+                                })
                             for sentence in hit.get("sentences", []):
                                 if title and isinstance(sentence, dict) and "sent_id" in sentence:
                                     fact = [title, int(sentence["sent_id"])]
@@ -137,14 +149,19 @@ def create_react_agent_graph(llm, toolset, max_hops=MAX_AGENT_HOPS):
         return updates
 
     def synthesis_node(state):
-        prompt = FORCED_SYNTHESIS_PROMPT_SYSTEM.format(
-            question=state["question"], scratchpad=state.get("scratchpad", "")
-        )
+        synthesis_llm = llm.bind(max_tokens=150)
+        messages = [
+            SystemMessage(content=FORCED_SYNTHESIS_PROMPT_SYSTEM),
+            HumanMessage(
+                content=f"Question: {state['question']}\n{state.get('scratchpad', '')}"
+            ),
+        ]
 
         llm_started = time.perf_counter()
-        response = llm.invoke(prompt)
+        response = synthesis_llm.invoke(messages)
         llm_latency = time.perf_counter() - llm_started
         response_text = _get_response_text(response)
+
         thought, raw_action, action_type, action_arg = parse_react_output(response_text)
         parsed_supporting_facts = parse_supporting_facts(response_text)
         supporting_facts, invalid_supporting_facts = _validate_supporting_facts(

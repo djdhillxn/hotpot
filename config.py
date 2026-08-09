@@ -12,6 +12,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
 os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY if OPENAI_API_KEY else "EMPTY")
 
 MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
+REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "6"))
+REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "15"))
+REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "7200"))
 WIKIPEDIA_USER_AGENT = os.getenv(
     "USER_AGENT", "HotpotQAReActAgent/1.0 (https://github.com/example/hotpot)"
 )

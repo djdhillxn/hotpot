@@ -13,7 +13,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from agent.baseline_rag import run_single_pass_rag
 from config import FULLWIKI_INDEX_DIR, LLM_MODEL_NAME, OPENAI_API_BASE, OPENAI_API_KEY
-from eval.artifacts import context_diagnostics, write_official_files, write_run_manifest
+from eval.artifacts import (
+    context_diagnostics,
+    observed_evidence_diagnostics,
+    write_official_files,
+    write_run_manifest,
+)
 from eval.dataset import load_hotpot_dataset
 from eval.metrics import evaluate_prediction
 from eval.plot_results import generate_eval_plots_and_report
@@ -59,7 +64,8 @@ def _sample_metadata(sample):
     return gold_supporting_facts, gold_titles, context_diagnostics(sample)
 
 
-def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_backend=None, top_k=7):
+
+def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_backend=None, top_k=6):
     question = sample["question"]
     gold_answer = sample["answer"]
     gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
@@ -93,6 +99,9 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
     observed_supporting_facts = agent_state.get("observed_supporting_facts", []) or []
     invalid_supporting_facts = agent_state.get("invalid_supporting_facts", []) or []
     visited_pages = agent_state.get("visited_pages", [])
+    observed_info = observed_evidence_diagnostics(
+        gold_supporting_facts, gold_titles, observed_supporting_facts, visited_pages
+    )
 
     eval_metrics = evaluate_prediction(
         prediction=pred_answer,
@@ -120,6 +129,7 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
         "latency": round(latency, 3),
         "timestamp": datetime.now().isoformat(),
         "failed": False,
+        **observed_info,
         "error": None,
         **context_info,
     })
@@ -153,11 +163,14 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
         "step_count": 1,
         "latency_seconds": round(latency, 3),
         "visited_pages": visited_pages,
-        "context_titles": context_info["context_titles"],
-        "gold_titles_in_context": context_info["gold_titles_in_context"],
-        "gold_document_recall_in_context": context_info["gold_document_recall_in_context"],
-        "gold_supporting_fact_recall_in_context": context_info["gold_supporting_fact_recall_in_context"],
-        "all_gold_supporting_facts_available": context_info["all_gold_supporting_facts_available"],
+        "observed_gold_document_recall": observed_info["observed_gold_document_recall"],
+        "observed_gold_supporting_fact_recall": observed_info["observed_gold_supporting_fact_recall"],
+        "all_gold_supporting_facts_observed": observed_info["all_gold_supporting_facts_observed"],
+        "hotpot_supplied_context_titles": context_info["hotpot_supplied_context_titles"],
+        "gold_titles_in_hotpot_supplied_context": context_info["gold_titles_in_hotpot_supplied_context"],
+        "hotpot_supplied_context_gold_document_recall": context_info["hotpot_supplied_context_gold_document_recall"],
+        "hotpot_supplied_context_gold_supporting_fact_recall": context_info["hotpot_supplied_context_gold_supporting_fact_recall"],
+        "hotpot_supplied_context_has_all_gold_supporting_facts": context_info["hotpot_supplied_context_has_all_gold_supporting_facts"],
         "evidence_graph": agent_state.get("evidence_graph", []),
         "steps": agent_state.get("steps", []),
         "error": None,
@@ -198,6 +211,9 @@ def build_failure_record(sample, idx, error, latency=0.0):
         "timestamp": timestamp,
         "failed": True,
         "error": str(error),
+        "observed_gold_document_recall": 0.0 if gold_titles else 1.0,
+        "observed_gold_supporting_fact_recall": 0.0 if gold_supporting_facts else 1.0,
+        "all_gold_supporting_facts_observed": not bool(gold_supporting_facts),
         **context_info,
     })
     trajectory = {
@@ -223,11 +239,14 @@ def build_failure_record(sample, idx, error, latency=0.0):
         "step_count": 1,
         "latency_seconds": round(latency, 3),
         "visited_pages": [],
-        "context_titles": context_info["context_titles"],
-        "gold_titles_in_context": context_info["gold_titles_in_context"],
-        "gold_document_recall_in_context": context_info["gold_document_recall_in_context"],
-        "gold_supporting_fact_recall_in_context": context_info["gold_supporting_fact_recall_in_context"],
-        "all_gold_supporting_facts_available": context_info["all_gold_supporting_facts_available"],
+        "observed_gold_document_recall": 0.0 if gold_titles else 1.0,
+        "observed_gold_supporting_fact_recall": 0.0 if gold_supporting_facts else 1.0,
+        "all_gold_supporting_facts_observed": not bool(gold_supporting_facts),
+        "hotpot_supplied_context_titles": context_info["hotpot_supplied_context_titles"],
+        "gold_titles_in_hotpot_supplied_context": context_info["gold_titles_in_hotpot_supplied_context"],
+        "hotpot_supplied_context_gold_document_recall": context_info["hotpot_supplied_context_gold_document_recall"],
+        "hotpot_supplied_context_gold_supporting_fact_recall": context_info["hotpot_supplied_context_gold_supporting_fact_recall"],
+        "hotpot_supplied_context_has_all_gold_supporting_facts": context_info["hotpot_supplied_context_has_all_gold_supporting_facts"],
         "evidence_graph": [],
         "steps": [],
         "error": str(error),
@@ -244,7 +263,7 @@ def run_baseline_benchmark(
     output_dir="eval_results/baseline",
     retriever="hybrid",
     index_dir=FULLWIKI_INDEX_DIR,
-    top_k=7,
+    top_k=6,
     concurrency=16,
 ):
     if concurrency < 1:
@@ -265,7 +284,7 @@ def run_baseline_benchmark(
         f"Samples Limit: {num_samples if num_samples else 'Full Set'}\n"
         f"Concurrency Workers: {concurrency}\n"
         f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
-        f"Retrieved document budget: {top_k if mode == 'fullwiki' else 1}\n"
+        f"Documents returned by the single retrieval: {top_k if mode == 'fullwiki' else 1}\n"
     )
     if mode == "live":
         info_msg += (
@@ -351,8 +370,11 @@ def run_baseline_benchmark(
     avg_joint_f1 = sum(r["joint_f1"] for r in results) / total_count if total_count else 0
     avg_doc_f1 = sum(r["doc_f1"] for r in results) / total_count if total_count else 0
     avg_lat = sum(r["latency"] for r in results) / total_count if total_count else 0
-    avg_context_sp_recall = sum(r["gold_supporting_fact_recall_in_context"] for r in results) / total_count if total_count else 0
-    full_context_count = sum(r["all_gold_supporting_facts_available"] for r in results)
+    avg_observed_doc_recall = sum(r["observed_gold_document_recall"] for r in results) / total_count if total_count else 0
+    avg_observed_sp_recall = sum(r["observed_gold_supporting_fact_recall"] for r in results) / total_count if total_count else 0
+    full_observed_count = sum(r["all_gold_supporting_facts_observed"] for r in results)
+    avg_supplied_context_sp_recall = sum(r["hotpot_supplied_context_gold_supporting_fact_recall"] for r in results) / total_count if total_count else 0
+    full_supplied_context_count = sum(r["hotpot_supplied_context_has_all_gold_supporting_facts"] for r in results)
     failed_count = sum(bool(r.get("failed")) for r in results)
 
     summary_text = (
@@ -364,8 +386,11 @@ def run_baseline_benchmark(
         f"Joint Exact Match (Joint EM): {avg_joint_em * 100:.1f}%\n"
         f"Joint F1 Score (Joint F1):    {avg_joint_f1 * 100:.1f}%\n"
         f"Supporting Document F1*:      {avg_doc_f1 * 100:.1f}%\n"
-        f"Gold SP Recall in Context*:    {avg_context_sp_recall * 100:.1f}%\n"
-        f"All Gold SP Available*:        {full_context_count}/{total_count} ({(full_context_count / total_count * 100) if total_count else 0:.1f}%)\n"
+        f"Observed Gold Document Recall*: {avg_observed_doc_recall * 100:.1f}%\n"
+        f"Observed Gold SP Recall*:       {avg_observed_sp_recall * 100:.1f}%\n"
+        f"All Gold SP Observed*:          {full_observed_count}/{total_count} ({(full_observed_count / total_count * 100) if total_count else 0:.1f}%)\n"
+        f"Hotpot Supplied-Context Gold SP Recall*: {avg_supplied_context_sp_recall * 100:.1f}%\n"
+        f"Hotpot Supplied Context Has All Gold SP*: {full_supplied_context_count}/{total_count} ({(full_supplied_context_count / total_count * 100) if total_count else 0:.1f}%)\n"
         f"Avg Latency / Question:        {avg_lat:.2f}s\n"
         f"Failed Questions:              {failed_count}\n"
         f"Total Evaluation Time:         {total_time:.2f}s\n"
@@ -401,8 +426,8 @@ def run_baseline_benchmark(
             "retrieval_calls_per_question": 1,
             "generation_calls_per_question": 1,
             "documents_per_search": top_k if mode == "fullwiki" else 1,
-            "retrieval_document_budget": top_k if mode == "fullwiki" else 1,
-            "max_retrieval_document_budget": top_k if mode == "fullwiki" else 1,
+            "retrieval_top_k": top_k if mode == "fullwiki" else 1,
+            "exact_title_promotion": False,
             "retriever": retriever if mode == "fullwiki" else mode,
             "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
             "total_evaluation_seconds": round(total_time, 3),
@@ -427,7 +452,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default="offline", help="Retrieval mode")
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default="hybrid", help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
-    parser.add_argument("--top-k", type=int, default=7, help="Documents retrieved in single-pass FullWiki search")
+    parser.add_argument("--top-k", type=int, default=6, help="Documents retrieved in the single-pass FullWiki search")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default="sample", help="Dataset source")
     parser.add_argument("--model", type=str, default=LLM_MODEL_NAME, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=OPENAI_API_BASE, help="Local vLLM / OpenAI server URL")

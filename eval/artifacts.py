@@ -41,11 +41,29 @@ def context_diagnostics(sample):
     fact_recall = len(available_facts) / len(set(gold_facts)) if gold_facts else 1.0
 
     return {
-        "context_titles": context_titles,
-        "gold_titles_in_context": sorted(available_titles),
-        "gold_document_recall_in_context": doc_recall,
-        "gold_supporting_fact_recall_in_context": fact_recall,
-        "all_gold_supporting_facts_available": fact_recall == 1.0,
+        "hotpot_supplied_context_titles": context_titles,
+        "gold_titles_in_hotpot_supplied_context": sorted(available_titles),
+        "hotpot_supplied_context_gold_document_recall": doc_recall,
+        "hotpot_supplied_context_gold_supporting_fact_recall": fact_recall,
+        "hotpot_supplied_context_has_all_gold_supporting_facts": fact_recall == 1.0,
+    }
+
+
+def observed_evidence_diagnostics(gold_supporting_facts, gold_titles, observed_supporting_facts, visited_pages):
+    """Measure gold evidence actually exposed to the model by the retrieval/tool path."""
+    gold_fact_set = {tuple(fact) for fact in gold_supporting_facts or []}
+    observed_fact_set = {tuple(fact) for fact in observed_supporting_facts or []}
+    gold_title_set = set(gold_titles or [])
+    visited_title_set = set(visited_pages or [])
+
+    return {
+        "observed_gold_document_recall": (
+            len(gold_title_set & visited_title_set) / len(gold_title_set) if gold_title_set else 1.0
+        ),
+        "observed_gold_supporting_fact_recall": (
+            len(gold_fact_set & observed_fact_set) / len(gold_fact_set) if gold_fact_set else 1.0
+        ),
+        "all_gold_supporting_facts_observed": gold_fact_set.issubset(observed_fact_set),
     }
 
 

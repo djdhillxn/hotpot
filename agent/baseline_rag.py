@@ -4,13 +4,26 @@ from agent.parser import parse_baseline_output
 from agent.state import create_initial_state
 from tools.wikipedia import WikipediaToolSet
 
-SINGLE_PASS_RAG_PROMPT = """Answer the following question directly and concisely using ONLY the provided context text.
-The context may contain sentence labels such as [Wikipedia Title | sent 2]. Those labels identify exact HotpotQA sentence IDs.
+SINGLE_PASS_RAG_PROMPT = """Answer the following HotpotQA question using ONLY the provided retrieved context.
+The context contains sentence labels such as [Wikipedia Title | sent 2]; these labels identify exact HotpotQA sentence IDs.
 
 Return EXACTLY one JSON object and no other text:
-{{"answer": "<concise answer>", "supporting_facts": [["Exact Wikipedia title", <sentence_id>], ...]}}
+{{"answer": "<short canonical answer only>", "supporting_facts": [["Exact Wikipedia title", <sentence_id>], ...]}}
 
-For supporting_facts, cite ONLY sentence labels that appear in the provided context and are needed to justify the answer. Copy titles and sentence IDs exactly. If the context provides no supporting evidence, return an empty list rather than inventing evidence.
+ANSWER RULES:
+- Return only the shortest canonical HotpotQA answer: exactly "yes"/"no", an entity name, date, number, or short noun phrase.
+- Do NOT write "The answer is ...", "Answer: ...", explanations, evidence, or full sentences in the answer field.
+
+SUPPORT RULES:
+- Cite ONLY sentence labels that appear in the provided context and are needed to justify the answer.
+- Convert a rendered label like [Radiohead | sent 1] to the JSON pair ["Radiohead", 1].
+- The title field must contain only the Wikipedia title; NEVER include "| sent N" in the title string.
+- If the context provides no supporting evidence, return an empty list rather than inventing evidence.
+
+Example:
+Context label: [Radiohead | sent 1]
+Correct citation: ["Radiohead", 1]
+Incorrect citation: ["Radiohead | sent 1", 1]
 
 Context:
 {context}

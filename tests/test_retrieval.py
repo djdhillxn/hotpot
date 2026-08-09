@@ -3,7 +3,14 @@ import io
 import json
 import tarfile
 
-import pytest
+try:
+    import pytest
+except ImportError:
+    class FakePytest:
+        @staticmethod
+        def approx(val, abs=1e-6):
+            return val
+    pytest = FakePytest()
 
 from retrieval.corpus import iter_hotpot_intro_records, normalize_intro_record
 from retrieval.fullwiki_retriever import FullWikiRetriever, reciprocal_rank_fusion
@@ -153,3 +160,89 @@ def test_shared_backend_hybrid_search_hydrates_only_final_top_k():
     assert result["hits"][0]["dense_rank"] == 1
     assert result["candidate_k"] == 3
     assert result["top_k"] == 2
+
+
+class RollingFakeBackend:
+    def __init__(self):
+        self.calls = []
+
+    def search(self, query, top_k=1):
+        self.calls.append(query)
+        base = len(self.calls) * 100
+        hits = []
+        for rank in range(1, top_k + 1):
+            doc_id = str(base + rank)
+            hits.append({
+                "doc_id": doc_id,
+                "title": f"Doc {doc_id}",
+                "rank": rank,
+                "bm25_rank": rank,
+                "bm25_score": float(20 - rank),
+                "dense_rank": rank,
+                "dense_score": 1.0 / rank,
+                "fused_score": 1.0 / (60 + rank),
+                "sentences": [f"Sentence for {doc_id}."],
+            })
+        return {
+            "query": query,
+            "mode": "hybrid",
+            "candidate_k": 20,
+            "top_k": top_k,
+            "hits": hits,
+            "latency_ms": {"bm25": 1.0, "dense": 2.0, "fusion": 0.1, "total": 3.1},
+        }
+
+
+def test_react_session_caps_unique_working_evidence_but_logs_full_top_k():
+    backend = RollingFakeBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=6,
+        max_observation_chars=7200,
+        max_evidence_documents=15,
+        duplicate_search_guard=True,
+    )
+
+    retriever.search("first")
+    retriever.search("second")
+    third_observation = retriever.search("third")
+
+    assert retriever.evidence_document_count == 15
+    assert len(retriever.visited_pages) == 15
+    assert len(retriever.last_result["retrieved_hits"]) == 6
+    assert len(retriever.last_result["hits"]) == 3
+    assert len(retriever.last_result["omitted_due_to_evidence_cap"]) == 3
+    assert "found no new evidence" in third_observation
+
+
+def test_react_session_duplicate_search_is_guarded_without_second_backend_call():
+    backend = RollingFakeBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=6,
+        max_observation_chars=7200,
+        max_evidence_documents=15,
+        duplicate_search_guard=True,
+    )
+
+    retriever.search("Radiohead lead singer")
+    duplicate_observation = retriever.search("  radiohead   lead singer  ")
+
+    assert len(backend.calls) == 1
+    assert retriever.last_result["duplicate_query"] is True
+    assert retriever.last_result["status"] == "duplicate_query"
+    assert "already performed earlier" in duplicate_observation
+
+
+def test_fullwiki_observation_respects_global_character_cap():
+    backend = RollingFakeBackend()
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=6,
+        max_observation_chars=500,
+        max_evidence_documents=15,
+    )
+
+    observation = retriever.search("query")
+    assert len(observation) <= 500
+    assert len(retriever.last_result["retrieved_hits"]) == 6

@@ -1,6 +1,13 @@
 import json
 
-import pytest
+try:
+    import pytest
+except ImportError:
+    class FakePytest:
+        @staticmethod
+        def approx(val, abs=1e-6):
+            return val
+    pytest = FakePytest()
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
 from agent.baseline_rag import run_single_pass_rag
@@ -62,6 +69,24 @@ def test_parse_baseline_json_output():
     )
     assert answer == "no"
     assert supporting_facts == [["Scott Derrickson", 1], ["Ed Wood", 1]]
+
+
+def test_parse_baseline_repairs_rendered_sentence_labels():
+    answer, supporting_facts = parse_baseline_output(
+        '{"answer": "The answer is Thom Yorke", "supporting_facts": '
+        '[["Radiohead | sent 1", 999], ["Thom Yorke | sent 0", "wrong"]]}'
+    )
+    assert answer == "Thom Yorke"
+    assert supporting_facts == [["Radiohead", 1], ["Thom Yorke", 0]]
+
+
+def test_parse_react_finish_strips_only_common_answer_wrapper():
+    _, raw_action, action_type, action_arg = parse_react_output(
+        "Thought: Done.\nAction: finish[The answer is Thom Yorke]"
+    )
+    assert action_type == "finish"
+    assert action_arg == "Thom Yorke"
+    assert raw_action == "finish[Thom Yorke]"
 
 
 def test_local_retriever_preserves_hotpot_sentence_ids():
@@ -142,9 +167,9 @@ def test_context_diagnostics_records_candidate_pool_oracle_coverage():
         ],
     }
     diagnostics = context_diagnostics(sample)
-    assert diagnostics["gold_document_recall_in_context"] == pytest.approx(0.5)
-    assert diagnostics["gold_supporting_fact_recall_in_context"] == pytest.approx(0.5)
-    assert diagnostics["all_gold_supporting_facts_available"] is False
+    assert diagnostics["hotpot_supplied_context_gold_document_recall"] == pytest.approx(0.5)
+    assert diagnostics["hotpot_supplied_context_gold_supporting_fact_recall"] == pytest.approx(0.5)
+    assert diagnostics["hotpot_supplied_context_has_all_gold_supporting_facts"] is False
 
 
 def test_single_pass_rag_baseline_returns_answer_and_support():

@@ -247,11 +247,19 @@ class FullWikiSearchBackend:
             },
         }
 
-    def create_session(self, search_top_k=1, max_observation_chars=2200):
+    def create_session(
+        self,
+        search_top_k=1,
+        max_observation_chars=2200,
+        max_evidence_documents=None,
+        duplicate_search_guard=False,
+    ):
         return FullWikiRetriever(
             self,
             search_top_k=search_top_k,
             max_observation_chars=max_observation_chars,
+            max_evidence_documents=max_evidence_documents,
+            duplicate_search_guard=duplicate_search_guard,
         )
 
     def describe(self):
@@ -270,26 +278,53 @@ class FullWikiSearchBackend:
 
 
 class FullWikiRetriever:
-    """Per-question ReAct-compatible session over a shared FullWiki backend."""
+    """Per-question ReAct-compatible session over a shared FullWiki backend.
 
-    def __init__(self, backend, search_top_k=1, max_observation_chars=2200):
+    The backend always retrieves ``search_top_k`` results. For iterative ReAct
+    runs, ``max_evidence_documents`` bounds how many unique Wikipedia documents
+    are ever exposed in the recurrent working context. Raw top-k results remain
+    in ``last_result['retrieved_hits']`` for later analysis.
+    """
+
+    def __init__(
+        self,
+        backend,
+        search_top_k=1,
+        max_observation_chars=2200,
+        max_evidence_documents=None,
+        duplicate_search_guard=False,
+    ):
         self.backend = backend
         self.search_top_k = int(search_top_k)
         self.max_observation_chars = int(max_observation_chars)
+        self.max_evidence_documents = (
+            int(max_evidence_documents) if max_evidence_documents is not None else None
+        )
+        self.duplicate_search_guard = bool(duplicate_search_guard)
         self.current_title = None
         self.current_document = None
         self.last_result = None
         self.visited_pages = []
+        self._evidence_doc_ids = []
+        self._evidence_doc_id_set = set()
+        self._seen_search_queries = {}
 
     @property
     def current_page_title(self):
         return self.current_title
+
+    @property
+    def evidence_document_count(self):
+        return len(self._evidence_doc_ids)
 
     def reset(self):
         self.current_title = None
         self.current_document = None
         self.last_result = None
         self.visited_pages = []
+        self._evidence_doc_ids = []
+        self._evidence_doc_id_set = set()
+        self._seen_search_queries = {}
 
     @staticmethod
     def _render_sentences(title, sentences):
@@ -297,40 +332,77 @@ class FullWikiRetriever:
             f"[{title} | sent {item['sent_id']}] {item['text']}" for item in sentences
         )
 
+    @staticmethod
+    def _normalize_query(query):
+        return " ".join(str(query).strip().strip("'\"").lower().split())
+
+    @staticmethod
+    def _normalize_title(title):
+        return " ".join(str(title).strip().lower().split())
+
+    @staticmethod
+    def _raw_logged_hit(hit):
+        return {
+            "doc_id": str(hit["doc_id"]),
+            "title": hit["title"],
+            "rank": hit["rank"],
+            "bm25_rank": hit.get("bm25_rank"),
+            "bm25_score": hit.get("bm25_score"),
+            "dense_rank": hit.get("dense_rank"),
+            "dense_score": hit.get("dense_score"),
+            "fused_score": hit.get("fused_score"),
+            "sentences": [
+                {"sent_id": sent_id, "text": text}
+                for sent_id, text in enumerate(hit.get("sentences", []))
+            ],
+        }
+
     def _visible_sentences(self, document, char_budget):
         visible = []
         used = 0
         for sent_id, text in enumerate(document.get("sentences", [])):
-            rendered = f"[{document['title']} | sent {sent_id}] {text}"
-            if visible and used + len(rendered) > char_budget:
+            label = f"[{document['title']} | sent {sent_id}] "
+            available = char_budget - used - len(label)
+            if available <= 0:
                 break
-            visible.append({"sent_id": sent_id, "text": text})
-            used += len(rendered)
+            clean_text = str(text)
+            if len(clean_text) > available:
+                if not visible:
+                    clean_text = clean_text[: max(0, available - 1)].rstrip() + "…"
+                else:
+                    break
+            visible.append({"sent_id": sent_id, "text": clean_text})
+            used += len(label) + len(clean_text) + 1
+            if used >= char_budget:
+                break
         return visible
 
-    def search(self, query):
-        result = self.backend.search(query, top_k=self.search_top_k)
-        hits = result.get("hits", [])
+    def _render_new_hits(self, hits, prefix):
         if not hits:
-            self.last_result = {
-                "action": "search",
-                "query": query,
-                "status": "not_found",
-                "retriever": result.get("mode"),
-                "hits": [],
-                "latency_ms": result.get("latency_ms", {}),
-                "title": None,
-                "sentences": [],
-            }
-            return f"Observation: FullWiki retrieval found no document for '{query}'."
+            return "", [], max(0, self.max_observation_chars - len(prefix))
 
-        per_hit_budget = max(600, self.max_observation_chars // len(hits))
+        remaining = max(0, self.max_observation_chars - len(prefix))
         rendered_blocks = []
         logged_hits = []
-        for hit in hits:
-            visible = self._visible_sentences(hit, per_hit_budget)
-            logged_hit = {
-                "doc_id": hit["doc_id"],
+
+        for index, hit in enumerate(hits):
+            docs_left = len(hits) - index
+            block_header = f"Loaded [{hit['title']}] (rank {hit['rank']}).\n"
+            if len(block_header) >= remaining:
+                break
+            per_doc_budget = max(0, remaining // docs_left)
+            sentence_budget = max(0, per_doc_budget - len(block_header) - 2)
+            visible = self._visible_sentences(hit, sentence_budget)
+            if not visible:
+                continue
+            block = block_header + self._render_sentences(hit["title"], visible)
+            if len(block) > remaining:
+                break
+            rendered_blocks.append(block)
+            remaining = max(0, remaining - len(block) - 2)
+
+            logged_hits.append({
+                "doc_id": str(hit["doc_id"]),
                 "title": hit["title"],
                 "rank": hit["rank"],
                 "bm25_rank": hit.get("bm25_rank"),
@@ -339,35 +411,161 @@ class FullWikiRetriever:
                 "dense_score": hit.get("dense_score"),
                 "fused_score": hit.get("fused_score"),
                 "sentences": visible,
-            }
-            logged_hits.append(logged_hit)
-            if hit["title"] not in self.visited_pages:
-                self.visited_pages.append(hit["title"])
-            rendered_blocks.append(
-                f"Loaded [{hit['title']}] (rank {hit['rank']}).\n"
-                + self._render_sentences(hit["title"], visible)
-            )
+            })
 
+        return "\n\n".join(rendered_blocks), logged_hits, remaining
+
+    def search(self, query):
+        query = str(query).strip().strip("'\"")
+        normalized_query = self._normalize_query(query)
+
+        if self.duplicate_search_guard and normalized_query in self._seen_search_queries:
+            previous = self._seen_search_queries[normalized_query]
+            self.last_result = {
+                "action": "search",
+                "query": query,
+                "status": "duplicate_query",
+                "retriever": previous.get("retriever"),
+                "duplicate_query": True,
+                "query_matches_retrieved_title": previous.get("query_matches_retrieved_title", False),
+                "query_title_match_rank": previous.get("query_title_match_rank"),
+                "candidate_k": previous.get("candidate_k"),
+                "top_k": self.search_top_k,
+                "hits": [],
+                "retrieved_hits": previous.get("retrieved_hits", []),
+                "new_evidence_documents": [],
+                "already_retained_documents": previous.get("retained_titles", []),
+                "omitted_due_to_evidence_cap": [],
+                "omitted_due_to_observation_cap": [],
+                "evidence_document_count": self.evidence_document_count,
+                "max_evidence_documents": self.max_evidence_documents,
+                "latency_ms": {"total": 0.0},
+                "title": self.current_title,
+                "sentences": [],
+            }
+            return f"Observation: The search query '{query}' was already performed earlier in this session."
+
+        result = self.backend.search(query, top_k=self.search_top_k)
+        hits = result.get("hits", [])
+        raw_logged_hits = [self._raw_logged_hit(hit) for hit in hits]
+        retrieved_titles = [hit["title"] for hit in hits]
+        title_match_rank = next(
+            (hit["rank"] for hit in hits if self._normalize_title(hit["title"]) == normalized_query),
+            None,
+        )
+
+        if not hits:
+            self.last_result = {
+                "action": "search",
+                "query": query,
+                "status": "not_found",
+                "retriever": result.get("mode"),
+                "duplicate_query": False,
+                "query_matches_retrieved_title": False,
+                "query_title_match_rank": None,
+                "candidate_k": result.get("candidate_k"),
+                "top_k": result.get("top_k"),
+                "hits": [],
+                "retrieved_hits": [],
+                "new_evidence_documents": [],
+                "already_retained_documents": [],
+                "omitted_due_to_evidence_cap": [],
+                "omitted_due_to_observation_cap": [],
+                "evidence_document_count": self.evidence_document_count,
+                "max_evidence_documents": self.max_evidence_documents,
+                "latency_ms": result.get("latency_ms", {}),
+                "title": None,
+                "sentences": [],
+            }
+            self._seen_search_queries[normalized_query] = dict(self.last_result, retrieved_titles=[])
+            return f"Observation: FullWiki retrieval found no document for '{query}'."
+
+        # Rank 1 remains the classic ReAct "current page" used by lookup.
         self.current_document = hits[0]
         self.current_title = hits[0]["title"]
+
+        candidate_new_hits = []
+        already_retained = []
+        omitted = []
+        remaining_slots = (
+            None
+            if self.max_evidence_documents is None
+            else max(0, self.max_evidence_documents - self.evidence_document_count)
+        )
+        for hit in hits:
+            doc_id = str(hit["doc_id"])
+            if doc_id in self._evidence_doc_id_set:
+                already_retained.append(hit["title"])
+                continue
+            if remaining_slots is not None and len(candidate_new_hits) >= remaining_slots:
+                omitted.append(hit["title"])
+                continue
+            candidate_new_hits.append(hit)
+
+        prefix = (
+            "Observation: FullWiki retrieval returned ranked HotpotQA-aligned Wikipedia "
+            "introductory paragraphs. Sentence IDs are exact 0-based HotpotQA sentence IDs.\n"
+        )
+        rendered, logged_hits, remaining_chars = self._render_new_hits(candidate_new_hits, prefix)
+        exposed_ids = {str(hit["doc_id"]) for hit in logged_hits}
+        exposed_titles = []
+        for hit in candidate_new_hits:
+            doc_id = str(hit["doc_id"])
+            if doc_id not in exposed_ids:
+                continue
+            self._evidence_doc_ids.append(doc_id)
+            self._evidence_doc_id_set.add(doc_id)
+            exposed_titles.append(hit["title"])
+            if hit["title"] not in self.visited_pages:
+                self.visited_pages.append(hit["title"])
+
+        observation_omitted = [
+            hit["title"] for hit in candidate_new_hits if str(hit["doc_id"]) not in exposed_ids
+        ]
+
+        if rendered:
+            observation = f"{prefix.rstrip()}\n{rendered}"
+        else:
+            observation = f"Observation: FullWiki retrieval found no new evidence for '{query}'."
+
         self.last_result = {
             "action": "search",
             "query": query,
             "status": "loaded",
             "retriever": result.get("mode"),
+            "duplicate_query": False,
+            "query_matches_retrieved_title": title_match_rank is not None,
+            "query_title_match_rank": title_match_rank,
             "candidate_k": result.get("candidate_k"),
             "top_k": result.get("top_k"),
+            # hits = evidence actually shown to the LLM on this turn.
             "hits": logged_hits,
+            # retrieved_hits = complete raw top-k result, preserved for auditing.
+            "retrieved_hits": raw_logged_hits,
+            "new_evidence_documents": exposed_titles,
+            "already_retained_documents": already_retained,
+            "omitted_due_to_evidence_cap": omitted,
+            "omitted_due_to_observation_cap": observation_omitted,
+            "evidence_document_count": self.evidence_document_count,
+            "max_evidence_documents": self.max_evidence_documents,
             "latency_ms": result.get("latency_ms", {}),
-            # Backward-compatible top-hit fields for existing trajectory consumers.
-            "title": logged_hits[0]["title"],
-            "sentences": logged_hits[0]["sentences"],
+            "title": self.current_title,
+            "sentences": (
+                logged_hits[0]["sentences"]
+                if logged_hits and logged_hits[0]["title"] == self.current_title
+                else []
+            ),
         }
-        return (
-            "Observation: FullWiki retrieval returned the following HotpotQA-aligned Wikipedia "
-            "introductory paragraph(s). Sentence IDs are exact 0-based HotpotQA sentence IDs.\n"
-            + "\n\n".join(rendered_blocks)
-        )
+        self._seen_search_queries[normalized_query] = {
+            "retriever": result.get("mode"),
+            "candidate_k": result.get("candidate_k"),
+            "retrieved_hits": raw_logged_hits,
+            "retrieved_titles": retrieved_titles,
+            "retained_titles": list(dict.fromkeys(already_retained + exposed_titles)),
+            "query_matches_retrieved_title": title_match_rank is not None,
+            "query_title_match_rank": title_match_rank,
+        }
+        return observation
 
     def lookup(self, keyword):
         if not self.current_document:
@@ -380,6 +578,20 @@ class FullWikiRetriever:
                 "hits": [],
             }
             return "Observation: No FullWiki document currently loaded. Perform a `search` first."
+
+        current_doc_id = str(self.current_document["doc_id"])
+        if current_doc_id not in self._evidence_doc_id_set:
+            self.last_result = {
+                "action": "lookup",
+                "query": keyword,
+                "status": "evidence_cap_reached",
+                "title": self.current_document["title"],
+                "sentences": [],
+                "hits": [],
+                "evidence_document_count": self.evidence_document_count,
+                "max_evidence_documents": self.max_evidence_documents,
+            }
+            return f"Observation: Could not load [{self.current_document['title']}] for lookup."
 
         keyword_clean = str(keyword).strip().strip("'\"").lower()
         matches = []

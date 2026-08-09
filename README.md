@@ -21,8 +21,9 @@ Official HotpotQA Wikipedia (Oct. 1, 2017)
              /                \
             /                  \
 Single-Pass RAG                ReAct
-1 query -> top 7 docs     up to 7 adaptive queries
-1 Qwen generation          top 1 doc/query -> Qwen
+1 query -> top 6 docs     up to 7 adaptive tool turns
+1 Qwen generation          top 6 docs/search -> Qwen
+                          max 15 unique docs in working context
             \                  /
              HotpotQA official metrics
 ```
@@ -37,7 +38,7 @@ HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia
 - **Sparse retrieval:** Lucene BM25 through Pyserini/Anserini.
 - **Dense retrieval:** `BAAI/bge-base-en-v1.5`, L2-normalized embeddings, persisted in a memory-efficient FAISS IVF-PQ index (`IVF4096,PQ96x8`). Corpus encoding is performed once during index construction; benchmark-time query encoding defaults to CPU so it does not compete with vLLM for the L4.
 - **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings. No dataset-specific fusion-weight sweep.
-- **Fair retrieval budget:** Single-pass RAG sees up to 7 documents from one retrieval. ReAct sees one document per adaptive search for at most 7 searches.
+- **Retrieval protocol:** Single-pass RAG retrieves the top 6 passages once from the original question. ReAct retrieves the top 6 passages on each adaptive search turn, while retaining at most 15 unique Wikipedia documents in its recurrent working evidence.
 - **ReAct controller:** LangGraph state machine enforcing Thought -> Action -> Observation, with delimiter-safe action parsing and a mandatory final synthesis call at the hop budget.
 - **Official-compatible evaluation:** Answer EM/F1, Supporting Fact EM/F1, Joint EM/F1, and evaluator-format `official_predictions.json`.
 - **Structured experiment artifacts:** complete trajectories, raw model outputs, sentence-level evidence, sparse/dense/fused ranks and scores, retrieval latency, run manifests, failures, and evidence graphs.
@@ -120,7 +121,7 @@ Run a first-stage retrieval sanity check over the validation questions:
 python retrieval/evaluate_retrieval.py \
     --source official_json \
     --modes bm25 dense hybrid \
-    --ks 1 5 10 20
+    --ks 1 5 6 10 20
 ```
 
 This does **not** call Qwen. It reports mean gold-document Recall@K and the rate at which all gold documents are recovered for BM25, dense, and hybrid retrieval, and saves the per-question results to:
@@ -146,8 +147,7 @@ LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python -m vllm.entrypoints.op
     --port 8000 \
     --dtype bfloat16 \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 8192 \
-    --enforce-eager
+    --max-model-len 8192
 ```
 
 Wait for `Application startup complete` on `http://localhost:8000/v1`.
@@ -160,15 +160,15 @@ PYTHONPATH=. pytest tests/
 
 The retrieval tests do not require the full Wikipedia indexes and exercise corpus parsing, sentence-ID preservation, RRF, and the per-question FullWiki retriever contract.
 
-## Step 6: Run the Budget-Matched Single-Pass FullWiki RAG Baseline
+## Step 6: Run the Single-Pass FullWiki RAG Baseline
 
-One hybrid retrieval from the original question, top 7 Wikipedia paragraphs, one Qwen generation:
+One hybrid retrieval from the original question, top 6 Wikipedia paragraphs, one Qwen generation:
 
 ```bash
 python eval/run_baseline.py \
     --mode fullwiki \
     --retriever hybrid \
-    --top-k 7 \
+    --top-k 6 \
     --source official_json \
     --concurrency 64 \
     --output-dir eval_results/baseline
@@ -176,15 +176,16 @@ python eval/run_baseline.py \
 
 ## Step 7: Run the FullWiki ReAct Agent
 
-Each ReAct search uses the **same hybrid backend** but exposes only its top-1 paragraph. The agent may make at most seven adaptive searches, so its maximum retrieved-document budget matches the baseline's seven documents.
+Each ReAct `search[...]` uses the **same hybrid backend** and retrieves its top 6 Wikipedia passages. Previously seen passages are not duplicated in the recurrent prompt, and the agent retains at most 15 unique Wikipedia documents in first-seen retrieval order across the trajectory; there is no hand-written title promotion or relevance replacement heuristic. `lookup[...]` remains scoped to the rank-1/current page, matching the classic ReAct tool semantics. The agent may take at most seven search/lookup actions before forced final synthesis.
 
 ```bash
 python eval/run_eval.py \
     --mode fullwiki \
     --retriever hybrid \
-    --top-k 1 \
+    --top-k 6 \
+    --max-evidence-docs 15 \
     --source official_json \
-    --concurrency 16 \
+    --concurrency 64 \
     --max-hops 7 \
     --output-dir eval_results/react
 ```
@@ -223,7 +224,10 @@ The ReAct trajectory for every retrieval step retains:
 - BM25 rank/score;
 - dense rank/score;
 - fused rank/score;
-- exact retrieved Wikipedia title and sentence IDs;
+- complete raw top-6 retrieval candidates plus the subset actually added to working evidence;
+- sparse/dense/fused ranks and scores for every retrieved candidate;
+- duplicate-query status, query/title-match diagnostic, evidence-memory count, and cap omissions;
+- exact exposed Wikipedia titles and sentence IDs;
 - retrieval latency by sparse/dense/fusion component;
 - raw Qwen response;
 - parsed Thought/Action;
@@ -316,11 +320,7 @@ conda activate hotpot
 
 ### `RuntimeError: Could not find nvcc` from vLLM
 
-Use the `--enforce-eager` vLLM flag shown above. If needed:
-
-```bash
-conda install -n hotpot -c nvidia cuda-toolkit -y
-```
+The optimized non-eager vLLM path may JIT-compile CUDA kernels. Install a CUDA toolkit/compiler compatible with the PyTorch CUDA build, then ensure `nvcc` is discoverable via `PATH`/`CUDA_HOME` before starting vLLM. `--enforce-eager` remains a fallback for debugging, not the recommended full-benchmark configuration.
 
 ### `CXXABI` / `libstdc++` error
 
