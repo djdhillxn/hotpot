@@ -2,6 +2,8 @@ import os
 import threading
 import time
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 class CrossEncoderEvidenceReranker:
     """Shared cross-encoder scorer for ReAct evidence memory.
