@@ -8,14 +8,16 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 class CrossEncoderEvidenceReranker:
-    """Shared cross-encoder scorer for ReAct evidence memory.
+    """Shared cross-encoder scorer for ReAct evidence memory with true pair-level batching.
 
     Features:
-    1. Bounded OrderedDict LRU Pair Cache (query, passage) -> float
-    2. Central Dynamic Microbatching Queue bounded by pair count to combine concurrent requests across
-       all evaluation threads into optimal GPU batches.
+    1. Bounded OrderedDict LRU Pair Cache (query, passage) -> float.
+    2. Central Pair-Level Coordinator Queue: breaks logical multi-pair requests into pair items,
+       buckets them by token length to minimize padding waste, and batches them into physical
+       GPU batches of batch_size (32 or 64) across all concurrent evaluation workers.
     3. Step-down CUDA OOM recovery (batch size reduction first before CPU fallback).
-    4. Telemetry metrics for queue wait, model evaluation, pair counts, and cache hit rates.
+    4. Separately tracks enqueue-to-first-batch delay, model execution time, physical batch count,
+       pairs per physical batch, padding efficiency, and total request completion time.
     """
 
     def __init__(self, model_name, device="cpu", max_length=512, batch_size=32):
@@ -39,17 +41,22 @@ class CrossEncoderEvidenceReranker:
         self._cache_lock = threading.Lock()
         self._max_cache_size = 100000
 
-        # Telemetry metrics
+        # Detailed Telemetry metrics
         self._telemetry_lock = threading.Lock()
+        self.stats_total_requests = 0
         self.stats_total_pairs = 0
         self.stats_cache_hits = 0
-        self.stats_total_queue_wait_seconds = 0.0
-        self.stats_total_eval_time_seconds = 0.0
-        self.stats_total_eval_calls = 0
+        self.stats_total_enqueue_to_first_batch_s = 0.0
+        self.stats_total_request_completion_s = 0.0
+        self.stats_total_eval_time_s = 0.0
+        self.stats_physical_batches = 0
+        self.stats_total_evaluated_pairs = 0
+        self.stats_total_tokens = 0
+        self.stats_total_padding_tokens = 0
 
-        # Central Dynamic Microbatching Queue
+        # Central Pair-Level Coordinator Queue
         self._queue = queue.Queue()
-        self._worker_thread = threading.Thread(target=self._microbatch_worker_loop, daemon=True)
+        self._worker_thread = threading.Thread(target=self._pair_coordinator_worker_loop, daemon=True)
         self._worker_thread.start()
 
         # Limit internal PyTorch CPU threads when running on CPU to prevent worker thread thrashing
@@ -107,7 +114,6 @@ class CrossEncoderEvidenceReranker:
         if not pairs:
             return []
         import torch
-        eval_started = time.perf_counter()
         with self._lock:
             try:
                 with torch.inference_mode():
@@ -154,71 +160,107 @@ class CrossEncoderEvidenceReranker:
                 else:
                     raise oom_exc
 
-        eval_duration = time.perf_counter() - eval_started
-        with self._telemetry_lock:
-            self.stats_total_eval_time_seconds += eval_duration
-            self.stats_total_eval_calls += 1
-
         return [float(s) for s in scores]
 
-    def _microbatch_worker_loop(self):
-        # Bound GPU batches by total PAIR count, not request count
-        max_pair_batch = max(64, self.batch_size * 2)
-
+    def _pair_coordinator_worker_loop(self):
         while True:
             try:
                 first_item = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            batch_requests = [first_item]
-            all_pairs = list(first_item["pairs"])
+            gathered_items = [first_item]
+            max_gather = max(64, self.batch_size * 2)
             start_wait = time.perf_counter()
 
-            while len(all_pairs) < max_pair_batch and (time.perf_counter() - start_wait) < 0.002:
+            while len(gathered_items) < max_gather and (time.perf_counter() - start_wait) < 0.002:
                 try:
                     item = self._queue.get_nowait()
-                    item_pair_count = len(item["pairs"])
-                    if len(all_pairs) + item_pair_count > max_pair_batch and len(all_pairs) > 0:
-                        self._queue.put(item)
-                        break
-                    batch_requests.append(item)
-                    all_pairs.extend(item["pairs"])
+                    gathered_items.append(item)
                 except queue.Empty:
                     break
 
-            if all_pairs:
+            if not gathered_items:
+                continue
+
+            # Token length bucketing to minimize padding:
+            # Estimate pair token length via len(q.split()) + len(p.split())
+            gathered_items.sort(
+                key=lambda x: len(x[2][0].split()) + len(x[2][1].split())
+            )
+
+            physical_batch_size = max(1, self.batch_size)
+            for i in range(0, len(gathered_items), physical_batch_size):
+                physical_chunk = gathered_items[i : i + physical_batch_size]
+                if not physical_chunk:
+                    continue
+
+                now = time.perf_counter()
+                for req, _, _ in physical_chunk:
+                    if req["first_batch_time"] is None:
+                        req["first_batch_time"] = now
+
+                physical_pairs = [pair for _, _, pair in physical_chunk]
+
+                # Compute token counts and padding waste for telemetry
+                pair_token_lens = [
+                    min(self.max_length, len(q.split()) + len(p.split()) + 3)
+                    for q, p in physical_pairs
+                ]
+                max_token_len = max(pair_token_lens) if pair_token_lens else 1
+                total_tokens = sum(pair_token_lens)
+                batch_capacity = max_token_len * len(physical_pairs)
+                padding_waste = max(0, batch_capacity - total_tokens)
+
+                model_start = time.perf_counter()
                 try:
-                    scores = self._predict_raw(all_pairs)
+                    scores = self._predict_raw(physical_pairs)
+                    model_dur = time.perf_counter() - model_start
+
                     with self._cache_lock:
-                        for pair, score in zip(all_pairs, scores):
+                        for pair, score in zip(physical_pairs, scores):
                             self._cache[pair] = score
                             self._cache.move_to_end(pair)
                             if len(self._cache) > self._max_cache_size:
                                 self._cache.popitem(last=False)
 
-                    idx = 0
-                    for req in batch_requests:
-                        num_pairs = len(req["pairs"])
-                        req["results"] = scores[idx : idx + num_pairs]
-                        idx += num_pairs
-                        req["event"].set()
+                    completed_reqs = []
+                    for (req, pair_idx, _), score in zip(physical_chunk, scores):
+                        req["scores"][pair_idx] = score
+                        req["completed_pairs"] += 1
+                        if req["completed_pairs"] == req["total_pairs"]:
+                            req["completion_time"] = time.perf_counter()
+                            completed_reqs.append(req)
+                            req["event"].set()
+
+                    with self._telemetry_lock:
+                        self.stats_physical_batches += 1
+                        self.stats_total_evaluated_pairs += len(physical_pairs)
+                        self.stats_total_eval_time_s += model_dur
+                        self.stats_total_tokens += total_tokens
+                        self.stats_total_padding_tokens += padding_waste
+
+                        for req in completed_reqs:
+                            self.stats_total_requests += 1
+                            first_delay = req["first_batch_time"] - req["enqueued_time"]
+                            comp_delay = req["completion_time"] - req["enqueued_time"]
+                            self.stats_total_enqueue_to_first_batch_s += max(0.0, first_delay)
+                            self.stats_total_request_completion_s += max(0.0, comp_delay)
+
                 except Exception as exc:
-                    for req in batch_requests:
+                    for req, _, _ in physical_chunk:
                         req["exception"] = exc
                         req["event"].set()
 
-            for _ in range(len(batch_requests)):
+            for _ in range(len(gathered_items)):
                 self._queue.task_done()
 
-    def score(self, question, passages):
-        passages = [str(passage) for passage in passages]
-        if not passages:
+    def score_pairs(self, pairs):
+        pairs = [(str(q), str(p)) for q, p in pairs]
+        if not pairs:
             return [], 0.0
 
         started = time.perf_counter()
-        pairs = [(str(question), passage) for passage in passages]
-
         cached_scores = {}
         uncached_pairs = []
         uncached_indices = []
@@ -242,30 +284,27 @@ class CrossEncoderEvidenceReranker:
 
         req_event = threading.Event()
         request_obj = {
-            "pairs": uncached_pairs,
+            "total_pairs": len(uncached_pairs),
+            "completed_pairs": 0,
+            "scores": [0.0] * len(uncached_pairs),
             "event": req_event,
-            "results": None,
             "exception": None,
             "enqueued_time": time.perf_counter(),
+            "first_batch_time": None,
+            "completion_time": None,
         }
-        self._queue.put(request_obj)
 
-        # Never perform duplicate fallback inference on timeout; wait for queue completion or raise TimeoutError
+        for pair_idx, pair in enumerate(uncached_pairs):
+            self._queue.put((request_obj, pair_idx, pair))
+
         signaled = req_event.wait(timeout=120.0)
         if not signaled:
-            raise TimeoutError("Reranker request timed out waiting for dynamic microbatching worker.")
-
-        queue_wait_duration = time.perf_counter() - request_obj["enqueued_time"]
-        with self._telemetry_lock:
-            self.stats_total_queue_wait_seconds += queue_wait_duration
+            raise TimeoutError("Reranker request timed out waiting for pair coordinator worker.")
 
         if request_obj["exception"] is not None:
             raise request_obj["exception"]
 
-        new_scores = request_obj["results"]
-        if new_scores is None:
-            raise RuntimeError("Reranker worker returned None results without exception.")
-
+        new_scores = request_obj["scores"]
         final_scores = [0.0] * len(pairs)
         for idx, score in cached_scores.items():
             final_scores[idx] = score
@@ -275,17 +314,34 @@ class CrossEncoderEvidenceReranker:
         latency = time.perf_counter() - started
         return final_scores, latency
 
+    def score(self, question, passages):
+        passages = [str(passage) for passage in passages]
+        if not passages:
+            return [], 0.0
+        pairs = [(str(question), passage) for passage in passages]
+        return self.score_pairs(pairs)
+
     def describe(self):
         with self._telemetry_lock:
             total_pairs = self.stats_total_pairs
             cache_hits = self.stats_cache_hits
-            queue_wait_s = self.stats_total_queue_wait_seconds
-            eval_time_s = self.stats_total_eval_time_seconds
-            eval_calls = self.stats_total_eval_calls
+            total_reqs = self.stats_total_requests
+            first_batch_s = self.stats_total_enqueue_to_first_batch_s
+            completion_s = self.stats_total_request_completion_s
+            eval_time_s = self.stats_total_eval_time_s
+            physical_batches = self.stats_physical_batches
+            eval_pairs = self.stats_total_evaluated_pairs
+            tokens = self.stats_total_tokens
+            padding = self.stats_total_padding_tokens
 
         hit_rate = (cache_hits / total_pairs) if total_pairs > 0 else 0.0
-        avg_wait_ms = ((queue_wait_s / max(1, total_pairs)) * 1000) if total_pairs > 0 else 0.0
-        avg_eval_ms = ((eval_time_s / max(1, eval_calls)) * 1000) if eval_calls > 0 else 0.0
+        avg_first_batch_ms = ((first_batch_s / max(1, total_reqs)) * 1000) if total_reqs > 0 else 0.0
+        avg_completion_ms = ((completion_s / max(1, total_reqs)) * 1000) if total_reqs > 0 else 0.0
+        avg_eval_ms = ((eval_time_s / max(1, physical_batches)) * 1000) if physical_batches > 0 else 0.0
+        avg_pairs_per_batch = (eval_pairs / physical_batches) if physical_batches > 0 else 0.0
+
+        total_tokens_with_pad = tokens + padding
+        padding_efficiency = (tokens / total_tokens_with_pad) if total_tokens_with_pad > 0 else 1.0
 
         return {
             "model": self.model_name,
@@ -297,7 +353,13 @@ class CrossEncoderEvidenceReranker:
             "total_pairs_scored": total_pairs,
             "cache_hits": cache_hits,
             "cache_hit_rate": round(hit_rate, 4),
-            "avg_queue_wait_ms": round(avg_wait_ms, 3),
+            "total_requests": total_reqs,
+            "avg_enqueue_to_first_batch_ms": round(avg_first_batch_ms, 3),
+            "avg_request_completion_ms": round(avg_completion_ms, 3),
             "avg_model_eval_ms": round(avg_eval_ms, 3),
+            "total_physical_batches": physical_batches,
+            "avg_pairs_per_physical_batch": round(avg_pairs_per_batch, 1),
+            "token_padding_efficiency": round(padding_efficiency, 4),
             "training_corpus_note": "BAAI/bge-reranker-base cross-encoder; no HotpotQA labels used by this project",
         }
+

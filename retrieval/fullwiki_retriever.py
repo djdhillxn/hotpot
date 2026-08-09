@@ -1,8 +1,10 @@
 import json
 import os
+import queue
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -92,6 +94,7 @@ class FullWikiSearchBackend:
         self.manifest_path = str(manifest_path)
         self.manifest = self._load_manifest()
         self._dense_lock = threading.Lock()
+        self._hybrid_executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix="hybrid_retrieval")
 
         # Thread-safe retrieval caches
         self._doc_id_cache = {}
@@ -102,6 +105,8 @@ class FullWikiSearchBackend:
 
         self._query_embed_cache = {}
         self._embed_cache_lock = threading.Lock()
+        self._dense_queue = None
+        self._dense_worker_thread = None
 
         try:
             os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
@@ -290,10 +295,111 @@ class FullWikiSearchBackend:
         nprobe_default = dense_manifest.get("nprobe", 16)
         self.dense_nprobe = int(os.getenv("FULLWIKI_DENSE_NPROBE", str(nprobe_default)))
         self.faiss = faiss
+
+        # Set FAISS OpenMP threads explicitly to prevent CPU oversubscription across 64 workers
+        faiss_omp_threads = int(os.getenv("FAISS_OMP_NUM_THREADS", "1"))
+        faiss.omp_set_num_threads(faiss_omp_threads)
+
         self.dense_index = faiss.read_index(self.dense_index_path)
         if hasattr(self.dense_index, "nprobe"):
             self.dense_index.nprobe = self.dense_nprobe
         self.encoder = SentenceTransformer(self.dense_model_name, device=self.dense_query_device)
+
+        # Central Dense Query Batching Queue & Worker
+        self._dense_queue = queue.Queue()
+        self._dense_worker_thread = threading.Thread(target=self._dense_batch_worker_loop, daemon=True)
+        self._dense_worker_thread.start()
+
+    def _dense_batch_worker_loop(self):
+        while True:
+            try:
+                first_item = self._dense_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            gathered_items = [first_item]
+            max_batch = 32
+            start_wait = time.perf_counter()
+
+            while len(gathered_items) < max_batch and (time.perf_counter() - start_wait) < 0.002:
+                try:
+                    item = self._dense_queue.get_nowait()
+                    gathered_items.append(item)
+                except queue.Empty:
+                    break
+
+            if not gathered_items:
+                continue
+
+            unique_queries = []
+            query_to_indices = {}
+            for idx, item in enumerate(gathered_items):
+                q = item["query"]
+                if q not in query_to_indices:
+                    query_to_indices[q] = []
+                    unique_queries.append(q)
+                query_to_indices[q].append(idx)
+
+            formatted_queries = [BGE_QUERY_INSTRUCTION + q for q in unique_queries]
+
+            try:
+                with self._dense_lock:
+                    embeddings = self.encoder.encode(
+                        formatted_queries,
+                        batch_size=min(32, len(formatted_queries)),
+                        normalize_embeddings=True,
+                        convert_to_numpy=True,
+                        show_progress_bar=False,
+                    ).astype("float32")
+
+                with self._embed_cache_lock:
+                    for q, emb in zip(unique_queries, embeddings):
+                        norm_q = q.strip().lower()
+                        if len(self._query_embed_cache) < 50000:
+                            self._query_embed_cache[norm_q] = emb
+
+                for q, emb in zip(unique_queries, embeddings):
+                    for idx in query_to_indices[q]:
+                        item = gathered_items[idx]
+                        item["embedding"] = emb
+                        item["event"].set()
+
+            except Exception as exc:
+                for item in gathered_items:
+                    item["exception"] = exc
+                    item["event"].set()
+
+            for _ in range(len(gathered_items)):
+                self._dense_queue.task_done()
+
+    def _encode_query_batched(self, query):
+        norm_q = query.strip().lower()
+        with self._embed_cache_lock:
+            cached_encoded = self._query_embed_cache.get(norm_q)
+
+        if cached_encoded is not None:
+            return cached_encoded
+
+        if self._dense_queue is None:
+            with self._dense_lock:
+                if self._dense_queue is None:
+                    self._load_dense_backend()
+
+        event = threading.Event()
+        item = {
+            "query": query,
+            "event": event,
+            "embedding": None,
+            "exception": None,
+        }
+        self._dense_queue.put(item)
+        signaled = event.wait(timeout=60.0)
+        if not signaled:
+            raise TimeoutError("Dense query batch worker timed out.")
+        if item["exception"] is not None:
+            raise item["exception"]
+
+        return item["embedding"]
 
     def _parse_lucene_doc(self, doc_id):
         doc_id_str = str(doc_id)
@@ -355,27 +461,14 @@ class FullWikiSearchBackend:
 
     def _dense_search(self, query, k):
         started = time.perf_counter()
-        query_key = (query, int(k))
+        encoded = self._encode_query_batched(query)
 
-        with self._embed_cache_lock:
-            cached_encoded = self._query_embed_cache.get(query_key)
-
-        if cached_encoded is None:
-            with self._dense_lock:
-                encoded = self.encoder.encode(
-                    [BGE_QUERY_INSTRUCTION + query],
-                    normalize_embeddings=True,
-                    convert_to_numpy=True,
-                    show_progress_bar=False,
-                ).astype("float32")
-            with self._embed_cache_lock:
-                if len(self._query_embed_cache) < 50000:
-                    self._query_embed_cache[query_key] = encoded
+        if encoded.ndim == 1:
+            encoded_mat = np.expand_dims(encoded, axis=0)
         else:
-            encoded = cached_encoded
+            encoded_mat = encoded
 
-        # FAISS C++ search is 100% thread-safe for read-only index: run OUTSIDE self._dense_lock!
-        scores, ids = self.dense_index.search(encoded, k)
+        scores, ids = self.dense_index.search(encoded_mat, int(k))
 
         rows = []
         for doc_id, score in zip(ids[0], scores[0]):
@@ -396,9 +489,13 @@ class FullWikiSearchBackend:
         bm25_latency = 0.0
         dense_latency = 0.0
 
-        if mode in {"bm25", "hybrid"}:
+        if mode == "hybrid":
+            f_bm25 = self._hybrid_executor.submit(self._bm25_search, query, candidate_k)
+            dense_hits, dense_latency = self._dense_search(query, candidate_k)
+            sparse_hits, bm25_latency = f_bm25.result()
+        elif mode == "bm25":
             sparse_hits, bm25_latency = self._bm25_search(query, candidate_k)
-        if mode in {"dense", "hybrid"}:
+        elif mode == "dense":
             dense_hits, dense_latency = self._dense_search(query, candidate_k)
 
         fuse_started = time.perf_counter()
@@ -440,6 +537,9 @@ class FullWikiSearchBackend:
             document.update(row)
             hydrated.append(document)
 
+        search_wall_clock = max(bm25_latency, dense_latency) if mode == "hybrid" else (bm25_latency + dense_latency)
+        total_search_latency = search_wall_clock + fusion_latency
+
         return {
             "query": query,
             "mode": mode,
@@ -450,7 +550,7 @@ class FullWikiSearchBackend:
                 "bm25": round(bm25_latency * 1000, 3),
                 "dense": round(dense_latency * 1000, 3),
                 "fusion": round(fusion_latency * 1000, 3),
-                "total": round((bm25_latency + dense_latency + fusion_latency) * 1000, 3),
+                "total": round(total_search_latency * 1000, 3),
             },
         }
 
@@ -465,43 +565,77 @@ class FullWikiSearchBackend:
         return passages or [title]
 
     def score_evidence_documents(self, question, documents):
+        res, latency = self.score_evidence_documents_multi_batch(
+            [{"question": question, "documents": documents}]
+        )
+        return res[0], latency
+
+    def score_evidence_documents_multi_batch(self, task_list):
         if self.evidence_reranker is None:
             raise RuntimeError("Evidence reranker is not configured on this FullWiki backend.")
-        if not documents:
-            return ([], [], []), 0.0
+        if not task_list:
+            return [], 0.0
 
-        all_passages = []
-        doc_slice_bounds = []
-        start = 0
+        all_pairs = []
+        task_doc_bounds = []
 
-        for doc in documents:
-            passages = self._reranker_passages_for_document(doc)
-            all_passages.extend(passages)
-            end = start + len(passages)
-            doc_slice_bounds.append((start, end))
-            start = end
+        for task in task_list:
+            q_str = str(task["question"])
+            docs = task.get("documents", [])
+            bounds = []
+            for doc in docs:
+                passages = self._reranker_passages_for_document(doc)
+                start = len(all_pairs)
+                for p in passages:
+                    all_pairs.append((q_str, p))
+                end = len(all_pairs)
+                bounds.append((start, end))
+            task_doc_bounds.append(bounds)
 
-        scores, latency = self.evidence_reranker.score(question, all_passages)
+        if not all_pairs:
+            empty_results = []
+            for task in task_list:
+                docs = task.get("documents", [])
+                empty_results.append((
+                    [0.0] * len(docs),
+                    [0] * len(docs),
+                    [{} for _ in docs],
+                ))
+            return empty_results, 0.0
 
-        doc_max_scores = []
-        doc_best_sents = []
-        doc_sent_scores_list = []
-        for doc, (s_idx, e_idx) in zip(documents, doc_slice_bounds):
-            doc_scores = scores[s_idx:e_idx]
-            max_rel_idx = max(range(len(doc_scores)), key=lambda i: doc_scores[i])
-            doc_max_scores.append(doc_scores[max_rel_idx])
+        scores, latency = self.evidence_reranker.score_pairs(all_pairs)
 
-            sentences = [str(x).strip() for x in doc.get("sentences", []) if str(x).strip()]
-            num_sents = len(sentences[:6])
-            best_sent_id = max_rel_idx if max_rel_idx < num_sents else 0
-            doc_best_sents.append(best_sent_id)
+        task_results = []
+        for task, doc_bounds in zip(task_list, task_doc_bounds):
+            documents = task.get("documents", [])
+            doc_max_scores = []
+            doc_best_sents = []
+            doc_sent_scores_list = []
 
-            sent_scores_dict = {
-                idx: float(score) for idx, score in enumerate(doc_scores[:num_sents])
-            }
-            doc_sent_scores_list.append(sent_scores_dict)
+            for doc, (s_idx, e_idx) in zip(documents, doc_bounds):
+                if s_idx == e_idx:
+                    doc_max_scores.append(0.0)
+                    doc_best_sents.append(0)
+                    doc_sent_scores_list.append({})
+                    continue
 
-        return (doc_max_scores, doc_best_sents, doc_sent_scores_list), latency
+                doc_scores = scores[s_idx:e_idx]
+                max_rel_idx = max(range(len(doc_scores)), key=lambda i: doc_scores[i])
+                doc_max_scores.append(doc_scores[max_rel_idx])
+
+                sentences = [str(x).strip() for x in doc.get("sentences", []) if str(x).strip()]
+                num_sents = len(sentences[:6])
+                best_sent_id = max_rel_idx if max_rel_idx < num_sents else 0
+                doc_best_sents.append(best_sent_id)
+
+                sent_scores_dict = {
+                    idx: float(score) for idx, score in enumerate(doc_scores[:num_sents])
+                }
+                doc_sent_scores_list.append(sent_scores_dict)
+
+            task_results.append((doc_max_scores, doc_best_sents, doc_sent_scores_list))
+
+        return task_results, latency
 
     def create_session(
         self,
@@ -784,24 +918,39 @@ class FullWikiRetriever:
             if str(hit["doc_id"]) in self._evidence_archive and str(hit["doc_id"]) not in new_doc_ids
         ]
 
-        added_titles = []
-        latency = 0.0
+        task_list = []
+        is_subquery = bool(query and self._normalize_query(query) != self._normalize_query(self.question))
 
         if new_hits:
-            res_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
+            task_list.append({"question": self.question, "documents": new_hits, "tag": "new_q"})
+            if is_subquery:
+                task_list.append({"question": query, "documents": new_hits, "tag": "new_sub"})
+
+        if is_subquery and existing_hits:
+            task_list.append({"question": query, "documents": existing_hits, "tag": "existing_sub"})
+
+        if not task_list:
+            return [], 0.0
+
+        # Combine all scoring phases into one logical submission to pair-level coordinator
+        multi_results, latency = self.backend.score_evidence_documents_multi_batch(task_list)
+        results_by_tag = {task["tag"]: res for task, res in zip(task_list, multi_results)}
+
+        added_titles = []
+        if new_hits:
+            res_q = results_by_tag["new_q"]
             scores_q, b_sents_q, s_scores_q = self._unpack_scores_and_bests(res_q)
 
-            # Sub-Query Bridge Protection (Max-Score Rule):
-            # Score against both the original question and the specific search sub-query
-            # for new documents to ensure intermediate bridge documents are not prematurely evicted.
-            if query and self._normalize_query(query) != self._normalize_query(self.question):
-                res_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
+            if is_subquery and "new_sub" in results_by_tag:
+                res_sub = results_by_tag["new_sub"]
                 scores_sub, b_sents_sub, s_scores_sub = self._unpack_scores_and_bests(res_sub)
 
                 scores = []
                 b_sents = []
                 sent_scores_list = []
-                for sq, ss, bq, bs, sq_dict, ss_dict in zip(scores_q, scores_sub, b_sents_q, b_sents_sub, s_scores_q, s_scores_sub):
+                for sq, ss, bq, bs, sq_dict, ss_dict in zip(
+                    scores_q, scores_sub, b_sents_q, b_sents_sub, s_scores_q, s_scores_sub
+                ):
                     if ss > sq:
                         scores.append(ss)
                         b_sents.append(bs)
@@ -810,12 +959,10 @@ class FullWikiRetriever:
                         scores.append(sq)
                         b_sents.append(bq)
                         sent_scores_list.append(sq_dict)
-                latency += latency1 + latency2
             else:
                 scores = scores_q
                 b_sents = b_sents_q
                 sent_scores_list = s_scores_q
-                latency += latency1
 
             if len(scores) != len(new_hits):
                 raise RuntimeError(
@@ -838,10 +985,9 @@ class FullWikiRetriever:
         # Rediscovery Score Upgrade Rule:
         # If an already-archived document is explicitly rediscovered by a later sub-query,
         # score it against that sub-query and upgrade its stored score if higher.
-        if query and self._normalize_query(query) != self._normalize_query(self.question) and existing_hits:
-            res_ext, latency_ext = self.backend.score_evidence_documents(query, existing_hits)
+        if is_subquery and existing_hits and "existing_sub" in results_by_tag:
+            res_ext = results_by_tag["existing_sub"]
             scores_existing, b_sents_existing, s_scores_existing = self._unpack_scores_and_bests(res_ext)
-            latency += latency_ext
             for hit, score, b_sent, s_dict in zip(existing_hits, scores_existing, b_sents_existing, s_scores_existing):
                 doc_id = str(hit["doc_id"])
                 entry = self._evidence_archive[doc_id]
