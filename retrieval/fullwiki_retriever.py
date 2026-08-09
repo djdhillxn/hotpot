@@ -264,16 +264,39 @@ class FullWikiSearchBackend:
         }
 
     @staticmethod
-    def _reranker_passage(document):
+    def _reranker_passages_for_document(document):
         title = str(document.get("title", "")).strip()
-        sentences = " ".join(str(x).strip() for x in document.get("sentences", []) if str(x).strip())
-        return f"{title}\n{sentences}".strip()
+        sentences = [str(x).strip() for x in document.get("sentences", []) if str(x).strip()]
+        passages = [f"{title}: {sent}" for sent in sentences[:6]]
+        full_lead = f"{title}\n{' '.join(sentences[:6])}".strip()
+        if full_lead and full_lead not in passages:
+            passages.append(full_lead)
+        return passages or [title]
 
     def score_evidence_documents(self, question, documents):
         if self.evidence_reranker is None:
             raise RuntimeError("Evidence reranker is not configured on this FullWiki backend.")
-        passages = [self._reranker_passage(document) for document in documents]
-        return self.evidence_reranker.score(question, passages)
+        if not documents:
+            return [], 0.0
+
+        all_passages = []
+        doc_slice_bounds = []
+        start = 0
+
+        for doc in documents:
+            passages = self._reranker_passages_for_document(doc)
+            all_passages.extend(passages)
+            end = start + len(passages)
+            doc_slice_bounds.append((start, end))
+            start = end
+
+        scores, latency = self.evidence_reranker.score(question, all_passages)
+
+        doc_max_scores = []
+        for s_idx, e_idx in doc_slice_bounds:
+            doc_max_scores.append(max(scores[s_idx:e_idx]))
+
+        return doc_max_scores, latency
 
     def create_session(
         self,

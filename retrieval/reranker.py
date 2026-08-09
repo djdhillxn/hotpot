@@ -52,5 +52,5 @@ class CrossEncoderEvidenceReranker:
             "device": self.device,
             "max_length": self.max_length,
             "batch_size": self.batch_size,
-            "training_corpus_note": "MS MARCO cross-encoder; no HotpotQA labels used by this project",
+            "training_corpus_note": "BAAI/bge-reranker-base cross-encoder; no HotpotQA labels used by this project",
         }

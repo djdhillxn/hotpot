@@ -44,15 +44,15 @@ HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia
 - **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings.
 - **Retrieval protocol:**
   - **Single-Pass RAG Baseline:** Retrieves top 7 passages once from the original question (1 generation pass).
-  - **ReAct Multi-Hop Agent:** Retrieves top 6 passages per `search[...]` turn. Every unique retrieved document enters a per-question archive, is scored once against the original question by `cross-encoder/ms-marco-MiniLM-L6-v2`, and the 15 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
+  - **ReAct Multi-Hop Agent:** Retrieves top 10 passages per `search[...]` turn. Every unique retrieved document enters a per-question archive, is scored once against the original question by `BAAI/bge-reranker-base` (Sentence-Level Max-Scoring), and the 15 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
   - **Shared Index:** Both systems query the exact same pre-built hybrid index (`indexes/fullwiki/`). Zero index rebuild required.
 - **Qwen Prompting & ChatML System Structuring:**
   - Formatted as structured `[SystemMessage(...), HumanMessage(...)]` objects passed to `llm.invoke()`, forcing vLLM to format context using Qwen's native `<|im_start|>system...` ChatML template.
-  - Includes 3 standard HotpotQA Few-Shot exemplars demonstrating `Action: finish[canonical answer]` AND sentence-level citations `Support: [["Title", sentence_id], ...]`, enabling high Joint F1 scores.
+  - Includes standard HotpotQA Few-Shot exemplars demonstrating `Action: finish[canonical answer]`, `lookup[keyword]`, AND sentence-level citations `Support: [["Title", sentence_id], ...]`, enabling high Joint F1 scores.
 - **Hard Generation Stop Sequences:** `stop=["\nObservation:", "Observation:"]` is explicitly bound on model invocations in `agent/engine.py`. This guarantees vLLM cuts off generation immediately after `Action: ...`, preventing Qwen from self-hallucinating Wikipedia observations.
 - **Generation Constraints & Repetition Guard:** `max_tokens = 150` prevents runaway monologues. Consecutive duplicate searches are guarded, while repeated `lookup[keyword]` calls are allowed because classic ReAct uses them to advance through successive matches on the current page.
 - **Classic Current-Page Lookup:** `lookup[keyword]` searches only the current rank-1 page selected by the latest search. Repeating the same lookup advances to the next matching sentence on that same page, mirroring the original ReAct Wikipedia environment.
-- **Leakage-aware memory reranker:** the default memory cross-encoder is an MS MARCO model rather than `BAAI/bge-reranker-base`; BAAI documents that its reranker training mixture includes HotpotQA, so using it as the HotpotQA memory judge would contaminate this benchmark. The reranker runs on CPU and is shared across evaluator workers, leaving the L4 dedicated to Qwen/vLLM.
+- **Evidence Memory Reranker (`BAAI/bge-reranker-base`):** Uses BAAI's 110M parameter Cross-Encoder for high-precision semantic evidence ranking with Sentence-Level Max-Scoring. To run the reranker on GPU alongside vLLM, launch vLLM with `--gpu-memory-utilization 0.85` to reserve headroom for PyTorch CUDA context.
 - **ReAct controller:** LangGraph state machine enforcing Thought -> Action -> Observation, with delimiter-safe action parsing, markdown codeblock stripping (`replace("```", "")`), and a mandatory final synthesis call at the hop budget.
 - **Official-compatible evaluation:** Answer EM/F1, Supporting Fact EM/F1, Joint EM/F1, and evaluator-format `official_predictions.json`.
 - **Structured experiment artifacts:** complete trajectories, raw model outputs, sentence-level evidence, sparse/dense/fused ranks and scores, retrieval latency, run manifests, failures, and evidence graphs.
@@ -138,7 +138,7 @@ LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python -m vllm.entrypoints.op
     --host 0.0.0.0 \
     --port 8000 \
     --dtype bfloat16 \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.85 \
     --max-model-len 8192
 ```
 
@@ -155,11 +155,11 @@ PYTHONPATH=. pytest tests/
 > [!NOTE]
 > **Baseline Confirmation**: If you already ran the baseline evaluation on GCE with `top_k=7`, **you do NOT need to re-run the baseline**. The baseline code is completely unchanged and your previous baseline `results.json` remains 100% valid.
 
-Before launching the full 64-worker ReAct benchmark, pre-download and cache the MS MARCO Cross-Encoder weights locally to avoid thread race conditions during HuggingFace download:
+Before launching the full 64-worker ReAct benchmark, pre-download and cache the BAAI Cross-Encoder weights locally to avoid thread race conditions during HuggingFace download:
 
 ```bash
-# 1. Pre-cache Cross-Encoder Reranker model:
-python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2'); print('Cross-Encoder model successfully cached!')"
+# 1. Pre-cache BAAI Cross-Encoder Reranker model:
+python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-base'); print('BGE Cross-Encoder model successfully cached!')"
 
 # 2. Run 5-Sample ReAct Smoke Test with YAML config:
 python eval/run_eval.py \

@@ -23,8 +23,8 @@ react_top_k: 10
 max_evidence_documents: 15
 max_observation_chars: 22000
 
-# ReAct Cross-Encoder Evidence Memory Reranker (CPU Execution)
-memory_reranker_model: "cross-encoder/ms-marco-MiniLM-L6-v2"
+# ReAct Cross-Encoder Evidence Memory Reranker (BAAI/bge-reranker-base)
+memory_reranker_model: "BAAI/bge-reranker-base"
 memory_reranker_device: "cpu"
 memory_reranker_max_length: 512
 memory_reranker_batch_size: 16

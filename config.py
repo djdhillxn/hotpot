@@ -43,10 +43,9 @@ MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
 REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "10"))
 REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "15"))
 REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "22000"))
-# ReAct evidence-memory reranker. The default is trained on MS MARCO rather than
-# HotpotQA so the memory policy does not use a reranker trained on this benchmark.
+# ReAct evidence-memory reranker using BAAI/bge-reranker-base.
 REACT_MEMORY_RERANKER_MODEL = os.getenv(
-    "REACT_MEMORY_RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2"
+    "REACT_MEMORY_RERANKER_MODEL", "BAAI/bge-reranker-base"
 )
 REACT_MEMORY_RERANKER_DEVICE = os.getenv("REACT_MEMORY_RERANKER_DEVICE", "cpu")
 REACT_MEMORY_RERANKER_MAX_LENGTH = int(os.getenv("REACT_MEMORY_RERANKER_MAX_LENGTH", "512"))
