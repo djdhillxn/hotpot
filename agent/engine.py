@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
 from agent.prompt import REACT_SYSTEM_PROMPT, FORCED_SYNTHESIS_PROMPT_SYSTEM
-from agent.parser import parse_react_output, parse_supporting_facts
+from agent.parser import parse_react_output, parse_supporting_facts, _canonical_answer_text
 from agent.state import create_initial_state
 from tools.wikipedia import WikipediaToolSet
 from config import MAX_AGENT_HOPS
