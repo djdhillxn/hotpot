@@ -15,10 +15,13 @@ from agent.baseline_rag import run_single_pass_rag
 from config import (
     BASELINE_SEARCH_TOP_K,
     FULLWIKI_INDEX_DIR,
+    FULLWIKI_RRF_K,
+    FULLWIKI_SEARCH_CANDIDATES,
     LLM_MODEL_NAME,
     OPENAI_API_BASE,
     OPENAI_API_KEY,
     REACT_MAX_OBSERVATION_CHARS,
+    load_eval_config,
 )
 from eval.artifacts import (
     context_diagnostics,
@@ -277,18 +280,6 @@ def build_failure_record(sample, idx, error, latency=0.0):
     return metrics, trajectory
 
 
-from config import (
-    BASELINE_SEARCH_TOP_K,
-    FULLWIKI_INDEX_DIR,
-    FULLWIKI_RRF_K,
-    FULLWIKI_SEARCH_CANDIDATES,
-    LLM_MODEL_NAME,
-    OPENAI_API_BASE,
-    OPENAI_API_KEY,
-    REACT_MAX_OBSERVATION_CHARS,
-)
-
-
 def run_baseline_benchmark(
     num_samples=None,
     mode="offline",
@@ -489,17 +480,6 @@ def run_baseline_benchmark(
     print(f"Saved execution log file to: {log_file}")
 
     generate_eval_plots_and_report(results, output_dir=output_dir)
-
-
-from config import (
-    BASELINE_SEARCH_TOP_K,
-    FULLWIKI_INDEX_DIR,
-    LLM_MODEL_NAME,
-    OPENAI_API_BASE,
-    OPENAI_API_KEY,
-    REACT_MAX_OBSERVATION_CHARS,
-    load_eval_config,
-)
 
 
 if __name__ == "__main__":
