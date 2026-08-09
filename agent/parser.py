@@ -32,11 +32,14 @@ def _extract_delimited_action(cleaned_output):
 
 
 def _canonical_answer_text(value):
-    """Conservatively strip common answer wrappers and trailing period punctuation without rewriting content."""
+    """Conservatively strip common answer wrappers, Support lines, and trailing period punctuation without rewriting content."""
     answer = str(value or "").strip().strip("'\"")
+    answer = re.sub(r"(?i)\n?\s*Support\s*:\s*\[.*\]\s*$", "", answer).strip()
     answer = _ANSWER_PREFIX_RE.sub("", answer, count=1)
     answer = _THE_ANSWER_IS_RE.sub("", answer, count=1)
     answer = answer.strip().strip("'\"")
+    if answer.lower().startswith("support:") or answer in {"[]", "Support: []"}:
+        return ""
     if answer.endswith(".") and not answer.endswith("..") and len(answer) > 1:
         if not (len(answer) >= 4 and answer[-3] == "." and answer[-1] == "."):
             answer = answer[:-1].strip()
@@ -124,7 +127,10 @@ def parse_react_output(llm_output):
     if "Observation:" in cleaned_output:
         cleaned_output = cleaned_output.split("Observation:")[0].strip()
 
-    action_match = _extract_delimited_action(cleaned_output)
+    # Remove trailing Support: [...] line so it doesn't pollute action parsing or final answer extraction
+    cleaned_no_support = re.sub(r"(?i)\n?\s*Support\s*:\s*\[.*\]\s*$", "", cleaned_output).strip()
+
+    action_match = _extract_delimited_action(cleaned_no_support)
     if action_match:
         prefix_match, action_type, extracted_arg = action_match
         action_arg = extracted_arg.strip().strip("'\"")
@@ -132,14 +138,14 @@ def parse_react_output(llm_output):
             action_arg = _canonical_answer_text(action_arg)
         raw_action = f"{action_type}[{action_arg}]"
 
-        thought_part = cleaned_output[: prefix_match.start()].strip()
+        thought_part = cleaned_no_support[: prefix_match.start()].strip()
         thought = re.sub(r"^Thought:\s*", "", thought_part, flags=re.IGNORECASE).strip()
         if not thought:
             thought = "Analyzing available information."
         return thought, raw_action, action_type, action_arg
 
     fallback_action = re.search(
-        r"Action:\s*(search|lookup|finish)\s+(.+)", cleaned_output, re.IGNORECASE
+        r"Action:\s*(search|lookup|finish)\s+(.+)", cleaned_no_support, re.IGNORECASE
     )
     if fallback_action:
         action_type = fallback_action.group(1).lower()
@@ -148,18 +154,19 @@ def parse_react_output(llm_output):
             action_arg = _canonical_answer_text(action_arg)
         raw_action = f"{action_type}[{action_arg}]"
 
-        thought_part = cleaned_output[: fallback_action.start()].strip()
+        thought_part = cleaned_no_support[: fallback_action.start()].strip()
         thought = re.sub(r"^Thought:\s*", "", thought_part, flags=re.IGNORECASE).strip()
         if not thought:
             thought = "Analyzing available information."
         return thought, raw_action, action_type, action_arg
 
-    if "finish" in cleaned_output.lower() or "final answer" in cleaned_output.lower():
-        lines = cleaned_output.split("\n")
-        last_line = lines[-1].strip()
+    if "finish" in cleaned_no_support.lower() or "final answer" in cleaned_no_support.lower():
+        lines = [l.strip() for l in cleaned_no_support.split("\n") if l.strip()]
+        last_line = lines[-1] if lines else ""
         arg = re.sub(r"^(finish|final answer):\s*", "", last_line, flags=re.IGNORECASE).strip("[] ")
         arg = _canonical_answer_text(arg)
-        return cleaned_output, f"finish[{arg}]", "finish", arg
+        if arg:
+            return cleaned_no_support, f"finish[{arg}]", "finish", arg
 
     thought = re.sub(r"^Thought:\s*", "", cleaned_output, flags=re.IGNORECASE).strip()
     return (

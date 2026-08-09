@@ -18,10 +18,35 @@ def _get_response_text(response):
     return response.content if hasattr(response, "content") else str(response)
 
 
+def _normalize_fact_title(title):
+    return " ".join(str(title or "").strip().lower().replace(",", "").replace(".", "").split())
+
+
 def _validate_supporting_facts(facts, observed_facts):
-    observed = {tuple(fact) for fact in observed_facts or []}
-    valid = [fact for fact in facts if tuple(fact) in observed]
-    invalid = [fact for fact in facts if tuple(fact) not in observed]
+    observed_map = {}
+    for fact in observed_facts or []:
+        if isinstance(fact, (list, tuple)) and len(fact) == 2:
+            norm_t = _normalize_fact_title(fact[0])
+            try:
+                sent_id = int(fact[1])
+                observed_map[(norm_t, sent_id)] = [str(fact[0]).strip(), sent_id]
+            except (ValueError, TypeError):
+                pass
+
+    valid = []
+    invalid = []
+    for fact in facts or []:
+        if isinstance(fact, (list, tuple)) and len(fact) == 2:
+            norm_t = _normalize_fact_title(fact[0])
+            try:
+                sent_id = int(fact[1])
+                key = (norm_t, sent_id)
+                if key in observed_map:
+                    valid.append(observed_map[key])
+                else:
+                    invalid.append([str(fact[0]).strip(), sent_id])
+            except (ValueError, TypeError):
+                invalid.append(fact)
     return valid, invalid
 
 
@@ -199,12 +224,25 @@ def create_react_agent_graph(llm, toolset=None, max_hops=MAX_AGENT_HOPS):
             parsed_supporting_facts, state.get("observed_supporting_facts", [])
         )
 
+        candidate_answer = ""
         if action_type == "finish" and action_arg.strip():
-            final_answer = action_arg.strip()
-            final_action = f"finish[{final_answer}]"
-        else:
-            final_answer = response_text.strip() or "unknown"
-            final_action = f"finish[{final_answer}]"
+            candidate_answer = _canonical_answer_text(action_arg)
+
+        if not candidate_answer:
+            import re
+            cleaned_text = re.sub(r"(?i)\n?\s*Support\s*:\s*\[.*\]\s*$", "", response_text).strip()
+            lines = [l.strip() for l in cleaned_text.split("\n") if l.strip()]
+            for line in reversed(lines):
+                cleaned_line = _canonical_answer_text(line)
+                if cleaned_line and not cleaned_line.lower().startswith("support"):
+                    candidate_answer = cleaned_line
+                    break
+
+        if not candidate_answer:
+            candidate_answer = "unknown"
+
+        final_answer = candidate_answer
+        final_action = f"finish[{final_answer}]"
 
         step_record = {
             "step": state.get("step_count", 0) + 1,

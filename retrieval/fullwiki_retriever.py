@@ -385,7 +385,12 @@ class FullWikiSearchBackend:
             best_sent_id = max_rel_idx if max_rel_idx < num_sents else 0
             doc_best_sents.append(best_sent_id)
 
-        return (doc_max_scores, doc_best_sents), latency
+            sent_scores_dict = {
+                idx: float(score) for idx, score in enumerate(doc_scores[:num_sents])
+            }
+            doc_sent_scores_list.append(sent_scores_dict)
+
+        return (doc_max_scores, doc_best_sents, doc_sent_scores_list), latency
 
     def create_session(
         self,
@@ -529,28 +534,37 @@ class FullWikiRetriever:
 
     @staticmethod
     def _unpack_scores_and_bests(res):
-        if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], list) and isinstance(res[1], list):
-            return res[0], res[1]
+        if isinstance(res, tuple) and len(res) == 3:
+            return res[0], res[1], res[2]
+        elif isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], list) and isinstance(res[1], list):
+            return res[0], res[1], [{} for _ in res[0]]
         elif isinstance(res, list):
-            return res, [0] * len(res)
-        return [], []
+            return res, [0] * len(res), [{} for _ in res]
+        return [], [], []
 
     def _visible_sentences(self, document, char_budget):
         doc_id = str(document.get("doc_id", ""))
         entry = self._evidence_archive.get(doc_id, {})
         best_sent_id = entry.get("best_sent_id", 0)
+        sent_scores = entry.get("sentence_scores", {})
 
         all_sentences = document.get("sentences", [])
         if not all_sentences:
             return []
 
-        target_ids = {0}
+        # Always include sent 0 for title and lead sentence context
+        selected_ids = {0}
         if 0 <= best_sent_id < len(all_sentences):
-            target_ids.add(best_sent_id)
-        if len(target_ids) == 1 and len(all_sentences) > 1:
-            target_ids.add(1)
+            selected_ids.add(best_sent_id)
 
-        ordered_sent_ids = sorted(target_ids)
+        # Rank all non-lead sentences by Cross-Encoder score
+        other_sent_indices = [idx for idx in range(1, len(all_sentences))]
+        other_sent_indices.sort(key=lambda idx: sent_scores.get(idx, -999.0), reverse=True)
+
+        for idx in other_sent_indices[:3]:
+            selected_ids.add(idx)
+
+        ordered_sent_ids = sorted(selected_ids)
 
         visible = []
         used = 0
@@ -646,28 +660,32 @@ class FullWikiRetriever:
 
         if new_hits:
             res_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
-            scores_q, b_sents_q = self._unpack_scores_and_bests(res_q)
-            
+            scores_q, b_sents_q, s_scores_q = self._unpack_scores_and_bests(res_q)
+
             # Sub-Query Bridge Protection (Max-Score Rule):
             # Score against both the original question and the specific search sub-query
             # for new documents to ensure intermediate bridge documents are not prematurely evicted.
             if query and self._normalize_query(query) != self._normalize_query(self.question):
                 res_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
-                scores_sub, b_sents_sub = self._unpack_scores_and_bests(res_sub)
+                scores_sub, b_sents_sub, s_scores_sub = self._unpack_scores_and_bests(res_sub)
 
                 scores = []
                 b_sents = []
-                for sq, ss, bq, bs in zip(scores_q, scores_sub, b_sents_q, b_sents_sub):
+                sent_scores_list = []
+                for sq, ss, bq, bs, sq_dict, ss_dict in zip(scores_q, scores_sub, b_sents_q, b_sents_sub, s_scores_q, s_scores_sub):
                     if ss > sq:
                         scores.append(ss)
                         b_sents.append(bs)
+                        sent_scores_list.append(ss_dict)
                     else:
                         scores.append(sq)
                         b_sents.append(bq)
+                        sent_scores_list.append(sq_dict)
                 latency += latency1 + latency2
             else:
                 scores = scores_q
                 b_sents = b_sents_q
+                sent_scores_list = s_scores_q
                 latency += latency1
 
             if len(scores) != len(new_hits):
@@ -675,13 +693,14 @@ class FullWikiRetriever:
                     f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
                 )
 
-            for hit, score, b_sent in zip(new_hits, scores, b_sents):
+            for hit, score, b_sent, s_dict in zip(new_hits, scores, b_sents, sent_scores_list):
                 doc_id = str(hit["doc_id"])
                 self._archive_order += 1
                 self._evidence_archive[doc_id] = {
                     "document": dict(hit),
                     "reranker_score": float(score),
                     "best_sent_id": int(b_sent),
+                    "sentence_scores": s_dict or {},
                     "first_seen_order": self._archive_order,
                     "first_seen_query": query,
                 }
@@ -692,14 +711,15 @@ class FullWikiRetriever:
         # score it against that sub-query and upgrade its stored score if higher.
         if query and self._normalize_query(query) != self._normalize_query(self.question) and existing_hits:
             res_ext, latency_ext = self.backend.score_evidence_documents(query, existing_hits)
-            scores_existing, b_sents_existing = self._unpack_scores_and_bests(res_ext)
+            scores_existing, b_sents_existing, s_scores_existing = self._unpack_scores_and_bests(res_ext)
             latency += latency_ext
-            for hit, score, b_sent in zip(existing_hits, scores_existing, b_sents_existing):
+            for hit, score, b_sent, s_dict in zip(existing_hits, scores_existing, b_sents_existing, s_scores_existing):
                 doc_id = str(hit["doc_id"])
                 entry = self._evidence_archive[doc_id]
                 if float(score) > float(entry["reranker_score"]):
                     entry["reranker_score"] = float(score)
                     entry["best_sent_id"] = int(b_sent)
+                    entry["sentence_scores"] = s_dict or {}
 
         return added_titles, latency
 
@@ -958,20 +978,38 @@ class FullWikiRetriever:
                 hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
                 title_match_rank = 1
 
-        # Hyperlink Graph Candidate Expansion:
+        # Smart Hyperlink Graph Candidate Expansion:
         # Extract 1-hop outgoing links from all Active Memory documents and visited pages.
-        # Fetch those candidate documents and merge them into hits before Cross-Encoder scoring.
+        # Filter out generic titles and rank by overlap with question/query before fetching top 20.
         if self.use_reranked_memory and hasattr(self.backend, "get_outgoing_links"):
+            GENERIC_TITLES = {
+                "united states", "english language", "actor", "film director", "film",
+                "television series", "california", "new york city", "united kingdom",
+                "japan", "france", "germany", "music", "album", "single (music)",
+                "rock music", "pop music", "hip hop music", "country", "city", "state", "year"
+            }
             graph_targets = set()
             active_titles = [self._evidence_archive[doc_id]["document"]["title"] for doc_id in self._evidence_doc_ids]
             for page_title in active_titles + self.visited_pages:
                 links = self.backend.get_outgoing_links(page_title)
-                for target in links[:15]:
-                    graph_targets.add(target)
+                for target in links:
+                    norm_target = str(target).strip().lower()
+                    if norm_target not in GENERIC_TITLES and norm_target not in {t.lower() for t in self.visited_pages}:
+                        graph_targets.add(target)
+
+            # Rank candidate graph targets by token overlap with question and active query
+            q_tokens = set(self._normalize_query(self.question).split() + normalized_query.split())
+
+            def _graph_target_score(target):
+                t_tokens = set(self._normalize_title(target).split())
+                overlap = len(q_tokens & t_tokens)
+                return overlap
+
+            sorted_graph_targets = sorted(graph_targets, key=_graph_target_score, reverse=True)
 
             existing_hit_ids = {str(h["doc_id"]) for h in hits}
             injected_graph_count = 0
-            for target_title in graph_targets:
+            for target_title in sorted_graph_targets[:30]:
                 if injected_graph_count >= 20:
                     break
                 graph_doc = self.backend.get_doc_by_title(target_title)
