@@ -11,7 +11,7 @@ evaluation_split: "validation"
 # First-Stage FullWiki Retrieval Settings
 retrieval_mode: "fullwiki"
 retriever: "hybrid"
-candidate_k: 40
+candidate_k: 80
 rrf_k: 60
 
 # Single-Pass Baseline Hyperparameters
@@ -19,7 +19,7 @@ baseline_top_k: 7
 
 # ReAct Multi-Hop Agent Hyperparameters
 max_tool_steps: 7
-react_top_k: 10
+react_top_k: 15
 max_evidence_documents: 15
 max_observation_chars: 22000
 
