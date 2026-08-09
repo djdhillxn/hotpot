@@ -277,7 +277,7 @@ class FullWikiSearchBackend:
         if self.evidence_reranker is None:
             raise RuntimeError("Evidence reranker is not configured on this FullWiki backend.")
         if not documents:
-            return [], 0.0
+            return ([], []), 0.0
 
         all_passages = []
         doc_slice_bounds = []
@@ -293,10 +293,18 @@ class FullWikiSearchBackend:
         scores, latency = self.evidence_reranker.score(question, all_passages)
 
         doc_max_scores = []
-        for s_idx, e_idx in doc_slice_bounds:
-            doc_max_scores.append(max(scores[s_idx:e_idx]))
+        doc_best_sents = []
+        for doc, (s_idx, e_idx) in zip(documents, doc_slice_bounds):
+            doc_scores = scores[s_idx:e_idx]
+            max_rel_idx = max(range(len(doc_scores)), key=lambda i: doc_scores[i])
+            doc_max_scores.append(doc_scores[max_rel_idx])
 
-        return doc_max_scores, latency
+            sentences = [str(x).strip() for x in doc.get("sentences", []) if str(x).strip()]
+            num_sents = len(sentences[:6])
+            best_sent_id = max_rel_idx if max_rel_idx < num_sents else 0
+            doc_best_sents.append(best_sent_id)
+
+        return (doc_max_scores, doc_best_sents), latency
 
     def create_session(
         self,
@@ -438,10 +446,35 @@ class FullWikiRetriever:
             ],
         }
 
+    @staticmethod
+    def _unpack_scores_and_bests(res):
+        if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], list) and isinstance(res[1], list):
+            return res[0], res[1]
+        elif isinstance(res, list):
+            return res, [0] * len(res)
+        return [], []
+
     def _visible_sentences(self, document, char_budget):
+        doc_id = str(document.get("doc_id", ""))
+        entry = self._evidence_archive.get(doc_id, {})
+        best_sent_id = entry.get("best_sent_id", 0)
+
+        all_sentences = document.get("sentences", [])
+        if not all_sentences:
+            return []
+
+        target_ids = {0}
+        if 0 <= best_sent_id < len(all_sentences):
+            target_ids.add(best_sent_id)
+        if len(target_ids) == 1 and len(all_sentences) > 1:
+            target_ids.add(1)
+
+        ordered_sent_ids = sorted(target_ids)
+
         visible = []
         used = 0
-        for sent_id, text in enumerate(document.get("sentences", [])):
+        for sent_id in ordered_sent_ids:
+            text = all_sentences[sent_id]
             label = f"[{document['title']} | sent {sent_id}] "
             available = char_budget - used - len(label)
             if available <= 0:
@@ -531,17 +564,29 @@ class FullWikiRetriever:
         latency = 0.0
 
         if new_hits:
-            scores_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
+            res_q, latency1 = self.backend.score_evidence_documents(self.question, new_hits)
+            scores_q, b_sents_q = self._unpack_scores_and_bests(res_q)
             
             # Sub-Query Bridge Protection (Max-Score Rule):
             # Score against both the original question and the specific search sub-query
             # for new documents to ensure intermediate bridge documents are not prematurely evicted.
             if query and self._normalize_query(query) != self._normalize_query(self.question):
-                scores_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
-                scores = [max(sq, ss) for sq, ss in zip(scores_q, scores_sub)]
+                res_sub, latency2 = self.backend.score_evidence_documents(query, new_hits)
+                scores_sub, b_sents_sub = self._unpack_scores_and_bests(res_sub)
+
+                scores = []
+                b_sents = []
+                for sq, ss, bq, bs in zip(scores_q, scores_sub, b_sents_q, b_sents_sub):
+                    if ss > sq:
+                        scores.append(ss)
+                        b_sents.append(bs)
+                    else:
+                        scores.append(sq)
+                        b_sents.append(bq)
                 latency += latency1 + latency2
             else:
                 scores = scores_q
+                b_sents = b_sents_q
                 latency += latency1
 
             if len(scores) != len(new_hits):
@@ -549,12 +594,13 @@ class FullWikiRetriever:
                     f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
                 )
 
-            for hit, score in zip(new_hits, scores):
+            for hit, score, b_sent in zip(new_hits, scores, b_sents):
                 doc_id = str(hit["doc_id"])
                 self._archive_order += 1
                 self._evidence_archive[doc_id] = {
                     "document": dict(hit),
                     "reranker_score": float(score),
+                    "best_sent_id": int(b_sent),
                     "first_seen_order": self._archive_order,
                     "first_seen_query": query,
                 }
@@ -564,12 +610,15 @@ class FullWikiRetriever:
         # If an already-archived document is explicitly rediscovered by a later sub-query,
         # score it against that sub-query and upgrade its stored score if higher.
         if query and self._normalize_query(query) != self._normalize_query(self.question) and existing_hits:
-            scores_existing, latency_ext = self.backend.score_evidence_documents(query, existing_hits)
+            res_ext, latency_ext = self.backend.score_evidence_documents(query, existing_hits)
+            scores_existing, b_sents_existing = self._unpack_scores_and_bests(res_ext)
             latency += latency_ext
-            for hit, score in zip(existing_hits, scores_existing):
+            for hit, score, b_sent in zip(existing_hits, scores_existing, b_sents_existing):
                 doc_id = str(hit["doc_id"])
                 entry = self._evidence_archive[doc_id]
-                entry["reranker_score"] = max(float(entry["reranker_score"]), float(score))
+                if float(score) > float(entry["reranker_score"]):
+                    entry["reranker_score"] = float(score)
+                    entry["best_sent_id"] = int(b_sent)
 
         return added_titles, latency
 

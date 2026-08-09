@@ -41,7 +41,7 @@ os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY if OPENAI_API_KEY else "E
 
 MAX_AGENT_HOPS = int(os.getenv("MAX_AGENT_HOPS", "7"))
 REACT_SEARCH_TOP_K = int(os.getenv("REACT_SEARCH_TOP_K", "20"))
-REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "10"))
+REACT_MAX_EVIDENCE_DOCUMENTS = int(os.getenv("REACT_MAX_EVIDENCE_DOCUMENTS", "20"))
 REACT_MAX_OBSERVATION_CHARS = int(os.getenv("REACT_MAX_OBSERVATION_CHARS", "16000"))
 # ReAct evidence-memory reranker using BAAI/bge-reranker-base.
 REACT_MEMORY_RERANKER_MODEL = os.getenv(
