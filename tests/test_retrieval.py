@@ -8,6 +8,7 @@ import pytest
 
 from retrieval.corpus import iter_hotpot_intro_records, normalize_intro_record
 from retrieval.fullwiki_retriever import (
+    FullWikiRerankedBaselineRetriever,
     FullWikiRetriever,
     FullWikiSearchBackend,
     reciprocal_rank_fusion,
@@ -226,6 +227,50 @@ def _query_context(question, search):
     if " ".join(question.lower().split()) == " ".join(search.lower().split()):
         return question
     return f"Question: {question}\nCurrent search: {search}"
+
+
+def test_reranked_baseline_scores_fifteen_pages_and_exposes_complete_top_seven_only():
+    question = "Which pages answer the question?"
+    hits = [
+        _hit(
+            str(i),
+            f"Doc {i}",
+            [f"Doc {i} opening.", "", f"Doc {i} final evidence."],
+            i,
+        )
+        for i in range(1, 16)
+    ]
+    page_scores = {
+        (question, str(i)): float(i)
+        for i in range(1, 16)
+    }
+    backend = LocalRerankBackend({question: hits}, page_scores)
+    retriever = FullWikiRerankedBaselineRetriever(
+        backend,
+        rerank_top_k=15,
+        output_top_k=7,
+    )
+
+    observation = retriever.search(question)
+
+    assert len(backend.page_stage_calls) == 1
+    assert backend.page_stage_calls[0]["doc_ids"] == [str(i) for i in range(1, 16)]
+    assert backend.sentence_stage_calls == []
+    assert retriever.visited_pages == [
+        "Doc 15", "Doc 14", "Doc 13", "Doc 12", "Doc 11", "Doc 10", "Doc 9"
+    ]
+    assert len(retriever.last_result["hits"]) == 7
+    assert len(retriever.last_result["local_reranked_hits"]) == 15
+    assert retriever.last_result["local_page_pair_count"] == 15
+    assert retriever.last_result["local_sentence_pair_count"] == 0
+    assert retriever.last_result["sentence_reranker_enabled"] is False
+    assert retriever.last_result["hits"][0]["sentences"] == [
+        {"sent_id": 0, "text": "Doc 15 opening."},
+        {"sent_id": 2, "text": "Doc 15 final evidence."},
+    ]
+    assert "[Doc 15 | sent 2] Doc 15 final evidence." in observation
+    assert "[Doc 9 | sent 2] Doc 9 final evidence." in observation
+    assert "Doc 8" not in observation
 
 
 def test_local_page_reranking_is_query_local_and_old_memory_cannot_hijack_current_page():

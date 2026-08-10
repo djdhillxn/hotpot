@@ -71,6 +71,7 @@ REACT_LOCAL_RERANKER_BATCH_SIZE = int(os.getenv(
     os.getenv("REACT_MEMORY_RERANKER_BATCH_SIZE", "32"),
 ))
 BASELINE_SEARCH_TOP_K = int(os.getenv("BASELINE_SEARCH_TOP_K", "7"))
+BASELINE_RERANK_TOP_K = int(os.getenv("BASELINE_RERANK_TOP_K", "15"))
 WIKIPEDIA_USER_AGENT = os.getenv(
     "USER_AGENT", "HotpotQAReActAgent/1.0 (https://github.com/example/hotpot)"
 )

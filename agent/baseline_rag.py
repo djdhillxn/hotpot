@@ -12,6 +12,7 @@ Return EXACTLY one JSON object and no other text:
 
 ANSWER RULES:
 - Derive the answer only from the provided context. For entity, date, number, and phrase answers, copy the exact concise wording from the context whenever possible. For yes/no and comparison questions, infer the concise answer ("yes" or "no") from the cited facts.
+- Use exactly "yes" or "no" for yes/no questions.
 - Prefer the exact concise answer wording from the context whenever possible; do not paraphrase, generalize, or shorten a multiword entity or noun phrase.
 - Do NOT write "The answer is ...", "Answer: ...", explanations, evidence, or full sentences in the answer field.
 

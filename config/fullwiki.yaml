@@ -7,6 +7,7 @@ api_key: "EMPTY"
 
 # Dataset Evaluation Split
 evaluation_split: "validation"
+dataset_source: "official_json"
 
 # First-Stage FullWiki Retrieval Settings
 retrieval_mode: "fullwiki"
@@ -14,8 +15,10 @@ retriever: "hybrid"
 candidate_k: 50
 rrf_k: 60
 
-# Single-Pass Baseline Hyperparameters
+# Single-Pass RAG + Page-Reranker Baseline Hyperparameters
+baseline_rerank_top_k: 15
 baseline_top_k: 7
+baseline_concurrency: 64
 
 # ReAct Multi-Hop Agent Hyperparameters
 max_tool_steps: 7

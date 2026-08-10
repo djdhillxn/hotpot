@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from agent.baseline_rag import run_single_pass_rag
 from config import (
+    BASELINE_RERANK_TOP_K,
     BASELINE_SEARCH_TOP_K,
     FULLWIKI_INDEX_DIR,
     FULLWIKI_RRF_K,
@@ -20,7 +21,10 @@ from config import (
     LLM_MODEL_NAME,
     OPENAI_API_BASE,
     OPENAI_API_KEY,
-    REACT_MAX_OBSERVATION_CHARS,
+    REACT_LOCAL_RERANKER_BATCH_SIZE,
+    REACT_LOCAL_RERANKER_DEVICE,
+    REACT_LOCAL_RERANKER_MAX_LENGTH,
+    REACT_LOCAL_RERANKER_MODEL,
     load_eval_config,
 )
 from eval.artifacts import (
@@ -91,7 +95,10 @@ def _sample_metadata(sample):
 
 
 
-def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_backend=None, top_k=BASELINE_SEARCH_TOP_K):
+def process_single_question(
+    sample, idx, total, mode, llm, logger, fullwiki_backend=None,
+    top_k=BASELINE_SEARCH_TOP_K, rerank_top_k=BASELINE_RERANK_TOP_K,
+):
     question = sample["question"]
     gold_answer = sample["answer"]
     gold_supporting_facts, gold_titles, context_info = _sample_metadata(sample)
@@ -104,9 +111,9 @@ def process_single_question(sample, idx, total, mode, llm, logger, fullwiki_back
     elif mode == "fullwiki":
         if fullwiki_backend is None:
             raise RuntimeError("FullWiki backend was not initialized.")
-        toolset = fullwiki_backend.create_session(
-            search_top_k=top_k,
-            max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
+        toolset = fullwiki_backend.create_baseline_session(
+            rerank_top_k=rerank_top_k,
+            output_top_k=top_k,
         )
     else:
         toolset = WikipediaToolSet()
@@ -262,7 +269,7 @@ def build_failure_record(sample, idx, error, latency=0.0):
         "joint_em": metrics["joint_em"],
         "joint_f1": metrics["joint_f1"],
         "supporting_document_f1": metrics["doc_f1"],
-        "step_count": 1,
+        "step_count": 0,
         "latency_seconds": round(latency, 3),
         "visited_pages": [],
         "observed_gold_document_recall": 0.0 if gold_titles else 1.0,
@@ -292,12 +299,24 @@ def run_baseline_benchmark(
     rrf_k=FULLWIKI_RRF_K,
     index_dir=FULLWIKI_INDEX_DIR,
     top_k=BASELINE_SEARCH_TOP_K,
-    concurrency=16,
+    rerank_top_k=BASELINE_RERANK_TOP_K,
+    concurrency=64,
+    reranker_model=None,
+    reranker_device=None,
+    reranker_max_length=None,
+    reranker_batch_size=None,
 ):
+    reranker_model = reranker_model or REACT_LOCAL_RERANKER_MODEL
+    reranker_device = reranker_device or REACT_LOCAL_RERANKER_DEVICE
+    reranker_max_length = reranker_max_length or REACT_LOCAL_RERANKER_MAX_LENGTH
+    reranker_batch_size = reranker_batch_size or REACT_LOCAL_RERANKER_BATCH_SIZE
+
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
     if top_k < 1:
         raise ValueError("top_k must be >= 1")
+    if rerank_top_k < top_k:
+        raise ValueError("rerank_top_k must be >= top_k")
 
     logger, log_file = setup_logger(output_dir)
     run_started_at = datetime.now().isoformat()
@@ -312,7 +331,10 @@ def run_baseline_benchmark(
         f"Samples Limit: {num_samples if num_samples else 'Full Set'}\n"
         f"Concurrency Workers: {concurrency}\n"
         f"Retriever: {retriever if mode == 'fullwiki' else 'n/a'}\n"
-        f"Documents returned by the single retrieval: {top_k if mode == 'fullwiki' else 1}\n"
+        f"Documents hydrated for page reranking: {rerank_top_k if mode == 'fullwiki' else 1}\n"
+        f"Documents exposed to the reader: {top_k if mode == 'fullwiki' else 1}\n"
+        f"Page reranker: {reranker_model if mode == 'fullwiki' else 'n/a'}\n"
+        f"Sentence reranker: disabled\n"
     )
     if mode == "live":
         info_msg += (
@@ -333,6 +355,10 @@ def run_baseline_benchmark(
             mode=retriever,
             candidate_k=candidate_k,
             rrf_k=rrf_k,
+            local_reranker_model=reranker_model,
+            local_reranker_device=reranker_device,
+            local_reranker_max_length=reranker_max_length,
+            local_reranker_batch_size=reranker_batch_size,
         )
 
     results = []
@@ -361,7 +387,7 @@ def run_baseline_benchmark(
         for idx, sample in enumerate(samples, 1):
             try:
                 eval_metrics, trajectory_entry = process_single_question(
-                    sample, idx, total, mode, llm, logger, fullwiki_backend, top_k
+                    sample, idx, total, mode, llm, logger, fullwiki_backend, top_k, rerank_top_k
                 )
             except Exception as exc:
                 logger.exception(f"Unexpected worker failure for question {idx}: {exc}")
@@ -372,7 +398,7 @@ def run_baseline_benchmark(
             future_to_meta = {
                 executor.submit(
                     process_single_question, sample, idx, total, mode, llm, logger,
-                    fullwiki_backend, top_k
+                    fullwiki_backend, top_k, rerank_top_k
                 ): (idx, sample)
                 for idx, sample in enumerate(samples, 1)
             }
@@ -421,6 +447,7 @@ def run_baseline_benchmark(
         f"All Gold SP Observed*:          {full_observed_count}/{total_count} ({(full_observed_count / total_count * 100) if total_count else 0:.1f}%)\n"
         f"Hotpot Supplied-Context Gold SP Recall*: {avg_supplied_context_sp_recall * 100:.1f}%\n"
         f"Hotpot Supplied Context Has All Gold SP*: {full_supplied_context_count}/{total_count} ({(full_supplied_context_count / total_count * 100) if total_count else 0:.1f}%)\n"
+        f"Avg Hops / Question:           {1.0 if total_count else 0.0:.2f}\n"
         f"Avg Latency / Question:        {avg_lat:.2f}s\n"
         f"Failed Questions:              {failed_count}\n"
         f"Total Evaluation Time:         {total_time:.2f}s\n"
@@ -461,7 +488,12 @@ def run_baseline_benchmark(
             "retrieval_calls_per_question": 1,
             "generation_calls_per_question": 1,
             "documents_per_search": top_k if mode == "fullwiki" else 1,
-            "retrieval_top_k": top_k if mode == "fullwiki" else 1,
+            "documents_hydrated_for_page_reranking": rerank_top_k if mode == "fullwiki" else 1,
+            "documents_in_reader_context": top_k if mode == "fullwiki" else 1,
+            "retrieval_top_k": rerank_top_k if mode == "fullwiki" else 1,
+            "page_reranker_enabled": mode == "fullwiki",
+            "page_reranker_model": reranker_model if mode == "fullwiki" else None,
+            "sentence_reranker_enabled": False,
             "exact_title_promotion": False,
             "retriever": retriever if mode == "fullwiki" else mode,
             "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
@@ -489,14 +521,17 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["offline", "fullwiki", "live"], default=None, help="Retrieval mode")
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default=None, help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
-    parser.add_argument("--top-k", type=int, default=None, help="Documents retrieved in the single-pass FullWiki search")
+    parser.add_argument("--top-k", type=int, default=None, help="Page-reranked documents exposed to the single-pass reader")
+    parser.add_argument("--rerank-top-k", type=int, default=None, help="FullWiki documents hydrated and page-reranked before selecting top-k")
     parser.add_argument("--candidate-k", type=int, default=None, help="First-stage RRF candidate pool size")
     parser.add_argument("--rrf-k", type=int, default=None, help="Reciprocal Rank Fusion smoothing parameter")
     parser.add_argument("--source", choices=["sample", "huggingface", "official_json"], default=None, help="Dataset source")
     parser.add_argument("--model", type=str, default=None, help="LLM model name")
     parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
     parser.add_argument("--output-dir", type=str, default="eval_results/baseline", help="Directory for outputs")
-    parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
+    parser.add_argument("--reranker-model", type=str, default=None, help="Page-level cross-encoder model")
+    parser.add_argument("--reranker-device", type=str, default=None, help="Page-level cross-encoder device")
+    parser.add_argument("--concurrency", type=int, default=None, help="Number of concurrent worker threads")
 
     args = parser.parse_args()
     cfg = load_eval_config(args.config) if args.config else {}
@@ -504,12 +539,18 @@ if __name__ == "__main__":
     mode = args.mode or cfg.get("retrieval_mode") or "offline"
     retriever = args.retriever or cfg.get("retriever") or "hybrid"
     top_k = args.top_k or cfg.get("baseline_top_k") or BASELINE_SEARCH_TOP_K
+    rerank_top_k = args.rerank_top_k or cfg.get("baseline_rerank_top_k") or BASELINE_RERANK_TOP_K
     source = args.source or cfg.get("dataset_source") or "sample"
     model = args.model or cfg.get("model_name") or LLM_MODEL_NAME
     api_base = args.api_base or cfg.get("api_base") or OPENAI_API_BASE
 
     candidate_k = args.candidate_k or cfg.get("candidate_k") or FULLWIKI_SEARCH_CANDIDATES
     rrf_k = args.rrf_k or cfg.get("rrf_k") or FULLWIKI_RRF_K
+    reranker_model = args.reranker_model or cfg.get("local_reranker_model") or cfg.get("memory_reranker_model") or REACT_LOCAL_RERANKER_MODEL
+    reranker_device = args.reranker_device or cfg.get("local_reranker_device") or cfg.get("memory_reranker_device") or REACT_LOCAL_RERANKER_DEVICE
+    reranker_batch_size = cfg.get("local_reranker_batch_size") or cfg.get("memory_reranker_batch_size") or REACT_LOCAL_RERANKER_BATCH_SIZE
+    reranker_max_length = cfg.get("local_reranker_max_length") or cfg.get("memory_reranker_max_length") or REACT_LOCAL_RERANKER_MAX_LENGTH
+    concurrency = args.concurrency or cfg.get("baseline_concurrency") or 64
 
     run_baseline_benchmark(
         num_samples=args.samples,
@@ -523,5 +564,10 @@ if __name__ == "__main__":
         rrf_k=rrf_k,
         index_dir=args.index_dir,
         top_k=top_k,
-        concurrency=args.concurrency,
+        rerank_top_k=rerank_top_k,
+        concurrency=concurrency,
+        reranker_model=reranker_model,
+        reranker_device=reranker_device,
+        reranker_max_length=reranker_max_length,
+        reranker_batch_size=reranker_batch_size,
     )

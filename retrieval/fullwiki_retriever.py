@@ -673,6 +673,18 @@ class FullWikiSearchBackend:
             graph_weight_outdegree_penalty=graph_weight_outdegree_penalty,
         )
 
+    def create_baseline_session(self, rerank_top_k=15, output_top_k=7):
+        """Create the one-search RAG + page-reranker baseline session.
+
+        The baseline shares first-stage retrieval and the page-level cross-encoder
+        with ReAct, but deliberately has no sentence reranker, lookup, or memory.
+        """
+        return FullWikiRerankedBaselineRetriever(
+            self,
+            rerank_top_k=rerank_top_k,
+            output_top_k=output_top_k,
+        )
+
     def describe(self):
         return {
             "backend": "fullwiki",
@@ -689,6 +701,192 @@ class FullWikiSearchBackend:
             ),
             "index_manifest": self.manifest,
         }
+
+
+class FullWikiRerankedBaselineRetriever:
+    """One-retrieval, one-generation FullWiki RAG + page-reranker session.
+
+    Contract:
+    - Retrieve/hydrate ``rerank_top_k`` documents from the shared FullWiki backend.
+    - Score each hydrated document exactly once with the page-level cross-encoder.
+    - Expose the top ``output_top_k`` reranked documents in full, preserving the
+      original HotpotQA sentence IDs.
+    - No sentence-level reranking, persistent memory, lookup, or second search.
+    """
+
+    def __init__(self, backend, rerank_top_k=15, output_top_k=7):
+        self.backend = backend
+        self.rerank_top_k = int(rerank_top_k)
+        self.output_top_k = int(output_top_k)
+        if self.rerank_top_k < 1:
+            raise ValueError("rerank_top_k must be >= 1")
+        if self.output_top_k < 1:
+            raise ValueError("output_top_k must be >= 1")
+        if self.output_top_k > self.rerank_top_k:
+            raise ValueError("output_top_k cannot exceed rerank_top_k")
+        if getattr(self.backend, "local_reranker", None) is None:
+            raise RuntimeError(
+                "The single-pass reranked baseline requires a configured page-level local reranker."
+            )
+        if not hasattr(self.backend, "score_page_documents"):
+            raise RuntimeError("FullWiki backend does not provide page-level reranking.")
+        self.reset()
+
+    def reset(self):
+        self.current_title = None
+        self.current_document = None
+        self.last_result = None
+        self.visited_pages = []
+
+    @property
+    def current_page_title(self):
+        return self.current_title
+
+    @staticmethod
+    def _logged_hit(hit):
+        return {
+            "doc_id": str(hit.get("doc_id", hit.get("id", ""))),
+            "title": hit.get("title"),
+            "rank": hit.get("rank"),
+            "bm25_rank": hit.get("bm25_rank"),
+            "bm25_score": hit.get("bm25_score"),
+            "dense_rank": hit.get("dense_rank"),
+            "dense_score": hit.get("dense_score"),
+            "fused_score": hit.get("fused_score"),
+            "sentences": [
+                {"sent_id": sent_id, "text": str(text)}
+                for sent_id, text in enumerate(hit.get("sentences", []))
+            ],
+        }
+
+    @staticmethod
+    def _visible_sentences(hit):
+        return [
+            {"sent_id": int(sent_id), "text": str(text).strip()}
+            for sent_id, text in enumerate(hit.get("sentences", []))
+            if str(text).strip()
+        ]
+
+    def search(self, query):
+        query = str(query).strip().strip("'\"")
+        if not query:
+            return "Observation: Search query cannot be empty."
+
+        result = self.backend.search(query, top_k=self.rerank_top_k)
+        hits = [dict(hit) for hit in result.get("hits", [])]
+        raw_logged_hits = [self._logged_hit(hit) for hit in hits]
+        if not hits:
+            self.last_result = {
+                "action": "search",
+                "query": query,
+                "status": "not_found",
+                "retriever": result.get("mode"),
+                "candidate_k": result.get("candidate_k"),
+                "rerank_top_k": self.rerank_top_k,
+                "output_top_k": self.output_top_k,
+                "hits": [],
+                "retrieved_hits": raw_logged_hits,
+                "local_reranked_hits": [],
+                "local_page_pair_count": 0,
+                "page_pair_estimated_truncations": 0,
+                "latency_ms": result.get("latency_ms", {}),
+                "title": None,
+                "sentences": [],
+            }
+            return f"Observation: FullWiki retrieval found no document for '{query}'."
+
+        page_scores, page_latency, estimated_truncated = self.backend.score_page_documents(
+            query, hits
+        )
+        if len(page_scores) != len(hits):
+            raise RuntimeError(
+                f"Page reranker returned {len(page_scores)} scores for {len(hits)} pages."
+            )
+
+        ranked_pages = []
+        for hit, score in zip(hits, page_scores):
+            row = dict(hit)
+            row["retrieval_rank"] = hit.get("rank")
+            row["local_rerank_score"] = float(score)
+            ranked_pages.append(row)
+        ranked_pages.sort(key=lambda hit: (
+            -float(hit["local_rerank_score"]),
+            int(hit.get("retrieval_rank") or 10**9),
+            str(hit.get("doc_id", "")),
+        ))
+        for local_rank, hit in enumerate(ranked_pages, 1):
+            hit["local_rerank_rank"] = local_rank
+
+        selected_pages = ranked_pages[: self.output_top_k]
+        exposed_hits = []
+        context_blocks = []
+        for output_rank, page in enumerate(selected_pages, 1):
+            sentences = self._visible_sentences(page)
+            exposed_hits.append({
+                "doc_id": str(page.get("doc_id", "")),
+                "title": page.get("title"),
+                "rank": page.get("retrieval_rank"),
+                "local_rerank_rank": page.get("local_rerank_rank"),
+                "local_rerank_score": page.get("local_rerank_score"),
+                "sentences": sentences,
+            })
+            lines = [f"Retrieved document {output_rank}: {page.get('title')}"]
+            lines.extend(
+                f"[{page.get('title')} | sent {sentence['sent_id']}] {sentence['text']}"
+                for sentence in sentences
+            )
+            context_blocks.append("\n".join(lines))
+
+        self.visited_pages = [
+            page.get("title") for page in selected_pages if page.get("title")
+        ]
+        self.current_document = dict(selected_pages[0]) if selected_pages else None
+        self.current_title = selected_pages[0].get("title") if selected_pages else None
+
+        local_reranked_hits = [
+            {
+                "doc_id": str(page.get("doc_id", "")),
+                "title": page.get("title"),
+                "retrieval_rank": page.get("retrieval_rank"),
+                "local_rerank_rank": page.get("local_rerank_rank"),
+                "local_rerank_score": page.get("local_rerank_score"),
+                "bm25_rank": page.get("bm25_rank"),
+                "dense_rank": page.get("dense_rank"),
+                "fused_score": page.get("fused_score"),
+            }
+            for page in ranked_pages
+        ]
+        latency_ms = dict(result.get("latency_ms", {}))
+        retrieval_total = float(latency_ms.get("total", 0.0) or 0.0)
+        page_reranker_ms = round(page_latency * 1000, 3)
+        latency_ms["local_page_reranker"] = page_reranker_ms
+        latency_ms["total_with_page_reranker"] = round(retrieval_total + page_reranker_ms, 3)
+
+        self.last_result = {
+            "action": "search",
+            "query": query,
+            "status": "loaded",
+            "retriever": result.get("mode"),
+            "candidate_k": result.get("candidate_k"),
+            "rerank_top_k": self.rerank_top_k,
+            "output_top_k": self.output_top_k,
+            "hits": exposed_hits,
+            "retrieved_hits": raw_logged_hits,
+            "local_reranked_hits": local_reranked_hits,
+            "local_page_pair_count": len(hits),
+            "local_sentence_pair_count": 0,
+            "page_pair_estimated_truncations": int(estimated_truncated),
+            "sentence_reranker_enabled": False,
+            "latency_ms": latency_ms,
+            "title": self.current_title,
+            "sentences": exposed_hits[0]["sentences"] if exposed_hits else [],
+        }
+
+        prefix = (
+            f"Observation: Single-pass FullWiki context with {len(exposed_hits)} "
+            "page-reranked documents.\n"
+        )
+        return prefix + "\n\n".join(context_blocks)
 
 
 class FullWikiRetriever:
