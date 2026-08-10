@@ -1,0 +1,45 @@
+flowchart LR
+    Q["HotpotQA question"]
+
+    subgraph Shared["Shared retrieval stack"]
+        BM25["Lucene BM25<br/>top 50"]
+        Dense["BGE dense + FAISS<br/>top 50"]
+        RRF["Reciprocal Rank Fusion<br/>k = 60"]
+        Hydrate["Hydrate top 15"]
+        PageCE["BGE page-level reranker<br/>15 query-page pairs"]
+    end
+
+    Q --> BM25
+    Q --> Dense
+    BM25 --> RRF
+    Dense --> RRF
+    RRF --> Hydrate --> PageCE
+
+    subgraph Baseline["Reranked single-pass RAG"]
+        Top7["Top 7 pages"]
+        Context7["All non-empty sentences<br/>from 7 Hotpot intro paragraphs"]
+        OneShot["One Qwen2.5-7B generation"]
+    end
+
+    PageCE --> Top7 --> Context7 --> OneShot
+
+    subgraph Agent["ReAct multi-hop agent"]
+        Current["Current page<br/>local page rank 1"]
+        Top4["Top 4 pages"]
+        SentenceCE["Sentence-level reranking<br/>all non-empty sentences"]
+        Memory["Persistent evidence memory<br/>12 snippets / 6K chars"]
+        Reason["Thought → Action → Observation"]
+        Tools["search[...] / lookup[...]"]
+    end
+
+    PageCE --> Current
+    PageCE --> Top4 --> SentenceCE --> Memory
+    Current --> Reason
+    Memory --> Reason
+    Reason --> Tools
+    Tools -->|"next search"| BM25
+    Tools -->|"lookup current page"| Current
+
+    OneShot --> Output["Answer + supporting facts"]
+    Reason -->|"finish[...] or hop-budget synthesis"| Output
+    Output --> Eval["HotpotQA answer / support / joint EM & F1"]

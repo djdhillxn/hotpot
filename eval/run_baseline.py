@@ -511,7 +511,7 @@ def run_baseline_benchmark(
     print(f"Saved run manifest to: {manifest_path}")
     print(f"Saved execution log file to: {log_file}")
 
-    generate_eval_plots_and_report(results, output_dir=output_dir)
+    generate_eval_plots_and_report(results, output_dir=output_dir, run_label="Reranked Single-Pass RAG Baseline")
 
 
 if __name__ == "__main__":

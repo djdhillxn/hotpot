@@ -1,293 +1,347 @@
-# ReAct Multi-Hop Question Answering Agent (HotpotQA FullWiki)
+# ReAct Multi-Hop Question Answering on HotpotQA FullWiki
 
-A retrieval-and-reasoning project that compares a **single-pass RAG baseline** against a **ReAct (Reason + Act) multi-hop agent** on HotpotQA FullWiki. Both systems use the same frozen `Qwen/Qwen2.5-7B-Instruct` model and the same global Wikipedia retrieval backend; the experimental difference is whether retrieval happens once from the original question or adaptively after each observation.
+A FullWiki multi-hop QA project comparing a **reranked single-pass RAG baseline** with a **ReAct agent** under a controlled retrieval stack. Both systems use the same frozen `Qwen/Qwen2.5-7B-Instruct` reader, the same Lucene BM25 + BGE/FAISS hybrid retrieval backend, and the same `BAAI/bge-reranker-base` page reranker. The key experimental difference is **one-shot evidence acquisition versus adaptive Thought → Action → Observation retrieval**.
+
+No LLM fine-tuning or post-training is used.
+
+## Final Result
+
+Evaluated on all **7,405 HotpotQA FullWiki dev questions**:
+
+| Metric | Reranked RAG | ReAct | Gain |
+| :--- | ---: | ---: | ---: |
+| Answer EM | 40.45 | **46.67** | **+6.23 pp** |
+| Answer F1 | 51.80 | **60.48** | **+8.68 pp** |
+| Supporting Fact EM | 9.66 | **14.91** | **+5.25 pp** |
+| Supporting Fact F1 | 43.97 | **52.25** | **+8.28 pp** |
+| Joint EM | 6.08 | **9.44** | **+3.36 pp** |
+| **Joint F1** | 26.86 | **37.11** | **+10.25 pp** |
+
+The same Joint-F1 gain persists across both major HotpotQA question types:
+
+| Question type | n | Reranked RAG | ReAct | Gain |
+| :--- | ---: | ---: | ---: | ---: |
+| Bridge | 5,918 | 22.71 | **32.94** | **+10.23 pp** |
+| Comparison | 1,487 | 43.38 | **53.71** | **+10.33 pp** |
+
+The quality gain has a systems cost: mean latency increases from **23.64 s** for the single-pass baseline to **64.40 s** for ReAct, while average trajectory length increases from **1.00** to **3.35** actions.
+
+> The final comparison figures and data-driven report are generated from `results.json` and `run_manifest.json` by `eval/compare_results.py`; no result values are hard-coded in the plotting pipeline.
+
+After running the comparison command below, GitHub-ready SVGs are published to `docs/results/`:
+
+- `official_metrics_comparison.svg` — headline official metrics
+- `joint_f1_by_question_type.svg` — bridge/comparison breakdown
+- `evidence_coverage_comparison.svg` — retrieved evidence exposure
+- `paired_outcome_transitions.svg` — rescues versus regressions
+- `quality_cost_tradeoff.svg` — quality/latency tradeoff
+- `react_quality_by_hops.svg` — trajectory-length diagnostic
 
 ---
 
-## Final Benchmark Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Corpus["Shared Retrieval Foundation"]
-        Q["User Question"] --> W["2017 Wikipedia Corpus<br/>(~5M Abstracts)"]
-        W --> BM25["Lucene BM25<br/>(Pyserini)"]
-        W --> BGE["BGE Dense Vectors<br/>(FAISS IVF-PQ)"]
-        BM25 --> RRF["Reciprocal Rank Fusion<br/>(Shared Hybrid Backend)"]
-        BGE --> RRF
+    Q["HotpotQA question"]
+
+    subgraph Shared["Shared retrieval stack"]
+        BM25["Lucene BM25<br/>top 50"]
+        Dense["BGE dense + FAISS<br/>top 50"]
+        RRF["Reciprocal Rank Fusion<br/>k = 60"]
+        Hydrate["Hydrate top 15"]
+        PageCE["BGE page-level reranker<br/>15 query-page pairs"]
     end
 
-    subgraph SinglePass["Single-Pass RAG Baseline"]
-        RRF --> S1["Single Query Pass"]
-        S1 --> LLM1["Frozen Qwen2.5-7B-Instruct<br/>(vLLM / L4 GPU)"]
-        LLM1 --> OUT1["Baseline Answer<br/>& Citations"]
+    Q --> BM25
+    Q --> Dense
+    BM25 --> RRF
+    Dense --> RRF
+    RRF --> Hydrate --> PageCE
+
+    subgraph Baseline["Reranked single-pass RAG"]
+        Top7["Top 7 pages"]
+        Context7["All non-empty sentences<br/>from 7 Hotpot intro paragraphs"]
+        OneShot["One Qwen2.5-7B generation"]
     end
 
-    subgraph ReAct["ReAct Multi-Hop Agent"]
-        RRF <--> LOOP["Adaptive Search &<br/>Lookup Tool Actions"]
-        LOOP <--> MEM["Cross-Encoder Reranked<br/>Evidence Memory"]
-        MEM <--> LLM2["Frozen Qwen2.5-7B-Instruct<br/>(vLLM / L4 GPU)"]
-        LLM2 --> OUT2["ReAct Answer<br/>& Citations"]
-        LLM2 -. "Hop limit reach" .-> FS["Forced<br/>Synthesis"]
-        FS -.-> OUT2
+    PageCE --> Top7 --> Context7 --> OneShot
+
+    subgraph Agent["ReAct multi-hop agent"]
+        Current["Current page<br/>local page rank 1"]
+        Top4["Top 4 pages"]
+        SentenceCE["Sentence-level reranking<br/>all non-empty sentences"]
+        Memory["Persistent evidence memory<br/>12 snippets / 6K chars"]
+        Reason["Thought → Action → Observation"]
+        Tools["search[...] / lookup[...]"]
     end
 
-    subgraph Eval["Shared Official Evaluation"]
-        OUT1 --> EVAL["Official HotpotQA Evaluator<br/>(Answer, Support & Joint F1/EM)"]
-        OUT2 --> EVAL
-    end
+    PageCE --> Current
+    PageCE --> Top4 --> SentenceCE --> Memory
+    Current --> Reason
+    Memory --> Reason
+    Reason --> Tools
+    Tools -->|"next search"| BM25
+    Tools -->|"lookup current page"| Current
+
+    OneShot --> Output["Answer + supporting facts"]
+    Reason -->|"finish[...] or hop-budget synthesis"| Output
+    Output --> Eval["HotpotQA answer / support / joint EM & F1"]
 ```
 
-> [!NOTE]
-> **Core Architectural Principle:** Both systems share the exact same underlying frozen LLM (`Qwen/Qwen2.5-7B-Instruct`) and the exact same dual BM25 + FAISS Hybrid Wikipedia retrieval backend. The experimental difference lies exclusively in the **evidence-acquisition strategy**: static single-pass retrieval vs. dynamic multi-turn ReAct reasoning with Cross-Encoder evidence memory.
->
-> *Active Configuration Hyperparameters:* Single-pass top-7 passages (`baseline_top_k: 7`); ReAct top-40 candidate passages per search (`react_top_k: 40`, `candidate_k: 100`, `rrf_k: 60`), max 20 active memory documents (`max_evidence_documents: 20`), max 7 tool hops (`max_tool_steps: 7`), observation limit of 22,000 characters (`max_observation_chars: 22000`), and Cross-Encoder batch size 32 (`memory_reranker_batch_size: 32`).
+The editable Mermaid source is also stored at [`docs/architecture.mmd`](docs/architecture.mmd).
 
-### Why the HotpotQA Wikipedia abstracts corpus?
+### Shared retrieval stack
 
-HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia articles. The project uses the official October 1, 2017 introductory-paragraph release (`enwiki-20171001-pages-meta-current-withlinks-abstracts.tar.bz2`, MD5 `01edf64cd120ecc03a2745352779514c`) rather than current live Wikipedia. The source sentence segmentation is preserved exactly, so retrieved evidence remains compatible with HotpotQA `[title, sentence_id]` supporting-fact evaluation.
+1. **BM25:** Lucene/Pyserini retrieves top 50 candidates.
+2. **Dense:** `BAAI/bge-base-en-v1.5` + FAISS retrieves top 50 candidates.
+3. **Fusion:** reciprocal-rank fusion with `rrf_k=60`.
+4. **Hydration:** top 15 fused Wikipedia intro documents are loaded with original HotpotQA sentence IDs.
+5. **Page reranking:** `BAAI/bge-reranker-base` scores one full-intro query/page pair for each of the 15 pages.
+
+### Reranked single-pass RAG baseline
+
+The baseline deliberately shares the strong page-level retrieval/reranking stack with ReAct:
+
+- one retrieval from the original question;
+- page-level BGE reranking over 15 hydrated pages;
+- top 7 pages passed to the reader;
+- every non-empty sentence from each stored HotpotQA intro paragraph is exposed with its original `[title, sentence_id]`;
+- one Qwen generation;
+- no sentence reranker, memory, lookup, second search, or iterative reasoning.
+
+This makes the baseline a controlled **RAG + reranking** comparator rather than a straw-man retrieval system.
+
+### ReAct agent
+
+For every `search[...]` action:
+
+1. retrieve/fuse/hydrate using the shared stack;
+2. page-rerank all 15 candidates **locally for the current query**;
+3. establish one current page for ReAct navigation;
+4. exhaustively sentence-rerank every non-empty sentence in exactly the top 4 pages;
+5. update a bounded persistent evidence memory of at most **12 snippets / 6,000 characters**;
+6. let the next Thought choose `search[...]`, `lookup[...]`, or `finish[...]`.
+
+Important invariants:
+
+- Cross-encoder logits are **never compared across different search queries**.
+- Persistent evidence memory can never change which page `lookup[...]` operates on.
+- `lookup[...]` always searches the current page selected by the latest search.
+- Sentence scores select evidence snippets but do not feed back into page ranking.
+- All original HotpotQA sentence IDs are preserved.
+- Maximum tool budget is 7 actions; a final synthesis call prevents empty termination at the budget.
 
 ---
 
-## Core Components & Engineering Safeguards
+## Dataset and Retrieval Corpus
 
-- **Frozen LLM:** `Qwen/Qwen2.5-7B-Instruct`, served through local vLLM on an NVIDIA L4. No LLM fine-tuning or post-training.
-- **Sparse retrieval:** Lucene BM25 through Pyserini/Anserini (pins `pyserini==1.6.0` requiring Java 21).
-- **Dense retrieval:** `BAAI/bge-base-en-v1.5`, L2-normalized embeddings, persisted in a memory-efficient FAISS IVF-PQ index (`IVF4096,PQ96x8`, `nprobe=32`). Corpus encoding is performed once during index construction; benchmark-time query encoding runs on CPU so it does not compete with vLLM for GPU VRAM.
-- **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings.
-- **Retrieval protocol:**
-  - **Single-Pass RAG Baseline:** Retrieves top 7 passages once from the original question (1 generation pass).
-  - **ReAct Multi-Hop Agent:** Retrieves top 40 passages per `search[...]` turn (`candidate_k: 100`, `rrf_k: 60`). Every unique retrieved document enters a per-question archive, is scored once against the original question by `BAAI/bge-reranker-base` (Sentence-Level Max-Scoring), and the 20 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
-  - **Shared Index:** Both systems query the exact same pre-built hybrid index (`indexes/fullwiki/`). Zero index rebuild required.
-- **Qwen Prompting & ChatML System Structuring:**
-  - Formatted as structured `[SystemMessage(...), HumanMessage(...)]` objects passed to `llm.invoke()`, forcing vLLM to format context using Qwen's native `<|im_start|>system...` ChatML template.
-  - Includes standard HotpotQA Few-Shot exemplars demonstrating `Action: finish[canonical answer]`, `lookup[keyword]`, AND sentence-level citations `Support: [["Title", sentence_id], ...]`, enabling high Joint F1 scores.
-- **Hard Generation Stop Sequences:** `stop=["\nObservation:", "Observation:"]` is explicitly bound on model invocations in `agent/engine.py`. This guarantees vLLM cuts off generation immediately after `Action: ...`, preventing Qwen from self-hallucinating Wikipedia observations.
-- **Generation Constraints & Repetition Guard:** `max_tokens = 150` prevents runaway monologues. Consecutive duplicate searches are guarded, while repeated `lookup[keyword]` calls are allowed because classic ReAct uses them to advance through successive matches on the current page.
-- **Classic Current-Page Lookup:** `lookup[keyword]` searches only the current rank-1 page selected by the latest search. Repeating the same lookup advances to the next matching sentence on that same page, mirroring the original ReAct Wikipedia environment.
-- **Evidence Memory Reranker (`BAAI/bge-reranker-base`):** Uses BAAI's 110M parameter Cross-Encoder for high-precision semantic evidence ranking with Sentence-Level Max-Scoring. To run the reranker on GPU alongside vLLM, launch vLLM with `--gpu-memory-utilization 0.85` to reserve headroom for PyTorch CUDA context.
-- **ReAct controller:** LangGraph state machine enforcing Thought -> Action -> Observation, with delimiter-safe action parsing, markdown codeblock stripping (`replace("```", "")`), and a mandatory final synthesis call at the hop budget.
-- **Official-compatible evaluation:** Answer EM/F1, Supporting Fact EM/F1, Joint EM/F1, and evaluator-format `official_predictions.json`.
-- **Structured experiment artifacts:** complete trajectories, raw model outputs, sentence-level evidence, sparse/dense/fused ranks and scores, retrieval latency, run manifests, failures, and evidence graphs.
+The reported experiment uses HotpotQA's **FullWiki** setting and the official October 1, 2017 Wikipedia introductory-paragraph archive:
+
+`enwiki-20171001-pages-meta-current-withlinks-abstracts.tar.bz2`
+
+The project preserves the source sentence segmentation and 0-based sentence IDs so predicted supporting facts remain compatible with the official HotpotQA evaluator.
+
+The final index contains approximately **5.23 million** Wikipedia intro documents:
+
+- Lucene BM25 through Pyserini/Anserini;
+- BGE dense embeddings (`BAAI/bge-base-en-v1.5`, 768-D);
+- FAISS IVF-PQ (`IVF4096,PQ96x8`, `nprobe=32`);
+- reciprocal-rank fusion over sparse and dense rankings.
+
+Dense corpus encoding is performed once during index construction. Benchmark-time dense query encoding runs on CPU so the L4 can be shared by vLLM and the page/sentence cross-encoder.
 
 ---
 
-## End-to-End Execution Guide on GCE L4
+## Evaluation
 
-Target machine: `g2-standard-8`, NVIDIA L4 (24 GB), 32 GB system RAM, Ubuntu 22.04.
+Both final runs use:
 
-### Step 1: Create or Update the Environment
+- **dataset:** official HotpotQA FullWiki dev, 7,405 questions;
+- **reader:** `Qwen/Qwen2.5-7B-Instruct`;
+- **serving:** vLLM;
+- **concurrency:** 64;
+- **retrieval:** BM25 top-50 + dense top-50 + RRF;
+- **page reranker:** `BAAI/bge-reranker-base`;
+- **failures:** 0 in both final runs.
 
-Fresh environment:
+Official HotpotQA formulas are used for:
+
+- Answer EM / F1
+- Supporting Fact EM / F1
+- Joint EM / F1
+
+The project also records clearly labeled diagnostics that are **not** official leaderboard metrics:
+
+- supporting-document F1;
+- observed gold-document recall;
+- observed gold supporting-fact recall;
+- percentage of questions for which all gold supporting facts were exposed to the model.
+
+### Final post-processing command
+
+After `eval_results/baseline/` and `eval_results/react/` contain their final `results.json` and `run_manifest.json` files:
 
 ```bash
-git clone https://github.com/your-username/hotpot.git
-cd hotpot
+python eval/compare_results.py \
+  --baseline eval_results/baseline/results.json \
+  --react eval_results/react/results.json \
+  --output-dir eval_results/comparison \
+  --publish-dir docs/results
+```
+
+The script first performs strict comparability checks. It refuses to generate a report if the two runs disagree on question IDs, question/gold content, dataset, model, concurrency, corpus hash, BM25/dense corpus size, hybrid retrieval parameters, or page-reranker configuration.
+
+It then generates:
+
+```text
+eval_results/comparison/
+├── comparison.log
+├── comparison_report.md
+├── comparison_summary.json
+├── official_metrics_comparison.{png,svg}
+├── joint_f1_by_question_type.{png,svg}
+├── evidence_coverage_comparison.{png,svg}
+├── paired_outcome_transitions.{png,svg}
+├── quality_cost_tradeoff.{png,svg}
+└── react_quality_by_hops.{png,svg}
+```
+
+Trackable publication artifacts are copied automatically to:
+
+```text
+docs/results/
+├── comparison_report.md
+├── comparison_summary.json
+├── official_metrics_comparison.svg
+├── joint_f1_by_question_type.svg
+├── evidence_coverage_comparison.svg
+├── paired_outcome_transitions.svg
+├── quality_cost_tradeoff.svg
+└── react_quality_by_hops.svg
+```
+
+The final Markdown report includes the experimental-validity table, official metric deltas in **percentage points**, question-type analysis, evidence acquisition diagnostics, paired rescue/regression counts, latency percentiles, reranker workload, and ReAct quality by trajectory length.
+
+---
+
+## End-to-End Reproduction on GCE L4
+
+Target used for the final experiment: NVIDIA L4 (24 GB), 32 GB system RAM, Ubuntu 22.04.
+
+### 1. Environment
+
+```bash
 conda env create -f environment.yml
 conda activate hotpot
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
-If updating an existing environment:
+For an existing environment:
 
 ```bash
-conda activate hotpot
 conda env update -f environment.yml --prune
+conda activate hotpot
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
-Verify runtime:
+### 2. Build the FullWiki index
 
 ```bash
-python --version
-java -version
+python retrieval/build_fullwiki_index.py
 ```
 
-### Step 2: Build Global FullWiki Retrieval Indexes & Hyperlink Graph (Done Once)
+The build verifies the official archive checksum, preserves sentence IDs, builds Lucene BM25 and FAISS dense indexes, and writes `indexes/fullwiki/manifest.json`.
 
-Do this **before launching vLLM**, because the one-time BGE corpus encoding uses the L4 GPU.
+Optional hyperlink-graph infrastructure remains available for separate experiments:
 
 ```bash
-# 1. Build Lucene BM25 and BGE FAISS Hybrid Indexes:
-python retrieval/build_fullwiki_index.py
-
-# 2. Build Precision Hyperlink Graph SQLite Database & Indexes:
 python tools/build_hyperlink_graph.py --output-dir indexes/fullwiki
 ```
 
-This commands:
-1. downloads the official HotpotQA Wikipedia intro archive if needed;
-2. verifies its official MD5 checksum (`01edf64cd120ecc03a2745352779514c`);
-3. streams the archive into sharded JSONL without materializing an expanded Wikipedia dump;
-4. preserves every source sentence and its 0-based sentence ID;
-5. builds a Lucene BM25 index with stored raw documents;
-6. encodes the corpus with `BAAI/bge-base-en-v1.5`;
-7. builds a FAISS IVF-PQ dense index;
-8. extracts Wikipedia HTML hyperlinks `<a href="...">` with sentence IDs, anchor text, target titles, and outdegree statistics into a high-performance SQLite database (`indexes/fullwiki/hyperlink_graph.db`) with case-insensitive `COLLATE NOCASE` indexes;
-9. verifies Lucene/FAISS/Graph document counts; and
-10. writes `indexes/fullwiki/manifest.json` with the exact corpus/index configuration.
+**Graph expansion is disabled in the reported final ReAct benchmark.**
 
-> [!TIP]
-> **What does `--force` do?**
-> By default, `python tools/build_hyperlink_graph.py` checks if `hyperlink_graph.db`, `title_graph.json`, and `title_to_doc_id.json` already exist in `--output-dir`. If present, it skips re-processing to save time (~2 min). Passing `--force` deletes existing graph files and forces a full re-extraction from the source Wikipedia archive.
-
-The build is idempotent. Existing verified stages are reused unless `--force` or `--force-*` is supplied.
-
-### Precision Hyperlink Graph Candidate Expansion
-
-When `--enable-graph-expansion` is passed to `run_eval.py` (or `use_graph_expansion: true` in `config/fullwiki.yaml`), the ReAct agent dynamically expands 1-hop outgoing links to discover bridge entities that lack direct word overlap with the original query.
-
-- **Focus Pages**: Outgoing edges are expanded strictly from the current search page (`current_title`) and top 1-2 active memory pages, avoiding noisy multi-document fan-outs.
-- **Multi-Signal Candidate Ranking**: Edges are scored using:
-  $$\text{Score} = 2.0 \times \text{SourceSentScore} + 1.5 \times \text{AnchorOverlap} + 1.0 \times \text{TitleOverlap} - 0.3 \times \log(1 + \text{TargetOutDegree})$$
-- **Automatic IDF Outdegree Penalty**: $-\log(1 + \text{TargetOutDegree})$ automatically penalizes generic high-outdegree hubs (e.g. `United States`, `Film`) without hard-coded stop lists.
-- **Quota & Logging**: Capped at **top 10 precision candidates**, with edge metadata logged in `last_result["graph_expansion_info"]`.
-
-### Step 3: Verify FullWiki Retrieval Before Spending LLM Compute
-
-Run a first-stage retrieval sanity check over validation questions:
+### 3. Retrieval sanity check
 
 ```bash
 python retrieval/evaluate_retrieval.py \
-    --source official_json \
-    --modes bm25 dense hybrid \
-    --ks 1 5 6 10 20
+  --source official_json \
+  --modes bm25 dense hybrid \
+  --ks 1 5 10 15 20
 ```
 
-Reports mean gold-document Recall@K and full recovery rates for BM25, dense, and hybrid retrieval, saving outputs to `eval_results/retrieval/retrieval_results.json`.
-
-For a quick 100-sample smoke run:
-
-```bash
-python retrieval/evaluate_retrieval.py --source official_json --samples 100
-```
-
-### Step 4: Launch Local Qwen/vLLM Server
+### 4. Launch Qwen/vLLM
 
 ```bash
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --dtype bfloat16 \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 8192
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 8192
 ```
 
-Wait for `Application startup complete` on `http://localhost:8000/v1`.
-
-### Step 5: Run Unit Tests
+### 5. Tests
 
 ```bash
 PYTHONPATH=. pytest tests/
 ```
 
-### Step 6: Pre-Cache Evidence Reranker & Pre-Flight Verification
-
-> [!NOTE]
-> **Baseline Confirmation**: If you already ran the baseline evaluation on GCE with `top_k=7`, **you do NOT need to re-run the baseline**. The baseline code is completely unchanged and your previous baseline `results.json` remains 100% valid.
-
-Before launching the full 64-worker ReAct benchmark, pre-download and cache the BAAI Cross-Encoder weights locally to avoid thread race conditions during HuggingFace download:
+### 6. Final reranked RAG baseline
 
 ```bash
-# 1. Pre-cache BAAI Cross-Encoder Reranker model:
-python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-base'); print('BGE Cross-Encoder model successfully cached!')"
-
-# 2. Run 5-Sample ReAct Smoke Test with YAML config:
-python eval/run_eval.py \
-    --config config/fullwiki.yaml \
-    --source official_json \
-    --samples 5 \
-    --concurrency 4 \
-    --output-dir eval_results/test_reranker
+python eval/run_baseline.py \
+  --config config/fullwiki.yaml \
+  --source official_json \
+  --concurrency 64 \
+  --output-dir eval_results/baseline
 ```
 
-Inspect `eval_results/test_reranker/trajectories.json` to confirm:
-- `memory_reranker` model is loaded and scoring passages cleanly.
-- `active_memory_documents` retains top-20 cross-encoder scored passages.
-- `rank1_in_active_memory` is `true` for rank-1 search pages, maintaining `lookup` functionality.
-- `finish[answer]` extracts canonical short answers and valid `Support: [...]` citations.
-
-### Step 7: Execute Full 7,405 Evaluation Benchmark
+### 7. Final ReAct benchmark
 
 ```bash
-# 1. Standard ReAct Multi-Hop Agent (Concurrent 64 Workers):
 python eval/run_eval.py \
-    --config config/fullwiki.yaml \
-    --source official_json \
-    --concurrency 64 \
-    --disable-graph-expansion \
-    --output-dir eval_results/react_standard
-
-# 2. Precision Graph-Enhanced ReAct Multi-Hop Agent (Concurrent 64 Workers):
-python eval/run_eval.py \
-    --config config/fullwiki.yaml \
-    --source official_json \
-    --concurrency 64 \
-    --enable-graph-expansion \
-    --output-dir eval_results/react_graph
+  --config config/fullwiki.yaml \
+  --source official_json \
+  --concurrency 64 \
+  --disable-graph-expansion \
+  --output-dir eval_results/react
 ```
 
-### Step 8: Generate Baseline vs. ReAct Comparative Analysis
+### 8. Final comparison and publication artifacts
 
 ```bash
 python eval/compare_results.py \
-    --baseline eval_results/baseline/results.json \
-    --react eval_results/react/results.json \
-    --output-dir eval_results/comparison
+  --baseline eval_results/baseline/results.json \
+  --react eval_results/react/results.json \
+  --output-dir eval_results/comparison \
+  --publish-dir docs/results
 ```
 
-Each benchmark directory contains:
-
-```text
-results.json
-trajectories.json
-official_predictions.json
-official_gold.json
-run_manifest.json
-run.log
-```
-
-The ReAct trajectory for every retrieval step retains:
-- generated search query;
-- BM25 rank/score;
-- dense rank/score;
-- fused rank/score;
-- complete raw top-40 retrieval candidates, the full unique-document archive count, cross-encoder scores, the active top-20 memory, and documents added/evicted after each search;
-- sparse/dense/fused ranks and scores for every retrieved candidate;
-- duplicate-query status, query/title-match diagnostic, evidence-memory/archive counts, rank-1 retention status, and memory/observation omissions;
-- exact exposed Wikipedia titles and sentence IDs;
-- retrieval latency by sparse/dense/fusion component;
-- raw Qwen response;
-- parsed Thought/Action;
-- Observation;
-- predicted/invalid supporting-fact citations; and
-- final answer/evidence graph.
-
-Check predictions with HotpotQA's official evaluator:
+Optional: verify evaluator-format predictions independently:
 
 ```bash
 python hotpot_evaluate_v1.py \
-    eval_results/react/official_predictions.json \
-    eval_results/react/official_gold.json
-```
-
-### Step 9: Launch Interactive Web Dashboard UI
-
-```bash
-streamlit run app/web_ui.py --server.port 8501 --server.address 0.0.0.0
+  eval_results/react/official_predictions.json \
+  eval_results/react/official_gold.json
 ```
 
 ---
 
-## Retrieval Modes
+## Key Implementation Safeguards
 
-The benchmark runners support three modes:
-
-- `offline`: searches only the 10 candidate paragraphs bundled with each FullWiki dev example; useful for tests/debugging, not the final global-retrieval experiment.
-- `fullwiki`: searches the global HotpotQA Wikipedia index; this is the primary benchmark mode.
-- `live`: current Wikipedia API; qualitative only because current Wikipedia sentence boundaries do not match HotpotQA's 2017 supporting-fact IDs.
-
-Within `fullwiki`, `--retriever` can be `bm25`, `dense`, or `hybrid`. The primary reported experiment uses `hybrid`.
+- Native ChatML message structure for Qwen.
+- Hard generation stop sequences at `Observation:` to prevent the model from inventing tool outputs.
+- Robust action parser preserving parentheses inside `search[...]` / `lookup[...]` payloads.
+- Consecutive duplicate-search guard.
+- Forced final synthesis at the hop budget.
+- Query-local page reranking instead of cross-query score accumulation.
+- Current-page navigation strictly separated from persistent evidence memory.
+- Sentence-level evidence memory with original HotpotQA sentence IDs.
+- Shared cross-worker cross-encoder batching for efficient GPU inference.
+- Run manifests containing exact corpus/index/model/configuration metadata.
+- Final comparison validation that fails closed on mismatched experiments.
 
 ---
 
@@ -296,35 +350,32 @@ Within `fullwiki`, `--retriever` can be `bm25`, `dense`, or `hybrid`. The primar
 ```text
 hotpot/
 ├── agent/
-│   ├── baseline_rag.py           # Single-pass RAG pipeline
-│   ├── engine.py                 # LangGraph state machine with stop sequence & repetition guards
-│   ├── parser.py                 # Flexible action parser (whitespace/case/markdown resilient)
-│   ├── prompt.py                 # ChatML system prompt & HotpotQA exemplars with Support lines
-│   └── state.py                  # Trajectory state definitions
+│   ├── baseline_rag.py
+│   ├── engine.py
+│   ├── parser.py
+│   ├── prompt.py
+│   └── state.py
 ├── retrieval/
-│   ├── __init__.py
-│   ├── corpus.py                 # Official archive download & streaming conversion
-│   ├── build_fullwiki_index.py   # BM25 + BGE/FAISS index construction
-│   ├── fullwiki_retriever.py     # Hybrid BM25+BGE search backend & multi-hit lookup
-│   └── evaluate_retrieval.py     # Recall@K sanity benchmark
-├── tools/
-│   ├── wikipedia.py              # Live API qualitative fallback
-│   └── local_retriever.py        # Candidate-pool retriever for offline mode
+│   ├── build_fullwiki_index.py
+│   ├── corpus.py
+│   ├── evaluate_retrieval.py
+│   ├── fullwiki_retriever.py
+│   └── reranker.py
 ├── eval/
-│   ├── artifacts.py              # Trajectory logging & manifest generation
-│   ├── compare_results.py        # Baseline vs ReAct delta evaluation
-│   ├── dataset.py                # HuggingFace & official JSON dataset loader
-│   ├── metrics.py                # Official HotpotQA tokenization & Joint F1 score computation
-│   ├── plot_results.py           # Performance & hop-distribution visualization
-│   ├── run_baseline.py           # Single-pass RAG concurrent runner
-│   └── run_eval.py               # ReAct agent concurrent runner
-├── app/
-│   └── web_ui.py                 # Interactive Streamlit dashboard
-├── portfolio/                    # Saved analysis reports & visualizations
+│   ├── artifacts.py
+│   ├── compare_results.py
+│   ├── dataset.py
+│   ├── metrics.py
+│   ├── plot_results.py
+│   ├── run_baseline.py
+│   └── run_eval.py
+├── docs/
+│   └── architecture.mmd
+├── portfolio/
 ├── tests/
-│   ├── test_agent.py
-│   └── test_retrieval.py
-├── config.py                     # Environment variables & default hyperparameters
+├── config/
+│   └── fullwiki.yaml
+├── config.py
 ├── environment.yml
 ├── requirements.txt
 └── README.md
@@ -332,33 +383,9 @@ hotpot/
 
 ---
 
-## Troubleshooting
+## Final Takeaway
 
-### Pyserini / Java error
-
-```bash
-java -version
-```
-
-The project expects Java 21. If the current environment was created before the retrieval upgrade:
-
-```bash
-conda env update -f environment.yml --prune
-conda activate hotpot
-```
-
-### `RuntimeError: Could not find nvcc` from vLLM
-
-The optimized non-eager vLLM path may JIT-compile CUDA kernels. Install a CUDA toolkit/compiler compatible with the PyTorch CUDA build, then ensure `nvcc` is discoverable via `PATH`/`CUDA_HOME` before starting vLLM. `--enforce-eager` remains a fallback for debugging.
-
-### `CXXABI` / `libstdc++` error
-
-```bash
-conda install -n hotpot -c conda-forge libstdcxx-ng sysroot_linux-64 -y
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-```
-
----
+With the reader and first-stage retrieval/reranking stack held fixed, adaptive ReAct retrieval improves **Joint F1 by 10.25 percentage points** over the reranked single-pass baseline on the complete 7,405-question HotpotQA FullWiki dev set. The improvement appears in both bridge and comparison questions and is accompanied by higher observed gold-evidence coverage, at the explicit cost of additional tool calls and approximately 2.7× mean latency.
 
 ## License
 

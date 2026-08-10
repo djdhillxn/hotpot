@@ -3,7 +3,7 @@ import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def generate_eval_plots_and_report(results, output_dir="eval_results"):
+def generate_eval_plots_and_report(results, output_dir="eval_results", run_label="ReAct Agent"):
     os.makedirs(output_dir, exist_ok=True)
 
     if not results:
@@ -28,7 +28,7 @@ def generate_eval_plots_and_report(results, output_dir="eval_results"):
     palette = sns.color_palette("Blues_d", len(metrics_names))
     bars = plt.bar(metrics_names, metrics_values, color=palette)
 
-    plt.title("HotpotQA FullWiki ReAct Agent Performance (%)", fontsize=14, fontweight="bold")
+    plt.title(f"HotpotQA FullWiki {run_label} Performance (%)", fontsize=14, fontweight="bold")
     plt.ylabel("Score (%)", fontsize=12)
     plt.ylim(0, 105)
     plt.grid(axis="y", linestyle="--", alpha=0.7)
@@ -49,24 +49,26 @@ def generate_eval_plots_and_report(results, output_dir="eval_results"):
     plt.savefig(chart_path, dpi=300)
     plt.close()
 
-    # 2. Histogram of ReAct Hop Steps
-    plt.figure(figsize=(7, 4))
+    # 2. Hop histogram is only useful for genuinely multi-hop runs.
     step_counts = [r["step_count"] for r in results]
-    plt.hist(step_counts, bins=range(1, max(step_counts) + 2), align="left", rwidth=0.8, color="#2b5c8f", edgecolor="black")
-    plt.title("Distribution of ReAct Reasoning Hops per Question", fontsize=13, fontweight="bold")
-    plt.xlabel("Number of Hops", fontsize=11)
-    plt.ylabel("Frequency", fontsize=11)
-    plt.grid(axis="y", linestyle="--", alpha=0.5)
+    hop_chart_path = None
+    if max(step_counts) > 1:
+        plt.figure(figsize=(7, 4))
+        plt.hist(step_counts, bins=range(1, max(step_counts) + 2), align="left", rwidth=0.8, color="#2b5c8f", edgecolor="black")
+        plt.title(f"Distribution of {run_label} Reasoning Hops per Question", fontsize=13, fontweight="bold")
+        plt.xlabel("Number of Hops", fontsize=11)
+        plt.ylabel("Frequency", fontsize=11)
+        plt.grid(axis="y", linestyle="--", alpha=0.5)
 
-    plt.tight_layout()
-    hop_chart_path = os.path.join(output_dir, "hop_distribution.png")
-    plt.savefig(hop_chart_path, dpi=300)
-    plt.close()
+        plt.tight_layout()
+        hop_chart_path = os.path.join(output_dir, "hop_distribution.png")
+        plt.savefig(hop_chart_path, dpi=300)
+        plt.close()
 
     # 3. Generate Markdown Report
     report_path = os.path.join(output_dir, "evaluation_report.md")
     with open(report_path, "w") as f:
-        f.write("# HotpotQA FullWiki ReAct Agent Evaluation Report\n\n")
+        f.write(f"# HotpotQA FullWiki {run_label} Evaluation Report\n\n")
         f.write(f"**Total Questions Evaluated**: {total_count}\n")
         f.write(f"**Average Latency**: {avg_latency:.2f}s per question\n")
         f.write(f"**Average Trajectory Hops**: {avg_steps:.2f} steps\n\n")
@@ -84,14 +86,15 @@ def generate_eval_plots_and_report(results, output_dir="eval_results"):
 
         f.write("## Evaluation Visualizations\n\n")
         f.write(f"![Benchmark Metrics]({os.path.basename(chart_path)})\n\n")
-        f.write(f"![Hop Distribution]({os.path.basename(hop_chart_path)})\n\n")
+        if hop_chart_path:
+            f.write(f"![Hop Distribution]({os.path.basename(hop_chart_path)})\n\n")
 
         f.write("## Sample Question Predictions\n\n")
         for i, r in enumerate(results[:5], 1):
             f.write(f"### Sample {i}\n")
             f.write(f"- **Question**: {r['question']}\n")
             f.write(f"- **Ground Truth**: {r['gold_answer']}\n")
-            f.write(f"- **Agent Prediction**: {r['pred_answer']}\n")
+            f.write(f"- **Prediction**: {r['pred_answer']}\n")
             f.write(f"- **Exact Match**: {'PASS' if r['exact_match'] else 'FAIL'}\n")
             f.write(f"- **Joint F1**: {r['joint_f1']:.2f}\n")
             f.write(f"- **Steps**: {r['step_count']}\n\n")

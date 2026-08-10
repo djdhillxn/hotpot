@@ -584,7 +584,7 @@ def run_benchmark(
     print(f"Saved execution log file to: {log_file}")
     print(f"Exported portfolio trajectories to: {portfolio_json_path}")
 
-    generate_eval_plots_and_report(results, output_dir=output_dir)
+    generate_eval_plots_and_report(results, output_dir=output_dir, run_label="ReAct Agent")
 
 
 from config import (
