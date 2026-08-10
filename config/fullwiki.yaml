@@ -11,7 +11,7 @@ evaluation_split: "validation"
 # First-Stage FullWiki Retrieval Settings
 retrieval_mode: "fullwiki"
 retriever: "hybrid"
-candidate_k: 100
+candidate_k: 50
 rrf_k: 60
 
 # Single-Pass Baseline Hyperparameters
@@ -19,9 +19,11 @@ baseline_top_k: 7
 
 # ReAct Multi-Hop Agent Hyperparameters
 max_tool_steps: 7
-react_top_k: 40
-max_evidence_documents: 20
-max_observation_chars: 22000
+react_top_k: 15
+local_rerank_page_count: 4
+max_evidence_snippets: 12
+max_evidence_chars: 6000
+max_observation_chars: 6000
 use_graph_expansion: false
 graph_focus_doc_count: 2
 graph_candidate_quota: 10
@@ -30,8 +32,8 @@ graph_weight_anchor_overlap: 1.5
 graph_weight_title_overlap: 1.0
 graph_weight_outdegree_penalty: 0.3
 
-# ReAct Cross-Encoder Evidence Memory Reranker (CUDA Execution)
-memory_reranker_model: "BAAI/bge-reranker-base"
-memory_reranker_device: "cuda"
-memory_reranker_max_length: 512
-memory_reranker_batch_size: 32
+# ReAct Query-Local Cross-Encoder Reranker (CUDA Execution)
+local_reranker_model: "BAAI/bge-reranker-base"
+local_reranker_device: "cuda"
+local_reranker_max_length: 512
+local_reranker_batch_size: 32

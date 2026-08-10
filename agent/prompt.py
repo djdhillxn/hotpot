@@ -1,8 +1,8 @@
 REACT_SYSTEM_PROMPT = """Solve a multi-step, multi-hop question-answering task by alternating between Thought, Action, and Observation.
 
 You have access to the following tools:
-(1) search[query]: Retrieves the top FullWiki candidates and updates a bounded, cross-encoder-reranked Active Evidence Memory. The system shows that current memory separately on every turn.
-(2) lookup[keyword]: Searches ONLY the currently loaded rank-1 page, when that page is retained in Active Evidence Memory, and returns the next sentence containing the keyword. Repeating the same lookup advances to the next match on that same page.
+(1) search[query]: Runs FullWiki retrieval, locally cross-encoder-reranks the current search candidates, selects exactly one current page, and updates a bounded sentence-level Active Evidence Memory. The system shows that memory separately on every turn.
+(2) lookup[keyword]: Searches ONLY the current page selected by the most recent successful search and returns the next sentence containing the keyword. Lookup is independent of Active Evidence Memory. Repeating the same lookup advances to the next match on that same page.
 (3) finish[answer]: Ends the task and provides the final concise answer based ONLY on observed evidence.
 
 STRICT FORMATTING RULES:
@@ -24,7 +24,7 @@ FINAL ANSWER RULES:
 
 DO NOT write "Observation:" yourself. The system provides the Observation after search/lookup.
 DO NOT hallucinate facts or supporting evidence.
-Active Evidence Memory is the current persistent evidence set; later searches may replace weaker documents with stronger ones. Base reasoning on the current memory plus any explicit lookup observations in the history.
+Active Evidence Memory is a bounded persistent set of sentence snippets gathered across searches and lookups. It does not determine the current page. Base reasoning on the current memory plus the explicit search/lookup observations in the history.
 When Active Evidence Memory or an Observation contains labels such as [Albert Einstein | sent 1], the integer is the exact HotpotQA sentence ID for that page.
 For Support, cite ONLY sentence labels that were actually observed, copy the Wikipedia title exactly, and include every sentence needed to justify the answer.
 If no observed sentence supports the answer, return Support: [] rather than inventing evidence.

@@ -2,18 +2,30 @@ import bz2
 import io
 import json
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
 
-try:
-    import pytest
-except ImportError:
-    class FakePytest:
-        @staticmethod
-        def approx(val, abs=1e-6):
-            return val
-    pytest = FakePytest()
+import pytest
 
 from retrieval.corpus import iter_hotpot_intro_records, normalize_intro_record
-from retrieval.fullwiki_retriever import FullWikiRetriever, reciprocal_rank_fusion
+from retrieval.fullwiki_retriever import (
+    FullWikiRetriever,
+    FullWikiSearchBackend,
+    reciprocal_rank_fusion,
+)
+
+
+def _hit(doc_id, title, sentences, rank=1):
+    return {
+        "doc_id": str(doc_id),
+        "title": title,
+        "rank": int(rank),
+        "bm25_rank": int(rank),
+        "bm25_score": float(20 - rank),
+        "dense_rank": int(rank),
+        "dense_score": 1.0 / rank,
+        "fused_score": 1.0 / (60 + rank),
+        "sentences": list(sentences),
+    }
 
 
 def test_normalize_intro_record_preserves_sentence_ids_and_title():
@@ -74,71 +86,52 @@ def test_reciprocal_rank_fusion_combines_sparse_and_dense_rankings():
     assert fused[1]["doc_id"] == "1"
 
 
-class FakeBackend:
-    def search(self, query, top_k=1):
-        hits = [
-            {
-                "doc_id": "10",
-                "title": "Scott Derrickson",
-                "rank": 1,
-                "bm25_rank": 1,
-                "bm25_score": 12.0,
-                "dense_rank": 2,
-                "dense_score": 0.8,
-                "fused_score": 0.03,
-                "sentences": [
-                    "Scott Derrickson is an American filmmaker.",
-                    "He was born in Denver, Colorado.",
-                ],
-            },
-            {
-                "doc_id": "11",
-                "title": "Ed Wood",
-                "rank": 2,
-                "bm25_rank": 3,
-                "bm25_score": 8.0,
-                "dense_rank": 1,
-                "dense_score": 0.9,
-                "fused_score": 0.029,
-                "sentences": ["Edward D. Wood Jr. was an American filmmaker."],
-            },
-        ]
-        return {
-            "query": query,
-            "mode": "hybrid",
-            "candidate_k": 20,
-            "top_k": top_k,
-            "hits": hits[:top_k],
-            "latency_ms": {"bm25": 2.0, "dense": 4.0, "fusion": 0.1, "total": 6.1},
-        }
+class RecordingReranker:
+    def __init__(self):
+        self.max_length = 512
+        self.calls = []
+
+    def score_pairs(self, pairs):
+        pairs = list(pairs)
+        self.calls.append(pairs)
+        return [float(index + 1) for index in range(len(pairs))], 0.001
+
+    def describe(self):
+        return {"model": "recording-reranker", "device": "cpu"}
 
 
-def test_fullwiki_session_returns_multiple_ranked_documents_with_exact_sentence_ids():
-    retriever = FullWikiRetriever(FakeBackend(), search_top_k=2, max_observation_chars=4000)
-    observation = retriever.search("Scott Derrickson Ed Wood")
+def test_backend_page_stage_uses_one_full_intro_pair_and_sentence_stage_scores_all_nonempty_ids():
+    backend = FullWikiSearchBackend.__new__(FullWikiSearchBackend)
+    backend.local_reranker = RecordingReranker()
 
-    assert "[Scott Derrickson | sent 0]" in observation
-    assert "[Scott Derrickson | sent 1]" in observation
-    assert "[Ed Wood | sent 0]" in observation
-    assert retriever.visited_pages == ["Scott Derrickson", "Ed Wood"]
-    assert len(retriever.last_result["hits"]) == 2
-    assert retriever.last_result["hits"][1]["dense_rank"] == 1
-    assert retriever.current_page_title == "Scott Derrickson"
-
-    lookup = retriever.lookup("Denver")
-    assert "[Scott Derrickson | sent 1]" in lookup
-    assert retriever.last_result["sentences"] == [
-        {"sent_id": 1, "text": "He was born in Denver, Colorado."}
+    documents = [
+        _hit("1", "First", ["Opening.", "", "Middle.", "Final evidence."], rank=1),
+        _hit("2", "Second", ["Only sentence."], rank=2),
     ]
+    page_scores, _, _ = backend.score_page_documents("Question context", documents)
+
+    assert len(page_scores) == 2
+    page_pairs = backend.local_reranker.calls[0]
+    assert len(page_pairs) == 2
+    assert "Opening. Middle. Final evidence." in page_pairs[0][1]
+    assert page_pairs[0][1].startswith("First\n")
+
+    scores_by_doc, _, pair_count = backend.score_document_sentences(
+        "Question context", [documents[0]]
+    )
+    sentence_pairs = backend.local_reranker.calls[1]
+    assert pair_count == 3
+    assert len(sentence_pairs) == 3
+    assert set(scores_by_doc["1"]) == {0, 2, 3}
+    assert sentence_pairs[-1][1] == "First: Final evidence."
 
 
-def test_shared_backend_hybrid_search_hydrates_only_final_top_k():
-    from retrieval.fullwiki_retriever import FullWikiSearchBackend
-
+def test_shared_backend_hybrid_search_hydrates_only_requested_top_k():
     backend = FullWikiSearchBackend.__new__(FullWikiSearchBackend)
     backend.mode = "hybrid"
     backend.candidate_k = 3
     backend.rrf_k = 60
+    backend._hybrid_executor = ThreadPoolExecutor(max_workers=1)
     backend._bm25_search = lambda query, k: (
         [{"doc_id": "1", "score": 10.0}, {"doc_id": "2", "score": 9.0}],
         0.001,
@@ -154,7 +147,11 @@ def test_shared_backend_hybrid_search_hydrates_only_final_top_k():
     }
     backend._parse_lucene_doc = lambda doc_id: dict(docs[doc_id])
 
-    result = backend.search("query", top_k=2)
+    try:
+        result = backend.search("query", top_k=2)
+    finally:
+        backend._hybrid_executor.shutdown(wait=True)
+
     assert [hit["doc_id"] for hit in result["hits"]] == ["2", "1"]
     assert result["hits"][0]["bm25_rank"] == 2
     assert result["hits"][0]["dense_rank"] == 1
@@ -162,311 +159,416 @@ def test_shared_backend_hybrid_search_hydrates_only_final_top_k():
     assert result["top_k"] == 2
 
 
-class RollingFakeBackend:
-    def __init__(self):
+class LocalRerankBackend:
+    def __init__(self, searches, page_scores, sentence_scores=None, exact_docs=None):
+        self.searches = searches
+        self.page_scores = page_scores
+        self.sentence_scores = sentence_scores or {}
+        self.exact_docs = {str(k).lower(): dict(v) for k, v in (exact_docs or {}).items()}
         self.calls = []
+        self.page_stage_calls = []
+        self.sentence_stage_calls = []
+        self.local_reranker = RecordingReranker()
 
     def search(self, query, top_k=1):
         self.calls.append(query)
-        base = len(self.calls) * 100
-        hits = []
-        for rank in range(1, top_k + 1):
-            doc_id = str(base + rank)
-            hits.append({
-                "doc_id": doc_id,
-                "title": f"Doc {doc_id}",
-                "rank": rank,
-                "bm25_rank": rank,
-                "bm25_score": float(20 - rank),
-                "dense_rank": rank,
-                "dense_score": 1.0 / rank,
-                "fused_score": 1.0 / (60 + rank),
-                "sentences": [f"Sentence for {doc_id}."],
-            })
+        hits = [dict(hit) for hit in self.searches[query]][:top_k]
         return {
             "query": query,
             "mode": "hybrid",
-            "candidate_k": 20,
+            "candidate_k": 50,
             "top_k": top_k,
             "hits": hits,
-            "latency_ms": {"bm25": 1.0, "dense": 2.0, "fusion": 0.1, "total": 3.1},
+            "latency_ms": {"bm25": 1.0, "dense": 2.0, "fusion": 0.1, "total": 2.1},
         }
 
+    def get_doc_by_title(self, title):
+        doc = self.exact_docs.get(str(title).strip().lower())
+        return dict(doc) if doc else None
 
-def test_react_session_caps_unique_working_evidence_but_logs_full_top_k():
-    backend = RollingFakeBackend()
+    def score_page_documents(self, query_context, documents):
+        documents = list(documents)
+        self.page_stage_calls.append({
+            "query_context": query_context,
+            "doc_ids": [str(doc["doc_id"]) for doc in documents],
+        })
+        scores = [float(self.page_scores[(query_context, str(doc["doc_id"]))]) for doc in documents]
+        return scores, 0.001, 0
+
+    def score_document_sentences(self, query_context, documents):
+        documents = list(documents)
+        call = {
+            "query_context": query_context,
+            "doc_ids": [str(doc["doc_id"]) for doc in documents],
+            "sent_ids": {},
+        }
+        output = {}
+        pair_count = 0
+        for document in documents:
+            doc_id = str(document["doc_id"])
+            output[doc_id] = {}
+            call["sent_ids"][doc_id] = []
+            for sent_id, text in enumerate(document.get("sentences", [])):
+                if not str(text).strip():
+                    continue
+                score = self.sentence_scores.get(
+                    (query_context, doc_id, sent_id),
+                    1000.0 - (100.0 * int(document.get("rank", 1))) - sent_id,
+                )
+                output[doc_id][sent_id] = float(score)
+                call["sent_ids"][doc_id].append(sent_id)
+                pair_count += 1
+        self.sentence_stage_calls.append(call)
+        return output, 0.002, pair_count
+
+
+def _query_context(question, search):
+    if " ".join(question.lower().split()) == " ".join(search.lower().split()):
+        return question
+    return f"Question: {question}\nCurrent search: {search}"
+
+
+def test_local_page_reranking_is_query_local_and_old_memory_cannot_hijack_current_page():
+    question = "Who connects the two facts?"
+    first_hits = [
+        _hit("1", "Old Winner", ["Old evidence."], 1),
+        _hit("2", "Other", ["Other evidence."], 2),
+    ]
+    second_hits = [
+        _hit("1", "Old Winner", ["Old evidence."], 1),
+        _hit("3", "New Winner", ["New evidence."], 2),
+    ]
+    q1 = _query_context(question, "first bridge")
+    q2 = _query_context(question, "second bridge")
+    page_scores = {
+        (q1, "1"): 100.0,
+        (q1, "2"): 1.0,
+        (q2, "1"): -5.0,
+        (q2, "3"): 8.0,
+    }
+    backend = LocalRerankBackend(
+        {"first bridge": first_hits, "second bridge": second_hits}, page_scores
+    )
     retriever = FullWikiRetriever(
         backend,
-        search_top_k=3,
-        max_observation_chars=3600,
-        max_evidence_documents=6,
+        search_top_k=2,
+        local_rerank_page_count=2,
+        question=question,
+        max_evidence_snippets=12,
+        max_evidence_chars=6000,
+    )
+
+    retriever.search("first bridge")
+    assert retriever.current_page_title == "Old Winner"
+
+    retriever.search("second bridge")
+    assert retriever.current_page_title == "New Winner"
+    assert retriever.last_result["current_page_selection_reason"] == "local_rerank"
+    assert retriever.last_result["current_page_local_rank"] == 1
+    assert retriever.last_result["local_reranked_hits"][0]["title"] == "New Winner"
+    assert len(retriever._evidence_archive["1"]["search_history"]) == 2
+    assert "reranker_score" not in retriever._evidence_archive["1"]
+
+
+def test_fifteen_hydrated_pages_produce_fifteen_page_pairs_and_only_four_sentence_pages():
+    question = "Question"
+    search = "broad search"
+    context = _query_context(question, search)
+    hits = [
+        _hit(str(i), f"Doc {i}", [f"Doc {i} sentence 0.", f"Doc {i} sentence 1."], i)
+        for i in range(1, 16)
+    ]
+    # Reverse retrieval order: doc 15 should become local rank 1.
+    page_scores = {(context, str(i)): float(i) for i in range(1, 16)}
+    backend = LocalRerankBackend({search: hits}, page_scores)
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=15,
+        local_rerank_page_count=4,
+        question=question,
+    )
+
+    retriever.search(search)
+
+    assert backend.page_stage_calls[0]["doc_ids"] == [str(i) for i in range(1, 16)]
+    assert retriever.last_result["local_page_pair_count"] == 15
+    assert backend.sentence_stage_calls[0]["doc_ids"] == ["15", "14", "13", "12"]
+    assert len(retriever.last_result["sentence_rerank_pages"]) == 4
+    assert retriever.current_page_title == "Doc 15"
+
+
+def test_sentence_stage_scores_last_sentence_and_preserves_blank_sentence_ids():
+    question = "Question"
+    search = "find evidence"
+    context = _query_context(question, search)
+    hits = [
+        _hit("1", "Page One", ["First.", "", "Third.", "", "Evidence is last."], 1),
+        _hit("2", "Page Two", ["A."], 2),
+        _hit("3", "Page Three", ["B."], 3),
+        _hit("4", "Page Four", ["C."], 4),
+        _hit("5", "Page Five", ["Should not be sentence-scored."], 5),
+    ]
+    page_scores = {(context, str(i)): float(10 - i) for i in range(1, 6)}
+    backend = LocalRerankBackend({search: hits}, page_scores)
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=5,
+        local_rerank_page_count=4,
+        question=question,
+    )
+
+    retriever.search(search)
+    call = backend.sentence_stage_calls[0]
+
+    assert call["doc_ids"] == ["1", "2", "3", "4"]
+    assert call["sent_ids"]["1"] == [0, 2, 4]
+    assert 4 in retriever._evidence_archive["1"]["latest_sentence_scores"]
+    assert "5" not in call["sent_ids"]
+
+
+def test_sentence_scores_never_reorder_page_ranking():
+    question = "Question"
+    search = "search"
+    context = _query_context(question, search)
+    hits = [
+        _hit("1", "Page One", ["Moderate sentence."], 1),
+        _hit("2", "Page Two", ["Spectacular sentence."], 2),
+        _hit("3", "Page Three", ["Other."], 3),
+        _hit("4", "Page Four", ["Other."], 4),
+    ]
+    page_scores = {
+        (context, "1"): 9.0,
+        (context, "2"): 8.0,
+        (context, "3"): 7.0,
+        (context, "4"): 6.0,
+    }
+    sentence_scores = {
+        (context, "1", 0): -100.0,
+        (context, "2", 0): 10000.0,
+    }
+    backend = LocalRerankBackend({search: hits}, page_scores, sentence_scores=sentence_scores)
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=4,
+        local_rerank_page_count=4,
+        question=question,
+    )
+
+    retriever.search(search)
+
+    assert retriever.current_page_title == "Page One"
+    assert [row["title"] for row in retriever.last_result["local_reranked_hits"]] == [
+        "Page One", "Page Two", "Page Three", "Page Four"
+    ]
+
+
+def test_exact_title_page_is_current_and_is_included_in_four_sentence_pages_without_reordering_pages():
+    question = "Question"
+    search = "Exact Page"
+    context = _query_context(question, search)
+    hits = [
+        _hit("1", "High One", ["A."], 1),
+        _hit("2", "High Two", ["B."], 2),
+        _hit("3", "High Three", ["C."], 3),
+        _hit("4", "High Four", ["D."], 4),
+        _hit("5", "Exact Page", ["Exact evidence."], 5),
+    ]
+    page_scores = {
+        (context, "1"): 10.0,
+        (context, "2"): 9.0,
+        (context, "3"): 8.0,
+        (context, "4"): 7.0,
+        (context, "5"): 1.0,
+    }
+    backend = LocalRerankBackend({search: hits}, page_scores)
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=5,
+        local_rerank_page_count=4,
+        question=question,
+    )
+
+    retriever.search(search)
+
+    assert retriever.current_page_title == "Exact Page"
+    assert retriever.last_result["current_page_selection_reason"] == "exact_title"
+    assert retriever.last_result["current_page_local_rank"] == 5
+    assert [row["title"] for row in retriever.last_result["local_reranked_hits"]][:4] == [
+        "High One", "High Two", "High Three", "High Four"
+    ]
+    assert backend.sentence_stage_calls[0]["doc_ids"] == ["5", "1", "2", "3"]
+
+
+def test_exact_title_injection_replaces_tail_and_keeps_page_pair_budget_fixed():
+    question = "Question"
+    search = "Exact Page"
+    context = _query_context(question, search)
+    hits = [_hit(str(i), f"Doc {i}", [f"Sentence {i}."], i) for i in range(1, 16)]
+    exact = _hit("99", "Exact Page", ["Exact sentence."], 99)
+    page_scores = {(context, str(i)): float(20 - i) for i in range(1, 16)}
+    page_scores[(context, "99")] = -100.0
+    backend = LocalRerankBackend(
+        {search: hits}, page_scores, exact_docs={"Exact Page": exact}
+    )
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=15,
+        local_rerank_page_count=4,
+        question=question,
+    )
+
+    retriever.search(search)
+
+    assert retriever.last_result["exact_title_injected"] is True
+    assert retriever.last_result["local_page_pair_count"] == 15
+    assert "15" not in backend.page_stage_calls[0]["doc_ids"]
+    assert "99" in backend.page_stage_calls[0]["doc_ids"]
+    assert retriever.current_page_title == "Exact Page"
+
+
+def test_snippet_memory_is_bounded_without_per_document_quota_and_without_cross_query_raw_score_ordering():
+    question = "Question"
+    search = "search"
+    context = _query_context(question, search)
+    hits = [
+        _hit("1", "Dense Evidence", [f"Evidence {i}." for i in range(10)], 1),
+        _hit("2", "Second", ["Second evidence."], 2),
+        _hit("3", "Third", ["Third evidence."], 3),
+        _hit("4", "Fourth", ["Fourth evidence."], 4),
+    ]
+    page_scores = {(context, str(i)): float(5 - i) for i in range(1, 5)}
+    sentence_scores = {}
+    for i in range(10):
+        sentence_scores[(context, "1", i)] = 1000.0 - i
+    sentence_scores[(context, "2", 0)] = 5.0
+    sentence_scores[(context, "3", 0)] = 4.0
+    sentence_scores[(context, "4", 0)] = 3.0
+
+    backend = LocalRerankBackend(
+        {search: hits}, page_scores, sentence_scores=sentence_scores
+    )
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=4,
+        local_rerank_page_count=4,
+        question=question,
+        max_evidence_snippets=6,
+        max_evidence_chars=300,
+    )
+
+    retriever.search(search)
+    memory = retriever.active_memory_snapshot()
+
+    assert len(memory) <= 6
+    assert len(retriever.render_active_evidence()) <= 300
+    assert sum(row["doc_id"] == "1" for row in memory) > 2
+    assert all("score" not in row for row in memory)
+    assert all("last_local_score" not in row for row in memory)
+
+
+def test_lookup_uses_current_page_even_if_not_in_active_memory_and_promotes_exact_sentence():
+    question = "Question"
+    search = "Exact Page"
+    context = _query_context(question, search)
+    hits = [
+        _hit("1", "High One", ["High evidence."], 1),
+        _hit("2", "High Two", ["Other evidence."], 2),
+        _hit("3", "High Three", ["Other evidence."], 3),
+        _hit("4", "High Four", ["Other evidence."], 4),
+        _hit("5", "Exact Page", ["Target is here.", "Target appears again."], 5),
+    ]
+    page_scores = {
+        (context, "1"): 10.0,
+        (context, "2"): 9.0,
+        (context, "3"): 8.0,
+        (context, "4"): 7.0,
+        (context, "5"): 1.0,
+    }
+    sentence_scores = {
+        (context, "1", 0): 1000.0,
+        (context, "2", 0): 900.0,
+        (context, "3", 0): 800.0,
+        (context, "5", 0): -100.0,
+        (context, "5", 1): -101.0,
+    }
+    backend = LocalRerankBackend({search: hits}, page_scores, sentence_scores=sentence_scores)
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=5,
+        local_rerank_page_count=4,
+        question=question,
+        max_evidence_snippets=1,
+        max_evidence_chars=6000,
+    )
+
+    retriever.search(search)
+    assert retriever.current_page_title == "Exact Page"
+    assert retriever.active_memory_snapshot()[0]["doc_id"] == "1"
+    assert "5" not in retriever._evidence_doc_id_set
+
+    first = retriever.lookup("Target")
+    assert "[Exact Page | sent 0]" in first
+    assert retriever.current_page_title == "Exact Page"
+    assert retriever.active_memory_snapshot()[0]["doc_id"] == "5"
+    assert retriever.active_memory_snapshot()[0]["source"] == "lookup"
+
+    second = retriever.lookup("Target")
+    assert "[Exact Page | sent 1]" in second
+    assert retriever.last_result["status"] == "found"
+
+
+def test_duplicate_search_is_guarded_without_second_backend_or_reranker_call():
+    question = "Question"
+    search = "Radiohead lead singer"
+    context = _query_context(question, search)
+    hits = [_hit("1", "Radiohead", ["Thom Yorke is the lead singer."], 1)]
+    backend = LocalRerankBackend({search: hits}, {(context, "1"): 1.0})
+    retriever = FullWikiRetriever(
+        backend,
+        search_top_k=1,
+        local_rerank_page_count=1,
+        question=question,
         duplicate_search_guard=True,
     )
 
-    retriever.search("first")
-    retriever.search("second")
-    third_observation = retriever.search("third")
-
-    assert retriever.evidence_document_count == 6
-    assert len(retriever.visited_pages) == 6
-    assert len(retriever.last_result["retrieved_hits"]) == 3
-    assert len(retriever.last_result["hits"]) == 0
-    assert len(retriever.last_result["omitted_due_to_evidence_cap"]) == 3
-    assert "found no new evidence" in third_observation
-
-
-def test_react_session_duplicate_search_is_guarded_without_second_backend_call():
-    backend = RollingFakeBackend()
-    retriever = FullWikiRetriever(
-        backend,
-        search_top_k=6,
-        max_observation_chars=7200,
-        max_evidence_documents=15,
-        duplicate_search_guard=True,
-    )
-
-    retriever.search("Radiohead lead singer")
+    retriever.search(search)
     duplicate_observation = retriever.search("  radiohead   lead singer  ")
 
     assert len(backend.calls) == 1
+    assert len(backend.page_stage_calls) == 1
     assert retriever.last_result["duplicate_query"] is True
     assert retriever.last_result["status"] == "duplicate_query"
     assert "already performed earlier" in duplicate_observation
 
 
-def test_fullwiki_observation_respects_global_character_cap():
-    backend = RollingFakeBackend()
-    retriever = FullWikiRetriever(
-        backend,
-        search_top_k=6,
-        max_observation_chars=500,
-        max_evidence_documents=15,
-    )
-
-    observation = retriever.search("query")
-    assert len(observation) <= 500
-    assert len(retriever.last_result["retrieved_hits"]) == 6
-
-
-def test_lookup_uses_only_rank_one_page_and_advances_matching_sentences():
-    class LookupBackend:
+def test_fallback_without_local_reranker_keeps_classic_current_page_lookup_behavior():
+    class FakeBackend:
         def search(self, query, top_k=1):
             hits = [
-                {
-                    "doc_id": "1",
-                    "title": "Rank One",
-                    "rank": 1,
-                    "bm25_rank": 1,
-                    "bm25_score": 10.0,
-                    "dense_rank": 1,
-                    "dense_score": 0.9,
-                    "fused_score": 0.03,
-                    "sentences": [
-                        "Target appears in the first sentence.",
-                        "Target also appears in the second sentence.",
+                _hit(
+                    "10",
+                    "Scott Derrickson",
+                    [
+                        "Scott Derrickson is an American filmmaker.",
+                        "He was born in Denver, Colorado.",
                     ],
-                },
-                {
-                    "doc_id": "2",
-                    "title": "Rank Two",
-                    "rank": 2,
-                    "bm25_rank": 2,
-                    "bm25_score": 9.0,
-                    "dense_rank": 2,
-                    "dense_score": 0.8,
-                    "fused_score": 0.02,
-                    "sentences": ["Only rank two contains UNIQUESECOND."],
-                },
+                    1,
+                ),
+                _hit("11", "Ed Wood", ["Edward D. Wood Jr. was an American filmmaker."], 2),
             ]
             return {
                 "query": query,
                 "mode": "hybrid",
-                "candidate_k": 20,
+                "candidate_k": 50,
                 "top_k": top_k,
                 "hits": hits[:top_k],
                 "latency_ms": {"total": 1.0},
             }
 
-    retriever = FullWikiRetriever(
-        LookupBackend(),
-        search_top_k=2,
-        max_observation_chars=4000,
-        max_evidence_documents=15,
-    )
-    retriever.search("query")
+    retriever = FullWikiRetriever(FakeBackend(), search_top_k=2, max_observation_chars=4000)
+    observation = retriever.search("Scott Derrickson Ed Wood")
 
-    assert "Could not find 'UNIQUESECOND' in [Rank One]" in retriever.lookup("UNIQUESECOND")
-
-    first = retriever.lookup("Target")
-    second = retriever.lookup("Target")
-    exhausted = retriever.lookup("Target")
-
-    assert "(Result 1 / 2)" in first
-    assert "[Rank One | sent 0]" in first
-    assert "(Result 2 / 2)" in second
-    assert "[Rank One | sent 1]" in second
-    assert "No more results" in exhausted
-
-
-def test_lookup_cannot_bypass_max_working_evidence_document_cap():
-    backend = RollingFakeBackend()
-    retriever = FullWikiRetriever(
-        backend,
-        search_top_k=6,
-        max_observation_chars=7200,
-        max_evidence_documents=15,
-    )
-
-    retriever.search("first")
-    retriever.search("second")
-    retriever.search("third")
-    assert retriever.evidence_document_count == 15
-    assert len(retriever.visited_pages) == 15
-
-    fourth = retriever.search("fourth")
-    assert "found no new evidence" in fourth
-    assert retriever.current_page_title == "Doc 401"
-    assert retriever.current_document["doc_id"] not in retriever._evidence_doc_id_set
-
-    lookup = retriever.lookup("Sentence")
-    assert "was not admitted to the bounded working evidence" in lookup
-    assert retriever.last_result["status"] == "current_page_not_exposed"
-    assert retriever.evidence_document_count == 15
-    assert len(retriever.visited_pages) == 15
-
-
-class FakeEvidenceReranker:
-    def describe(self):
-        return {"model": "fake-cross-encoder", "device": "cpu"}
-
-
-class RerankedRollingBackend(RollingFakeBackend):
-    def __init__(self):
-        super().__init__()
-        self.evidence_reranker = FakeEvidenceReranker()
-        self.scored_doc_ids = []
-
-    def score_evidence_documents(self, question, documents):
-        self.scored_doc_ids.extend(str(doc["doc_id"]) for doc in documents)
-        # Deterministic fake relevance: later/larger doc ids are more relevant.
-        return [float(int(doc["doc_id"])) for doc in documents], 0.001
-
-
-def test_cross_encoder_memory_evicts_weaker_early_documents_and_keeps_archive():
-    backend = RerankedRollingBackend()
-    retriever = FullWikiRetriever(
-        backend,
-        search_top_k=6,
-        max_observation_chars=7200,
-        max_evidence_documents=15,
-        duplicate_search_guard=True,
-        question="Which evidence answers the original question?",
-    )
-
-    first = retriever.search("first")
-    second = retriever.search("second")
-    third = retriever.search("third")
-
-    assert "Consult the Active Evidence Memory" in first
-    assert "Consult the Active Evidence Memory" in second
-    assert "Consult the Active Evidence Memory" in third
-    assert retriever.evidence_archive_count == 18
-    assert retriever.evidence_document_count == 15
-    assert len(backend.scored_doc_ids) == 36
-
-    active_ids = [row["doc_id"] for row in retriever.active_memory_snapshot()]
-    assert "101" not in active_ids
-    assert "102" not in active_ids
-    assert "103" not in active_ids
-    assert "301" in active_ids
-    assert "306" in active_ids
-    assert set(retriever.last_result["evicted_evidence_documents"]) == {
-        "Doc 101",
-        "Doc 102",
-        "Doc 103",
-    }
-    assert retriever.last_result["memory_policy"] == "cross_encoder_top_k"
-    assert retriever.last_result["evidence_archive_count"] == 18
-
-    memory = retriever.render_active_evidence()
-    assert "[Doc 101]" not in memory
-    assert "[Doc 306]" in memory
-
-
-def test_cross_encoder_memory_scores_each_unique_document_only_once():
-    class OverlapBackend(RerankedRollingBackend):
-        def search(self, query, top_k=1):
-            self.calls.append(query)
-            if len(self.calls) == 1:
-                ids = ["1", "2", "3"]
-            else:
-                ids = ["2", "3", "4"]
-            hits = [
-                {
-                    "doc_id": doc_id,
-                    "title": f"Doc {doc_id}",
-                    "rank": rank,
-                    "bm25_rank": rank,
-                    "bm25_score": 10.0 - rank,
-                    "dense_rank": rank,
-                    "dense_score": 1.0 / rank,
-                    "fused_score": 1.0 / (60 + rank),
-                    "sentences": [f"Sentence for {doc_id}."],
-                }
-                for rank, doc_id in enumerate(ids[:top_k], 1)
-            ]
-            return {
-                "query": query,
-                "mode": "hybrid",
-                "candidate_k": 20,
-                "top_k": top_k,
-                "hits": hits,
-                "latency_ms": {"total": 1.0},
-            }
-
-    backend = OverlapBackend()
-    retriever = FullWikiRetriever(
-        backend,
-        search_top_k=3,
-        max_observation_chars=4000,
-        max_evidence_documents=15,
-        question="question",
-    )
-
-    retriever.search("first")
-    retriever.search("second")
-
-    assert set(backend.scored_doc_ids) == {"1", "2", "3", "4"}
-    assert retriever.evidence_archive_count == 4
-
-
-def test_cross_encoder_memory_does_not_allow_lookup_on_evicted_rank_one_page():
-    class LowScoreFourthSearchBackend(RerankedRollingBackend):
-        def score_evidence_documents(self, question, documents):
-            self.scored_doc_ids.extend(str(doc["doc_id"]) for doc in documents)
-            scores = []
-            for doc in documents:
-                doc_id = int(doc["doc_id"])
-                # First three searches get strong scores; fourth search is weak.
-                scores.append(float(doc_id if doc_id < 400 else -doc_id))
-            return scores, 0.001
-
-    backend = LowScoreFourthSearchBackend()
-    retriever = FullWikiRetriever(
-        backend,
-        search_top_k=6,
-        max_observation_chars=7200,
-        max_evidence_documents=15,
-        question="question",
-    )
-
-    retriever.search("first")
-    retriever.search("second")
-    retriever.search("third")
-    fourth = retriever.search("fourth")
-
-    assert retriever.current_page_title == "Doc 401"
-    assert retriever.current_document["doc_id"] not in retriever._evidence_doc_id_set
-    assert "rank-1 page was not retained" in fourth
-    lookup = retriever.lookup("Sentence")
-    assert "was not admitted to the bounded working evidence" in lookup
+    assert retriever.current_page_title == "Scott Derrickson"
+    assert "[Scott Derrickson | sent 0]" in observation
+    lookup = retriever.lookup("Denver")
+    assert "[Scott Derrickson | sent 1]" in lookup

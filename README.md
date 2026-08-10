@@ -6,29 +6,41 @@ A retrieval-and-reasoning project that compares a **single-pass RAG baseline** a
 
 ## Final Benchmark Architecture
 
-```text
-Official HotpotQA Wikipedia (Oct. 1, 2017)
-        ~5M introductory paragraphs
-                    |
-        +-----------+-----------+
-        |                       |
-  Lucene BM25             BGE dense vectors
-   (Pyserini)          (bge-base-en-v1.5 + FAISS)
-        |                       |
-        +-----------+-----------+
-                    |
-          Reciprocal Rank Fusion
-                    |
-           shared FullWiki backend
-             /                \
-            /                  \
-Single-Pass RAG                ReAct Multi-Hop Agent
-1 query -> top 7 docs     up to 7 adaptive tool turns
-1 Qwen generation          top 6 docs/search -> Qwen
-                           max 15 unique docs in working context
-            \                  /
-             HotpotQA official metrics
+```mermaid
+flowchart LR
+    subgraph Corpus["Shared Retrieval Foundation"]
+        Q["User Question"] --> W["2017 Wikipedia Corpus<br/>(~5M Abstracts)"]
+        W --> BM25["Lucene BM25<br/>(Pyserini)"]
+        W --> BGE["BGE Dense Vectors<br/>(FAISS IVF-PQ)"]
+        BM25 --> RRF["Reciprocal Rank Fusion<br/>(Shared Hybrid Backend)"]
+        BGE --> RRF
+    end
+
+    subgraph SinglePass["Single-Pass RAG Baseline"]
+        RRF --> S1["Single Query Pass"]
+        S1 --> LLM1["Frozen Qwen2.5-7B-Instruct<br/>(vLLM / L4 GPU)"]
+        LLM1 --> OUT1["Baseline Answer<br/>& Citations"]
+    end
+
+    subgraph ReAct["ReAct Multi-Hop Agent"]
+        RRF <--> LOOP["Adaptive Search &<br/>Lookup Tool Actions"]
+        LOOP <--> MEM["Cross-Encoder Reranked<br/>Evidence Memory"]
+        MEM <--> LLM2["Frozen Qwen2.5-7B-Instruct<br/>(vLLM / L4 GPU)"]
+        LLM2 --> OUT2["ReAct Answer<br/>& Citations"]
+        LLM2 -. "Hop limit reach" .-> FS["Forced<br/>Synthesis"]
+        FS -.-> OUT2
+    end
+
+    subgraph Eval["Shared Official Evaluation"]
+        OUT1 --> EVAL["Official HotpotQA Evaluator<br/>(Answer, Support & Joint F1/EM)"]
+        OUT2 --> EVAL
+    end
 ```
+
+> [!NOTE]
+> **Core Architectural Principle:** Both systems share the exact same underlying frozen LLM (`Qwen/Qwen2.5-7B-Instruct`) and the exact same dual BM25 + FAISS Hybrid Wikipedia retrieval backend. The experimental difference lies exclusively in the **evidence-acquisition strategy**: static single-pass retrieval vs. dynamic multi-turn ReAct reasoning with Cross-Encoder evidence memory.
+>
+> *Active Configuration Hyperparameters:* Single-pass top-7 passages (`baseline_top_k: 7`); ReAct top-40 candidate passages per search (`react_top_k: 40`, `candidate_k: 100`, `rrf_k: 60`), max 20 active memory documents (`max_evidence_documents: 20`), max 7 tool hops (`max_tool_steps: 7`), observation limit of 22,000 characters (`max_observation_chars: 22000`), and Cross-Encoder batch size 32 (`memory_reranker_batch_size: 32`).
 
 ### Why the HotpotQA Wikipedia abstracts corpus?
 
@@ -44,7 +56,7 @@ HotpotQA defines the FullWiki setting over the first paragraphs of all Wikipedia
 - **Hybrid retrieval:** Reciprocal Rank Fusion (RRF) over BM25 and dense rankings.
 - **Retrieval protocol:**
   - **Single-Pass RAG Baseline:** Retrieves top 7 passages once from the original question (1 generation pass).
-  - **ReAct Multi-Hop Agent:** Retrieves top 20 passages per `search[...]` turn (`candidate_k: 60`). Every unique retrieved document enters a per-question archive, is scored once against the original question by `BAAI/bge-reranker-base` (Sentence-Level Max-Scoring), and the 20 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
+  - **ReAct Multi-Hop Agent:** Retrieves top 40 passages per `search[...]` turn (`candidate_k: 100`, `rrf_k: 60`). Every unique retrieved document enters a per-question archive, is scored once against the original question by `BAAI/bge-reranker-base` (Sentence-Level Max-Scoring), and the 20 highest-scoring documents form the recurrent Active Evidence Memory across up to 7 adaptive turns. Later strong evidence can evict weaker early evidence.
   - **Shared Index:** Both systems query the exact same pre-built hybrid index (`indexes/fullwiki/`). Zero index rebuild required.
 - **Qwen Prompting & ChatML System Structuring:**
   - Formatted as structured `[SystemMessage(...), HumanMessage(...)]` objects passed to `llm.invoke()`, forcing vLLM to format context using Qwen's native `<|im_start|>system...` ChatML template.
@@ -191,7 +203,7 @@ python eval/run_eval.py \
 
 Inspect `eval_results/test_reranker/trajectories.json` to confirm:
 - `memory_reranker` model is loaded and scoring passages cleanly.
-- `active_memory_documents` retains top-10 cross-encoder scored passages.
+- `active_memory_documents` retains top-20 cross-encoder scored passages.
 - `rank1_in_active_memory` is `true` for rank-1 search pages, maintaining `lookup` functionality.
 - `finish[answer]` extracts canonical short answers and valid `Support: [...]` citations.
 
@@ -240,7 +252,7 @@ The ReAct trajectory for every retrieval step retains:
 - BM25 rank/score;
 - dense rank/score;
 - fused rank/score;
-- complete raw top-6 retrieval candidates, the full unique-document archive count, cross-encoder scores, the active top-15 memory, and documents added/evicted after each search;
+- complete raw top-40 retrieval candidates, the full unique-document archive count, cross-encoder scores, the active top-20 memory, and documents added/evicted after each search;
 - sparse/dense/fused ranks and scores for every retrieved candidate;
 - duplicate-query status, query/title-match diagnostic, evidence-memory/archive counts, rank-1 retention status, and memory/observation omissions;
 - exact exposed Wikipedia titles and sentence IDs;

@@ -7,8 +7,8 @@ from collections import OrderedDict
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
-class CrossEncoderEvidenceReranker:
-    """Shared cross-encoder scorer for ReAct evidence memory with true pair-level batching.
+class CrossEncoderReranker:
+    """Shared query-passage cross-encoder scorer with true pair-level batching.
 
     Features:
     1. Bounded OrderedDict LRU Pair Cache (query, passage) -> float.
@@ -26,7 +26,7 @@ class CrossEncoderEvidenceReranker:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:
             raise RuntimeError(
-                "Evidence-memory reranking requires sentence-transformers and torch."
+                "Cross-encoder reranking requires sentence-transformers and torch."
             ) from exc
 
         self.model_name = str(model_name)
@@ -90,7 +90,7 @@ class CrossEncoderEvidenceReranker:
 
         except Exception as exc:
             if "cuda" in self.device.lower():
-                print(f"[EvidenceReranker WARNING] Failed to load on {self.device} ({exc}). Falling back to CPU.")
+                print(f"[LocalReranker WARNING] Failed to load on {self.device} ({exc}). Falling back to CPU.")
                 self.device = "cpu"
                 self.dtype_str = "float32"
                 num_threads = min(4, max(1, (os.cpu_count() or 4) // 4))
@@ -106,7 +106,7 @@ class CrossEncoderEvidenceReranker:
                 raise exc
 
         print(
-            f"[EvidenceReranker] Successfully initialized '{self.model_name}' on device '{self.device}' "
+            f"[LocalReranker] Successfully initialized '{self.model_name}' on device '{self.device}' "
             f"(torch_dtype={self.dtype_str}, batch_size={self.batch_size}, max_length={self.max_length})"
         )
 
@@ -129,7 +129,7 @@ class CrossEncoderEvidenceReranker:
                     if self.batch_size > 8:
                         self.batch_size = max(8, self.batch_size // 2)
                         print(
-                            f"\n[EvidenceReranker WARNING] CUDA OOM during predict ({oom_exc}). "
+                            f"\n[LocalReranker WARNING] CUDA OOM during predict ({oom_exc}). "
                             f"Halving prediction batch_size to {self.batch_size}."
                         )
                         with torch.inference_mode():
@@ -141,7 +141,7 @@ class CrossEncoderEvidenceReranker:
                             )
                     else:
                         print(
-                            f"\n[EvidenceReranker WARNING] Permanent CUDA OOM. "
+                            f"\n[LocalReranker WARNING] Permanent CUDA OOM. "
                             "Fallback: moving CrossEncoder to CPU permanently."
                         )
                         self.device = "cpu"
@@ -363,3 +363,7 @@ class CrossEncoderEvidenceReranker:
             "training_corpus_note": "BAAI/bge-reranker-base cross-encoder; no HotpotQA labels used by this project",
         }
 
+
+
+# Backward-compatible import alias for older tests/scripts.
+CrossEncoderEvidenceReranker = CrossEncoderReranker

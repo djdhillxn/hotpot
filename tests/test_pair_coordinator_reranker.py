@@ -2,19 +2,21 @@ import unittest
 import time
 from unittest.mock import MagicMock
 
-from retrieval.reranker import CrossEncoderEvidenceReranker
+from collections import OrderedDict
+
+from retrieval.reranker import CrossEncoderReranker
 
 
 class TestPairCoordinatorReranker(unittest.TestCase):
 
     def test_pair_coordinator_and_telemetry(self):
-        reranker = CrossEncoderEvidenceReranker.__new__(CrossEncoderEvidenceReranker)
+        reranker = CrossEncoderReranker.__new__(CrossEncoderReranker)
         reranker.model_name = "test-model"
         reranker.device = "cpu"
         reranker.max_length = 512
         reranker.batch_size = 4
         reranker._lock = MagicMock()
-        reranker._cache = {}
+        reranker._cache = OrderedDict()
         reranker._cache_lock = MagicMock()
         reranker._max_cache_size = 1000
 

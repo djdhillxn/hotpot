@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import threading
@@ -17,7 +18,7 @@ from config import (
     FULLWIKI_SEARCH_CANDIDATES,
 )
 
-from retrieval.reranker import CrossEncoderEvidenceReranker
+from retrieval.reranker import CrossEncoderReranker
 
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
@@ -77,10 +78,14 @@ class FullWikiSearchBackend:
         candidate_k=FULLWIKI_SEARCH_CANDIDATES,
         rrf_k=FULLWIKI_RRF_K,
         dense_query_device=DENSE_QUERY_DEVICE,
+        local_reranker_model=None,
+        local_reranker_device="cpu",
+        local_reranker_max_length=512,
+        local_reranker_batch_size=16,
         evidence_reranker_model=None,
-        evidence_reranker_device="cpu",
-        evidence_reranker_max_length=512,
-        evidence_reranker_batch_size=16,
+        evidence_reranker_device=None,
+        evidence_reranker_max_length=None,
+        evidence_reranker_batch_size=None,
     ):
         if mode not in {"bm25", "dense", "hybrid"}:
             raise ValueError("mode must be one of: bm25, dense, hybrid")
@@ -130,14 +135,28 @@ class FullWikiSearchBackend:
         if self.mode in {"dense", "hybrid"}:
             self._load_dense_backend()
 
-        self.evidence_reranker = None
-        if evidence_reranker_model:
-            self.evidence_reranker = CrossEncoderEvidenceReranker(
-                evidence_reranker_model,
-                device=evidence_reranker_device,
-                max_length=evidence_reranker_max_length,
-                batch_size=evidence_reranker_batch_size,
+        # Query-local reranker. Legacy evidence_reranker_* keyword arguments remain
+        # accepted so older scripts do not fail, but the reranker is no longer a
+        # global evidence-memory governor.
+        if local_reranker_model is None:
+            local_reranker_model = evidence_reranker_model
+        if evidence_reranker_device is not None and local_reranker_device == "cpu":
+            local_reranker_device = evidence_reranker_device
+        if evidence_reranker_max_length is not None and local_reranker_max_length == 512:
+            local_reranker_max_length = evidence_reranker_max_length
+        if evidence_reranker_batch_size is not None and local_reranker_batch_size == 16:
+            local_reranker_batch_size = evidence_reranker_batch_size
+
+        self.local_reranker = None
+        if local_reranker_model:
+            self.local_reranker = CrossEncoderReranker(
+                local_reranker_model,
+                device=local_reranker_device,
+                max_length=local_reranker_max_length,
+                batch_size=local_reranker_batch_size,
             )
+        # Compatibility alias only; new retrieval code uses local_reranker.
+        self.evidence_reranker = self.local_reranker
 
         self.db_path = os.path.join(os.path.dirname(self.manifest_path), "hyperlink_graph.db")
         alt_db_path = os.path.join("data", "fullwiki", "hyperlink_graph.db")
@@ -555,92 +574,72 @@ class FullWikiSearchBackend:
         }
 
     @staticmethod
-    def _reranker_passages_for_document(document):
+    def _page_reranker_passage(document):
         title = str(document.get("title", "")).strip()
-        sentences = [str(x).strip() for x in document.get("sentences", []) if str(x).strip()]
-        passages = [f"{title}: {sent}" for sent in sentences[:6]]
-        full_lead = f"{title}\n{' '.join(sentences[:6])}".strip()
-        if full_lead and full_lead not in passages:
-            passages.append(full_lead)
-        return passages or [title]
+        sentences = [
+            str(text).strip()
+            for text in document.get("sentences", [])
+            if str(text).strip()
+        ]
+        body = " ".join(sentences).strip()
+        return f"{title}\n{body}".strip() if body else title
 
-    def score_evidence_documents(self, question, documents):
-        res, latency = self.score_evidence_documents_multi_batch(
-            [{"question": question, "documents": documents}]
+    def score_page_documents(self, query_context, documents):
+        """Score exactly one full-intro passage per document for the current search."""
+        if self.local_reranker is None:
+            raise RuntimeError("Local reranker is not configured on this FullWiki backend.")
+        documents = list(documents or [])
+        passages = [self._page_reranker_passage(doc) for doc in documents]
+        pairs = [(str(query_context), passage) for passage in passages]
+        if not pairs:
+            return [], 0.0, 0
+
+        # Cheap telemetry only. The model itself still owns exact tokenizer truncation.
+        max_length = int(getattr(self.local_reranker, "max_length", 512))
+        estimated_truncated = sum(
+            1
+            for q, p in pairs
+            if len(q.split()) + len(p.split()) + 3 > max_length
         )
-        return res[0], latency
+        scores, latency = self.local_reranker.score_pairs(pairs)
+        return [float(score) for score in scores], latency, estimated_truncated
 
-    def score_evidence_documents_multi_batch(self, task_list):
-        if self.evidence_reranker is None:
-            raise RuntimeError("Evidence reranker is not configured on this FullWiki backend.")
-        if not task_list:
-            return [], 0.0
+    def score_document_sentences(self, query_context, documents):
+        """Score every non-empty sentence in the supplied pages, preserving sentence IDs."""
+        if self.local_reranker is None:
+            raise RuntimeError("Local reranker is not configured on this FullWiki backend.")
 
         all_pairs = []
-        task_doc_bounds = []
-
-        for task in task_list:
-            q_str = str(task["question"])
-            docs = task.get("documents", [])
-            bounds = []
-            for doc in docs:
-                passages = self._reranker_passages_for_document(doc)
-                start = len(all_pairs)
-                for p in passages:
-                    all_pairs.append((q_str, p))
-                end = len(all_pairs)
-                bounds.append((start, end))
-            task_doc_bounds.append(bounds)
-
-        if not all_pairs:
-            empty_results = []
-            for task in task_list:
-                docs = task.get("documents", [])
-                empty_results.append((
-                    [0.0] * len(docs),
-                    [0] * len(docs),
-                    [{} for _ in docs],
-                ))
-            return empty_results, 0.0
-
-        scores, latency = self.evidence_reranker.score_pairs(all_pairs)
-
-        task_results = []
-        for task, doc_bounds in zip(task_list, task_doc_bounds):
-            documents = task.get("documents", [])
-            doc_max_scores = []
-            doc_best_sents = []
-            doc_sent_scores_list = []
-
-            for doc, (s_idx, e_idx) in zip(documents, doc_bounds):
-                if s_idx == e_idx:
-                    doc_max_scores.append(0.0)
-                    doc_best_sents.append(0)
-                    doc_sent_scores_list.append({})
+        pair_meta = []
+        for document in documents or []:
+            doc_id = str(document.get("doc_id", document.get("id", "")))
+            title = str(document.get("title", "")).strip()
+            for sent_id, text in enumerate(document.get("sentences", [])):
+                clean_text = str(text).strip()
+                if not clean_text:
                     continue
+                all_pairs.append((str(query_context), f"{title}: {clean_text}"))
+                pair_meta.append((doc_id, int(sent_id)))
 
-                doc_scores = scores[s_idx:e_idx]
-                max_rel_idx = max(range(len(doc_scores)), key=lambda i: doc_scores[i])
-                doc_max_scores.append(doc_scores[max_rel_idx])
+        scores_by_doc = {
+            str(document.get("doc_id", document.get("id", ""))): {}
+            for document in documents or []
+        }
+        if not all_pairs:
+            return scores_by_doc, 0.0, 0
 
-                sentences = [str(x).strip() for x in doc.get("sentences", []) if str(x).strip()]
-                num_sents = len(sentences[:6])
-                best_sent_id = max_rel_idx if max_rel_idx < num_sents else 0
-                doc_best_sents.append(best_sent_id)
-
-                sent_scores_dict = {
-                    idx: float(score) for idx, score in enumerate(doc_scores[:num_sents])
-                }
-                doc_sent_scores_list.append(sent_scores_dict)
-
-            task_results.append((doc_max_scores, doc_best_sents, doc_sent_scores_list))
-
-        return task_results, latency
+        scores, latency = self.local_reranker.score_pairs(all_pairs)
+        for (doc_id, sent_id), score in zip(pair_meta, scores):
+            scores_by_doc.setdefault(doc_id, {})[sent_id] = float(score)
+        return scores_by_doc, latency, len(all_pairs)
 
     def create_session(
         self,
-        search_top_k=1,
-        max_observation_chars=2200,
+        search_top_k=15,
+        local_rerank_page_count=4,
+        max_evidence_snippets=12,
+        max_evidence_chars=6000,
+        max_observation_chars=6000,
         max_evidence_documents=None,
         duplicate_search_guard=False,
         question=None,
@@ -652,11 +651,17 @@ class FullWikiSearchBackend:
         graph_weight_title_overlap=1.0,
         graph_weight_outdegree_penalty=0.3,
     ):
+        # max_evidence_documents is a legacy compatibility alias. In the new
+        # architecture the bounded recurrent state is sentence snippets, not docs.
+        if max_evidence_documents is not None:
+            max_evidence_snippets = int(max_evidence_documents)
         return FullWikiRetriever(
             self,
             search_top_k=search_top_k,
+            local_rerank_page_count=local_rerank_page_count,
+            max_evidence_snippets=max_evidence_snippets,
+            max_evidence_chars=max_evidence_chars,
             max_observation_chars=max_observation_chars,
-            max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=duplicate_search_guard,
             question=question,
             use_graph_expansion=use_graph_expansion,
@@ -679,21 +684,32 @@ class FullWikiSearchBackend:
             "dense_model": self.dense_model_name,
             "dense_query_device": self.dense_query_device if self.mode in {"dense", "hybrid"} else None,
             "dense_nprobe": self.dense_nprobe,
-            "evidence_memory_reranker": (
-                self.evidence_reranker.describe() if self.evidence_reranker is not None else None
+            "local_reranker": (
+                self.local_reranker.describe() if self.local_reranker is not None else None
             ),
             "index_manifest": self.manifest,
         }
 
 
 class FullWikiRetriever:
-    """Per-question ReAct-compatible session over a shared FullWiki backend."""
+    """Per-question ReAct session with query-local reranking and snippet memory.
+
+    Contract:
+    - Every search has its own local page ranking. Scores never carry across queries.
+    - One current page is selected from that search and lookup always operates on it.
+    - Persistent memory is a bounded set of sentence snippets, independent of current page.
+    """
+
+    CURRENT_PAGE_OBSERVATION_SENTENCES = 3
 
     def __init__(
         self,
         backend,
-        search_top_k=1,
-        max_observation_chars=2200,
+        search_top_k=15,
+        local_rerank_page_count=4,
+        max_evidence_snippets=12,
+        max_evidence_chars=6000,
+        max_observation_chars=6000,
         max_evidence_documents=None,
         duplicate_search_guard=False,
         question=None,
@@ -707,10 +723,12 @@ class FullWikiRetriever:
     ):
         self.backend = backend
         self.search_top_k = int(search_top_k)
+        requested_local_rerank_pages = int(local_rerank_page_count)
+        if max_evidence_documents is not None:
+            max_evidence_snippets = int(max_evidence_documents)
+        self.max_evidence_snippets = int(max_evidence_snippets)
+        self.max_evidence_chars = int(max_evidence_chars)
         self.max_observation_chars = int(max_observation_chars)
-        self.max_evidence_documents = (
-            int(max_evidence_documents) if max_evidence_documents is not None else None
-        )
         self.duplicate_search_guard = bool(duplicate_search_guard)
         self.question = str(question).strip() if question is not None else None
         self.use_graph_expansion = bool(use_graph_expansion)
@@ -720,21 +738,54 @@ class FullWikiRetriever:
         self.graph_w_anchor = float(graph_weight_anchor_overlap)
         self.graph_w_title = float(graph_weight_title_overlap)
         self.graph_w_outdegree = float(graph_weight_outdegree_penalty)
-        self.use_reranked_memory = (
-            getattr(self.backend, "evidence_reranker", None) is not None
-            and self.max_evidence_documents is not None
+
+        if self.search_top_k < 1:
+            raise ValueError("search_top_k must be >= 1")
+        if requested_local_rerank_pages < 1:
+            raise ValueError("local_rerank_page_count must be >= 1")
+        # A small search_top_k is useful for tests/debugging; the production
+        # configuration remains exactly 4 of 15. Never ask the sentence stage
+        # to open more pages than this search actually hydrated.
+        self.local_rerank_page_count = min(requested_local_rerank_pages, self.search_top_k)
+        if self.max_evidence_snippets < 1:
+            raise ValueError("max_evidence_snippets must be >= 1")
+        if self.max_evidence_chars < 1:
+            raise ValueError("max_evidence_chars must be >= 1")
+        if self.max_observation_chars < 1:
+            raise ValueError("max_observation_chars must be >= 1")
+
+        reranker = getattr(self.backend, "local_reranker", None)
+        if reranker is None:
+            reranker = getattr(self.backend, "evidence_reranker", None)
+        self.use_local_reranking = (
+            reranker is not None
             and bool(self.question)
+            and hasattr(self.backend, "score_page_documents")
+            and hasattr(self.backend, "score_document_sentences")
         )
+
         self.current_title = None
         self.current_document = None
         self.last_result = None
         self.visited_pages = []
-        self._evidence_doc_ids = []
-        self._evidence_doc_id_set = set()
+
+        # Cheap per-question metadata archive. Cross-query raw CE scores are never
+        # used to rank this archive or to select the current page.
         self._evidence_archive = {}
         self._archive_order = 0
+
+        # Sentence-level persistent evidence memory.
+        self._snippet_archive = {}
+        self._snippet_order = 0
+        self._active_snippet_keys = []
         self._active_memory_context = ""
         self._active_memory_hits = []
+
+        # Compatibility-only doc views derived from active snippets. They are not
+        # a memory policy and never control current-page selection or lookup.
+        self._evidence_doc_ids = []
+        self._evidence_doc_id_set = set()
+
         self._seen_search_queries = {}
         self._lookup_keyword = None
         self._lookup_matches = []
@@ -745,6 +796,18 @@ class FullWikiRetriever:
         return self.current_title
 
     @property
+    def evidence_archive_count(self):
+        return len(self._evidence_archive)
+
+    @property
+    def evidence_snippet_archive_count(self):
+        return len(self._snippet_archive)
+
+    @property
+    def evidence_snippet_count(self):
+        return len(self._active_snippet_keys)
+
+    @property
     def evidence_document_count(self):
         return len(self._evidence_doc_ids)
 
@@ -753,22 +816,19 @@ class FullWikiRetriever:
         self.current_document = None
         self.last_result = None
         self.visited_pages = []
-        self._evidence_doc_ids = []
-        self._evidence_doc_id_set = set()
         self._evidence_archive = {}
         self._archive_order = 0
+        self._snippet_archive = {}
+        self._snippet_order = 0
+        self._active_snippet_keys = []
         self._active_memory_context = ""
         self._active_memory_hits = []
+        self._evidence_doc_ids = []
+        self._evidence_doc_id_set = set()
         self._seen_search_queries = {}
         self._lookup_keyword = None
         self._lookup_matches = []
         self._lookup_index = 0
-
-    @staticmethod
-    def _render_sentences(title, sentences):
-        return "\n".join(
-            f"[{title} | sent {item['sent_id']}] {item['text']}" for item in sentences
-        )
 
     @staticmethod
     def _normalize_query(query):
@@ -781,393 +841,547 @@ class FullWikiRetriever:
     @staticmethod
     def _raw_logged_hit(hit):
         return {
-            "doc_id": str(hit["doc_id"]),
-            "title": hit["title"],
-            "rank": hit["rank"],
+            "doc_id": str(hit.get("doc_id", hit.get("id", ""))),
+            "title": hit.get("title"),
+            "rank": hit.get("rank"),
             "bm25_rank": hit.get("bm25_rank"),
             "bm25_score": hit.get("bm25_score"),
             "dense_rank": hit.get("dense_rank"),
             "dense_score": hit.get("dense_score"),
             "fused_score": hit.get("fused_score"),
             "sentences": [
-                {"sent_id": sent_id, "text": text}
+                {"sent_id": sent_id, "text": str(text)}
                 for sent_id, text in enumerate(hit.get("sentences", []))
             ],
         }
 
     @staticmethod
-    def _unpack_scores_and_bests(res):
-        if isinstance(res, tuple) and len(res) == 3:
-            return res[0], res[1], res[2]
-        elif isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], list) and isinstance(res[1], list):
-            return res[0], res[1], [{} for _ in res[0]]
-        elif isinstance(res, list):
-            return res, [0] * len(res), [{} for _ in res]
-        return [], [], []
+    def _snippet_key(doc_id, sent_id):
+        return (str(doc_id), int(sent_id))
 
-    def _visible_sentences(self, document, char_budget):
-        doc_id = str(document.get("doc_id", ""))
-        entry = self._evidence_archive.get(doc_id, {})
-        best_sent_id = entry.get("best_sent_id", 0)
-        sent_scores = entry.get("sentence_scores", {})
+    def _local_query_context(self, query):
+        query = str(query).strip()
+        if self._normalize_query(query) == self._normalize_query(self.question):
+            return self.question
+        return f"Question: {self.question}\nCurrent search: {query}"
 
-        all_sentences = document.get("sentences", [])
-        if not all_sentences:
-            return []
+    def _archive_search_document(self, hit, query, local_score=None, local_rank=None, sentence_scores=None):
+        doc_id = str(hit.get("doc_id", hit.get("id", "")))
+        entry = self._evidence_archive.get(doc_id)
+        if entry is None:
+            self._archive_order += 1
+            entry = {
+                "document": dict(hit),
+                "first_seen_order": self._archive_order,
+                "first_seen_query": query,
+                "search_history": [],
+                "latest_sentence_scores": {},
+            }
+            self._evidence_archive[doc_id] = entry
+        else:
+            entry["document"] = dict(hit)
 
-        # Always include sent 0 for title and lead sentence context
-        selected_ids = {0}
-        if 0 <= best_sent_id < len(all_sentences):
-            selected_ids.add(best_sent_id)
+        entry["search_history"].append({
+            "query": query,
+            "retrieval_rank": hit.get("retrieval_rank", hit.get("rank")),
+            "local_page_rank": local_rank,
+            "local_page_score": float(local_score) if local_score is not None else None,
+        })
+        if sentence_scores is not None:
+            entry["latest_sentence_scores"] = {
+                int(sent_id): float(score) for sent_id, score in sentence_scores.items()
+            }
 
-        # Rank all non-lead sentences by Cross-Encoder score
-        other_sent_indices = [idx for idx in range(1, len(all_sentences))]
-        other_sent_indices.sort(key=lambda idx: sent_scores.get(idx, -999.0), reverse=True)
+    def _upsert_search_snippet(self, candidate, query):
+        key = self._snippet_key(candidate["doc_id"], candidate["sent_id"])
+        self._snippet_order += 1
+        entry = self._snippet_archive.get(key)
+        if entry is None:
+            entry = {
+                "doc_id": str(candidate["doc_id"]),
+                "title": candidate["title"],
+                "sent_id": int(candidate["sent_id"]),
+                "text": candidate["text"],
+                "source": "search",
+                "best_local_sentence_rank": int(candidate["local_sentence_rank"]),
+                "best_local_page_rank": int(candidate["local_page_rank"]),
+                "first_seen_order": self._snippet_order,
+                "last_seen_order": self._snippet_order,
+                "first_seen_query": query,
+                "last_seen_query": query,
+                "last_local_score": float(candidate["score"]),
+                "search_count": 1,
+                "lookup_count": 0,
+            }
+            self._snippet_archive[key] = entry
+            return key
 
-        for idx in other_sent_indices[:3]:
-            selected_ids.add(idx)
+        entry["last_seen_order"] = self._snippet_order
+        entry["last_seen_query"] = query
+        entry["last_local_score"] = float(candidate["score"])
+        entry["search_count"] = int(entry.get("search_count", 0)) + 1
+        entry["best_local_sentence_rank"] = min(
+            int(entry.get("best_local_sentence_rank", candidate["local_sentence_rank"])),
+            int(candidate["local_sentence_rank"]),
+        )
+        entry["best_local_page_rank"] = min(
+            int(entry.get("best_local_page_rank", candidate["local_page_rank"])),
+            int(candidate["local_page_rank"]),
+        )
+        return key
 
-        ordered_sent_ids = sorted(selected_ids)
+    def _upsert_lookup_snippet(self, sent_id, text, keyword):
+        doc_id = str(self.current_document.get("doc_id", self.current_document.get("id", "")))
+        key = self._snippet_key(doc_id, sent_id)
+        self._snippet_order += 1
+        entry = self._snippet_archive.get(key)
+        if entry is None:
+            entry = {
+                "doc_id": doc_id,
+                "title": self.current_title,
+                "sent_id": int(sent_id),
+                "text": str(text),
+                "source": "lookup",
+                "best_local_sentence_rank": None,
+                "best_local_page_rank": None,
+                "first_seen_order": self._snippet_order,
+                "last_seen_order": self._snippet_order,
+                "first_seen_query": f"lookup[{keyword}]",
+                "last_seen_query": f"lookup[{keyword}]",
+                "last_local_score": None,
+                "search_count": 0,
+                "lookup_count": 1,
+            }
+            self._snippet_archive[key] = entry
+        else:
+            entry["source"] = "lookup"
+            entry["last_seen_order"] = self._snippet_order
+            entry["last_seen_query"] = f"lookup[{keyword}]"
+            entry["lookup_count"] = int(entry.get("lookup_count", 0)) + 1
+        return key
 
-        visible = []
-        used = 0
-        for sent_id in ordered_sent_ids:
-            text = all_sentences[sent_id]
-            label = f"[{document['title']} | sent {sent_id}] "
-            available = char_budget - used - len(label)
-            if available <= 0:
+    @staticmethod
+    def _memory_sort_key(item):
+        key, entry = item
+        if entry.get("source") == "lookup":
+            return (
+                0,
+                -int(entry.get("lookup_count", 0)),
+                -int(entry.get("last_seen_order", 0)),
+                key,
+            )
+        sentence_rank = entry.get("best_local_sentence_rank")
+        page_rank = entry.get("best_local_page_rank")
+        return (
+            1,
+            int(sentence_rank) if sentence_rank is not None else 10**9,
+            int(page_rank) if page_rank is not None else 10**9,
+            -int(entry.get("last_seen_order", 0)),
+            key,
+        )
+
+    def _refresh_snippet_memory(self):
+        previous = list(self._active_snippet_keys)
+        previous_set = set(previous)
+        ranked = sorted(self._snippet_archive.items(), key=self._memory_sort_key)
+
+        prefix = (
+            "Active Evidence Memory (bounded sentence snippets; local CE scores are never "
+            "compared across searches):\n"
+        )
+        remaining = max(0, self.max_evidence_chars - len(prefix))
+        active_keys = []
+        rendered_lines = []
+        active_hits = []
+
+        for key, entry in ranked:
+            if len(active_keys) >= self.max_evidence_snippets:
                 break
-            clean_text = str(text)
-            if len(clean_text) > available:
-                if not visible:
-                    clean_text = clean_text[: max(0, available - 1)].rstrip() + "…"
+            label = f"[{entry['title']} | sent {entry['sent_id']}] "
+            text = str(entry.get("text", ""))
+            line = label + text
+            needed = len(line) + (1 if rendered_lines else 0)
+            if needed > remaining:
+                if not active_keys:
+                    available = max(0, remaining - len(label) - 1)
+                    if available <= 0:
+                        continue
+                    text = text[:available].rstrip()
+                    if len(text) < len(str(entry.get("text", ""))):
+                        text = text.rstrip("…") + "…"
+                    line = label + text
+                    needed = len(line)
                 else:
-                    break
-            visible.append({"sent_id": sent_id, "text": clean_text})
-            used += len(label) + len(clean_text) + 1
-            if used >= char_budget:
-                break
-        return visible
+                    continue
 
-    def _render_new_hits(self, hits, prefix):
-        if not hits:
-            return "", [], max(0, self.max_observation_chars - len(prefix))
-
-        remaining = max(0, self.max_observation_chars - len(prefix))
-        rendered_blocks = []
-        logged_hits = []
-
-        for index, hit in enumerate(hits):
-            docs_left = len(hits) - index
-            block_header = f"Loaded [{hit['title']}] (rank {hit['rank']}).\n"
-            if len(block_header) >= remaining:
-                break
-            per_doc_budget = max(0, remaining // docs_left)
-            sentence_budget = max(0, per_doc_budget - len(block_header) - 2)
-            visible = self._visible_sentences(hit, sentence_budget)
-            if not visible:
-                continue
-            block = block_header + self._render_sentences(hit["title"], visible)
-            if len(block) > remaining:
-                break
-            rendered_blocks.append(block)
-            remaining = max(0, remaining - len(block) - 2)
-
-            logged_hits.append({
-                "doc_id": str(hit["doc_id"]),
-                "title": hit["title"],
-                "rank": hit["rank"],
-                "bm25_rank": hit.get("bm25_rank"),
-                "bm25_score": hit.get("bm25_score"),
-                "dense_rank": hit.get("dense_rank"),
-                "dense_score": hit.get("dense_score"),
-                "fused_score": hit.get("fused_score"),
-                "sentences": visible,
+            active_keys.append(key)
+            rendered_lines.append(line)
+            remaining = max(0, remaining - needed)
+            active_hits.append({
+                "doc_id": entry["doc_id"],
+                "title": entry["title"],
+                "memory_rank": len(active_keys),
+                "memory_source": entry.get("source"),
+                "local_sentence_rank": entry.get("best_local_sentence_rank"),
+                "local_page_rank": entry.get("best_local_page_rank"),
+                "sentences": [{"sent_id": entry["sent_id"], "text": text}],
             })
 
-        return "\n\n".join(rendered_blocks), logged_hits, remaining
+        self._active_snippet_keys = active_keys
+        self._active_memory_context = prefix + "\n".join(rendered_lines) if rendered_lines else ""
+        self._active_memory_hits = active_hits
 
-    @property
-    def evidence_archive_count(self):
-        return len(self._evidence_archive)
+        doc_ids = []
+        for hit in active_hits:
+            if hit["doc_id"] not in doc_ids:
+                doc_ids.append(hit["doc_id"])
+        self._evidence_doc_ids = doc_ids
+        self._evidence_doc_id_set = set(doc_ids)
+
+        for hit in active_hits:
+            title = hit.get("title")
+            if title and title not in self.visited_pages:
+                self.visited_pages.append(title)
+
+        active_set = set(active_keys)
+        added = [key for key in active_keys if key not in previous_set]
+        evicted = [key for key in previous if key not in active_set]
+        return added, evicted, list(active_hits)
+
+    def _snippet_summary(self, key):
+        entry = self._snippet_archive.get(key, {})
+        return {
+            "doc_id": entry.get("doc_id"),
+            "title": entry.get("title"),
+            "sent_id": entry.get("sent_id"),
+            "source": entry.get("source"),
+            "best_local_sentence_rank": entry.get("best_local_sentence_rank"),
+            "best_local_page_rank": entry.get("best_local_page_rank"),
+        }
 
     def render_active_evidence(self):
         return self._active_memory_context
 
     def active_memory_snapshot(self):
         rows = []
-        for memory_rank, doc_id in enumerate(self._evidence_doc_ids, 1):
-            entry = self._evidence_archive.get(doc_id, {})
-            document = entry.get("document", {})
+        for memory_rank, key in enumerate(self._active_snippet_keys, 1):
+            entry = self._snippet_archive.get(key, {})
             rows.append({
                 "memory_rank": memory_rank,
-                "doc_id": doc_id,
-                "title": document.get("title"),
-                "reranker_score": entry.get("reranker_score"),
-                "first_seen_order": entry.get("first_seen_order"),
+                "doc_id": entry.get("doc_id"),
+                "title": entry.get("title"),
+                "sent_id": entry.get("sent_id"),
+                "text": entry.get("text"),
+                "source": entry.get("source"),
+                "best_local_sentence_rank": entry.get("best_local_sentence_rank"),
+                "best_local_page_rank": entry.get("best_local_page_rank"),
                 "first_seen_query": entry.get("first_seen_query"),
+                "last_seen_query": entry.get("last_seen_query"),
             })
         return rows
 
-    def _score_new_archive_documents(self, query, hits):
-        # Partition hits into new vs previously archived documents before updating self._evidence_archive
-        new_hits = [hit for hit in hits if str(hit["doc_id"]) not in self._evidence_archive]
-        new_doc_ids = {str(hit["doc_id"]) for hit in new_hits}
-        existing_hits = [
-            hit for hit in hits
-            if str(hit["doc_id"]) in self._evidence_archive and str(hit["doc_id"]) not in new_doc_ids
-        ]
-
-        task_list = []
-        is_subquery = bool(query and self._normalize_query(query) != self._normalize_query(self.question))
-
-        if new_hits:
-            task_list.append({"question": self.question, "documents": new_hits, "tag": "new_q"})
-            if is_subquery:
-                task_list.append({"question": query, "documents": new_hits, "tag": "new_sub"})
-
-        if is_subquery and existing_hits:
-            task_list.append({"question": query, "documents": existing_hits, "tag": "existing_sub"})
-
-        if not task_list:
-            return [], 0.0
-
-        # Combine all scoring phases into one logical submission to pair-level coordinator
-        multi_results, latency = self.backend.score_evidence_documents_multi_batch(task_list)
-        results_by_tag = {task["tag"]: res for task, res in zip(task_list, multi_results)}
-
-        added_titles = []
-        if new_hits:
-            res_q = results_by_tag["new_q"]
-            scores_q, b_sents_q, s_scores_q = self._unpack_scores_and_bests(res_q)
-
-            if is_subquery and "new_sub" in results_by_tag:
-                res_sub = results_by_tag["new_sub"]
-                scores_sub, b_sents_sub, s_scores_sub = self._unpack_scores_and_bests(res_sub)
-
-                scores = []
-                b_sents = []
-                sent_scores_list = []
-                for sq, ss, bq, bs, sq_dict, ss_dict in zip(
-                    scores_q, scores_sub, b_sents_q, b_sents_sub, s_scores_q, s_scores_sub
-                ):
-                    if ss > sq:
-                        scores.append(ss)
-                        b_sents.append(bs)
-                        sent_scores_list.append(ss_dict)
-                    else:
-                        scores.append(sq)
-                        b_sents.append(bq)
-                        sent_scores_list.append(sq_dict)
-            else:
-                scores = scores_q
-                b_sents = b_sents_q
-                sent_scores_list = s_scores_q
-
-            if len(scores) != len(new_hits):
-                raise RuntimeError(
-                    f"Evidence reranker returned {len(scores)} scores for {len(new_hits)} documents."
-                )
-
-            for hit, score, b_sent, s_dict in zip(new_hits, scores, b_sents, sent_scores_list):
-                doc_id = str(hit["doc_id"])
-                self._archive_order += 1
-                self._evidence_archive[doc_id] = {
-                    "document": dict(hit),
-                    "reranker_score": float(score),
-                    "best_sent_id": int(b_sent),
-                    "sentence_scores": s_dict or {},
-                    "first_seen_order": self._archive_order,
-                    "first_seen_query": query,
-                }
-                added_titles.append(hit["title"])
-
-        # Rediscovery Score Upgrade Rule:
-        # If an already-archived document is explicitly rediscovered by a later sub-query,
-        # score it against that sub-query and upgrade its stored score if higher.
-        if is_subquery and existing_hits and "existing_sub" in results_by_tag:
-            res_ext = results_by_tag["existing_sub"]
-            scores_existing, b_sents_existing, s_scores_existing = self._unpack_scores_and_bests(res_ext)
-            for hit, score, b_sent, s_dict in zip(existing_hits, scores_existing, b_sents_existing, s_scores_existing):
-                doc_id = str(hit["doc_id"])
-                entry = self._evidence_archive[doc_id]
-                if float(score) > float(entry["reranker_score"]):
-                    entry["reranker_score"] = float(score)
-                    entry["best_sent_id"] = int(b_sent)
-                    entry["sentence_scores"] = s_dict or {}
-
-        return added_titles, latency
-
-    def _render_reranked_memory(self, current_doc_id=None):
-        if not self._evidence_doc_ids:
-            self._active_memory_context = ""
-            self._active_memory_hits = []
-            return [], []
-
-        prefix = (
-            "Active Evidence Memory (cross-encoder reranked; use ONLY sentence labels shown here "
-            "or in lookup observations as evidence):\n"
-        )
-        remaining = max(0, self.max_observation_chars - len(prefix))
-        rendered_blocks = []
-        logged_hits = []
-        omitted_due_to_char_cap = []
-
-        # When current_doc_id is present in active memory, render it first so it
-        # cannot be cut off by the global character budget on the turn it was searched.
-        render_doc_ids = list(self._evidence_doc_ids)
-        if current_doc_id in self._evidence_doc_id_set and render_doc_ids[0] != current_doc_id:
-            render_doc_ids.remove(current_doc_id)
-            render_doc_ids.insert(0, current_doc_id)
-        memory_rank_by_id = {
-            doc_id: memory_rank for memory_rank, doc_id in enumerate(self._evidence_doc_ids, 1)
-        }
-
-        for index, doc_id in enumerate(render_doc_ids):
-            entry = self._evidence_archive[doc_id]
-            document = entry["document"]
-            memory_rank = memory_rank_by_id[doc_id]
-            header = f"Memory [{memory_rank}] [{document['title']}]\n"
-            if len(header) >= remaining:
-                omitted_due_to_char_cap.extend(
-                    self._evidence_archive[x]["document"]["title"]
-                    for x in render_doc_ids[index:]
-                )
-                break
-
-            sentence_budget = max(0, min(remaining - len(header) - 2, 3000))
-            visible = self._visible_sentences(document, sentence_budget)
-            if not visible:
-                omitted_due_to_char_cap.append(document["title"])
+    @staticmethod
+    def _merge_exposed_hits(hits):
+        by_doc = {}
+        order = []
+        seen_sentences = set()
+        for hit in hits:
+            if not hit:
                 continue
+            doc_id = str(hit.get("doc_id", ""))
+            if doc_id not in by_doc:
+                by_doc[doc_id] = {
+                    k: v for k, v in hit.items() if k != "sentences"
+                }
+                by_doc[doc_id]["sentences"] = []
+                order.append(doc_id)
+            for sentence in hit.get("sentences", []):
+                sent_id = int(sentence["sent_id"])
+                key = (doc_id, sent_id)
+                if key in seen_sentences:
+                    continue
+                seen_sentences.add(key)
+                by_doc[doc_id]["sentences"].append({
+                    "sent_id": sent_id,
+                    "text": str(sentence.get("text", "")),
+                })
+        return [by_doc[doc_id] for doc_id in order]
 
-            block = header + self._render_sentences(document["title"], visible)
-            if len(block) > remaining:
-                omitted_due_to_char_cap.extend(
-                    self._evidence_archive[x]["document"]["title"]
-                    for x in render_doc_ids[index:]
+    def _current_page_observation(self, query, current_page, current_sentence_scores, selection_reason):
+        scored = []
+        for sent_id, score in current_sentence_scores.items():
+            sentences = current_page.get("sentences", [])
+            if 0 <= int(sent_id) < len(sentences):
+                text = str(sentences[int(sent_id)]).strip()
+                if text:
+                    scored.append((float(score), int(sent_id), text))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+
+        if not scored:
+            for sent_id, text in enumerate(current_page.get("sentences", [])):
+                clean = str(text).strip()
+                if clean:
+                    scored.append((0.0, sent_id, clean))
+
+        selected = scored[: self.CURRENT_PAGE_OBSERVATION_SENTENCES]
+        current_sentences = [
+            {"sent_id": sent_id, "text": text}
+            for _, sent_id, text in selected
+        ]
+        local_rank = current_page.get("local_rerank_rank")
+        reason_text = "exact-title match" if selection_reason == "exact_title" else "local cross-encoder rank 1"
+        prefix = (
+            f"Observation: FullWiki search '{query}' selected current page [{current_page['title']}] "
+            f"by {reason_text} (local page rank {local_rank}).\n"
+        )
+        lines = [
+            f"[{current_page['title']} | sent {item['sent_id']}] {item['text']}"
+            for item in current_sentences
+        ]
+        observation = prefix + "\n".join(lines)
+        if len(observation) > self.max_observation_chars:
+            observation = observation[: max(0, self.max_observation_chars - 1)].rstrip() + "…"
+        return observation, current_sentences
+
+    def _graph_expand_candidates(self, query, normalized_query, hits):
+        if not (
+            self.use_graph_expansion
+            and hasattr(self.backend, "get_outgoing_edges")
+            and hasattr(self.backend, "get_doc_by_title")
+        ):
+            return hits, []
+
+        focus_titles = []
+        if self.current_title:
+            focus_titles.append(self.current_title)
+        for doc_id in self._evidence_doc_ids[: self.graph_focus_doc_count]:
+            entry = self._evidence_archive.get(doc_id, {})
+            title = entry.get("document", {}).get("title")
+            if title and title not in focus_titles:
+                focus_titles.append(title)
+
+        q_tokens = set(self._normalize_query(self.question).split() + normalized_query.split())
+        candidate_edges = []
+        seen_target_norms = {self._normalize_title(t) for t in self.visited_pages}
+
+        for source_title in focus_titles:
+            source_doc_id = None
+            if hasattr(self.backend, "title_to_doc_id"):
+                source_doc_id = self.backend.title_to_doc_id.get(source_title.lower())
+            sent_scores = {}
+            if source_doc_id and source_doc_id in self._evidence_archive:
+                sent_scores = self._evidence_archive[source_doc_id].get("latest_sentence_scores", {})
+
+            for edge in self.backend.get_outgoing_edges(source_title):
+                target_title = edge["target_title"]
+                if self._normalize_title(target_title) in seen_target_norms:
+                    continue
+                source_sent_id = int(edge.get("source_sent_id", 0))
+                source_sent_score = float(sent_scores.get(source_sent_id, 0.0))
+                anchor_text = edge.get("anchor_text", target_title)
+                anchor_overlap = len(q_tokens & set(self._normalize_title(anchor_text).split()))
+                title_overlap = len(q_tokens & set(self._normalize_title(target_title).split()))
+                outdegree = self.backend.get_target_outdegree(target_title)
+                score = (
+                    self.graph_w_src * source_sent_score
+                    + self.graph_w_anchor * anchor_overlap
+                    + self.graph_w_title * title_overlap
+                    - self.graph_w_outdegree * math.log1p(outdegree)
                 )
-                break
+                candidate_edges.append((score, edge))
 
-            rendered_blocks.append(block)
-            remaining = max(0, remaining - len(block) - 2)
-            logged_hits.append({
+        best_by_target = {}
+        for score, edge in candidate_edges:
+            target = edge["target_title"]
+            if target not in best_by_target or score > best_by_target[target][0]:
+                best_by_target[target] = (score, edge)
+
+        graph_hits = []
+        logs = []
+        existing_ids = {str(hit.get("doc_id", "")) for hit in hits}
+        for score, edge in sorted(best_by_target.values(), key=lambda row: row[0], reverse=True):
+            if len(graph_hits) >= self.graph_candidate_quota:
+                break
+            graph_doc = self.backend.get_doc_by_title(edge["target_title"])
+            if not graph_doc:
+                continue
+            doc_id = str(graph_doc.get("doc_id", graph_doc.get("id", "")))
+            if doc_id in existing_ids:
+                continue
+            graph_hit = dict(graph_doc)
+            graph_hit.update({
                 "doc_id": doc_id,
-                "title": document["title"],
-                "rank": document.get("rank"),
-                "memory_rank": memory_rank,
-                "bm25_rank": document.get("bm25_rank"),
-                "bm25_score": document.get("bm25_score"),
-                "dense_rank": document.get("dense_rank"),
-                "dense_score": document.get("dense_score"),
-                "fused_score": document.get("fused_score"),
-                "reranker_score": entry["reranker_score"],
-                "sentences": visible,
+                "rank": len(hits) + len(graph_hits) + 1,
+                "fused_score": 0.5 + float(score),
+                "graph_candidate": True,
+            })
+            graph_hits.append(graph_hit)
+            existing_ids.add(doc_id)
+            logs.append({
+                "source_title": edge.get("source_title"),
+                "source_sent_id": edge.get("source_sent_id"),
+                "anchor_text": edge.get("anchor_text"),
+                "target_title": edge.get("target_title"),
+                "score": round(float(score), 4),
             })
 
-        body = "\n\n".join(rendered_blocks)
-        self._active_memory_context = prefix + body if body else ""
-        self._active_memory_hits = logged_hits
-        return logged_hits, omitted_due_to_char_cap
+        if not graph_hits:
+            return hits, logs
 
-    def _refresh_reranked_memory(self, current_doc_id=None, is_exact_title_search=False):
-        previous_ids = list(self._evidence_doc_ids)
-        previous_set = set(previous_ids)
-        ranked = sorted(
-            self._evidence_archive.items(),
-            key=lambda item: (
-                -float(item[1]["reranker_score"]),
-                int(item[1]["first_seen_order"]),
-                item[0],
-            ),
-        )
-        limit = self.max_evidence_documents or len(ranked)
-        selected_ids = [doc_id for doc_id, _ in ranked[:limit]]
+        quota = min(len(graph_hits), self.graph_candidate_quota, self.search_top_k)
+        keep = max(0, self.search_top_k - quota)
+        return hits[:keep] + graph_hits[:quota], logs
 
-        # Exact-Title Memory Reservation:
-        # If an explicit exact title match exists (e.g. search[Inception] matched title "Inception"),
-        # reserve one slot in active memory for current_doc_id so subsequent lookup[keyword]
-        # calls on this exact entity page are guaranteed to succeed.
-        if (
-            is_exact_title_search
-            and current_doc_id
-            and current_doc_id in self._evidence_archive
-            and current_doc_id not in selected_ids
-        ):
-            if selected_ids:
-                selected_ids.pop()
-            selected_ids.append(current_doc_id)
-
-        self._evidence_doc_ids = selected_ids
-        self._evidence_doc_id_set = set(self._evidence_doc_ids)
-
-        added_ids = [doc_id for doc_id in self._evidence_doc_ids if doc_id not in previous_set]
-        evicted_ids = [doc_id for doc_id in previous_ids if doc_id not in self._evidence_doc_id_set]
-        active_hits, observation_omitted = self._render_reranked_memory(
-            current_doc_id=current_doc_id
-        )
-
-        for hit in active_hits:
-            if hit["title"] not in self.visited_pages:
-                self.visited_pages.append(hit["title"])
-
-        return added_ids, evicted_ids, active_hits, observation_omitted
-
-    def _search_with_reranked_memory(
-        self, query, normalized_query, result, hits, raw_logged_hits, title_match_rank, graph_expansion_logs=None
+    def _search_with_local_reranking(
+        self,
+        query,
+        normalized_query,
+        result,
+        hits,
+        raw_logged_hits,
+        title_match_rank,
+        exact_title_injected,
+        graph_expansion_logs,
     ):
-        new_archive_titles, reranker_latency = self._score_new_archive_documents(query, hits)
+        local_query = self._local_query_context(query)
+        page_scores, page_latency, estimated_truncated = self.backend.score_page_documents(
+            local_query, hits
+        )
+        if len(page_scores) != len(hits):
+            raise RuntimeError(
+                f"Local reranker returned {len(page_scores)} page scores for {len(hits)} pages."
+            )
 
-        # Select current_document strictly from the candidates returned by the CURRENT search
-        exact_match_hit = next(
-            (h for h in hits if self._normalize_title(h["title"]) == normalized_query),
+        ranked_pages = []
+        for hit, score in zip(hits, page_scores):
+            row = dict(hit)
+            row["retrieval_rank"] = hit.get("rank")
+            row["local_rerank_score"] = float(score)
+            ranked_pages.append(row)
+        ranked_pages.sort(key=lambda hit: (
+            -float(hit["local_rerank_score"]),
+            int(hit.get("retrieval_rank") or 10**9),
+            str(hit.get("doc_id", "")),
+        ))
+        for local_rank, hit in enumerate(ranked_pages, 1):
+            hit["local_rerank_rank"] = local_rank
+
+        exact_match_page = next(
+            (hit for hit in ranked_pages if self._normalize_title(hit["title"]) == normalized_query),
             None,
         )
-        if exact_match_hit is None and title_match_rank == 1 and hits:
-            exact_match_hit = hits[0]
-
-        is_exact_title_search = exact_match_hit is not None or title_match_rank is not None
-
-        if exact_match_hit and str(exact_match_hit["doc_id"]) in self._evidence_archive:
-            current_doc_id = str(exact_match_hit["doc_id"])
+        if exact_match_page is not None:
+            current_page = exact_match_page
+            selection_reason = "exact_title"
         else:
-            search_doc_ids = [str(h["doc_id"]) for h in hits if str(h["doc_id"]) in self._evidence_archive]
-            if search_doc_ids:
-                current_doc_id = max(
-                    search_doc_ids,
-                    key=lambda did: self._evidence_archive[did]["reranker_score"],
-                )
-            else:
-                current_doc_id = str(self.current_document.get("doc_id", "")) if self.current_document else None
+            current_page = ranked_pages[0]
+            selection_reason = "local_rerank"
 
-        if current_doc_id and current_doc_id in self._evidence_archive:
-            self.current_document = self._evidence_archive[current_doc_id]["document"]
-            self.current_title = self._evidence_archive[current_doc_id]["document"]["title"]
+        # Point 2 invariant: current page is fixed by THIS search only. Memory is
+        # refreshed later and never gets a chance to change this identity.
+        self.current_document = dict(current_page)
+        self.current_title = current_page["title"]
+        self._lookup_keyword = None
+        self._lookup_matches = []
+        self._lookup_index = 0
+        if self.current_title not in self.visited_pages:
+            self.visited_pages.append(self.current_title)
 
-        # Independently refresh and render global recurrent evidence memory
-        added_ids, evicted_ids, active_hits, observation_omitted = self._refresh_reranked_memory(
-            current_doc_id=current_doc_id,
-            is_exact_title_search=is_exact_title_search,
+        sentence_pages = list(ranked_pages[: self.local_rerank_page_count])
+        current_doc_id = str(current_page.get("doc_id", ""))
+        if current_doc_id not in {str(page.get("doc_id", "")) for page in sentence_pages}:
+            sentence_pages = [current_page] + sentence_pages[: self.local_rerank_page_count - 1]
+
+        scores_by_doc, sentence_latency, sentence_pair_count = self.backend.score_document_sentences(
+            local_query, sentence_pages
         )
 
-        active_titles = [hit["title"] for hit in active_hits]
-        active_id_set = set(self._evidence_doc_ids)
-        raw_omitted_titles = [
-            hit["title"] for hit in hits if str(hit["doc_id"]) not in active_id_set
+        sentence_page_ids = {str(page.get("doc_id", "")) for page in sentence_pages}
+        for page in ranked_pages:
+            doc_id = str(page.get("doc_id", ""))
+            self._archive_search_document(
+                page,
+                query=query,
+                local_score=page.get("local_rerank_score"),
+                local_rank=page.get("local_rerank_rank"),
+                sentence_scores=scores_by_doc.get(doc_id) if doc_id in sentence_page_ids else None,
+            )
+
+        local_sentence_candidates = []
+        for page in sentence_pages:
+            doc_id = str(page.get("doc_id", ""))
+            page_sentences = page.get("sentences", [])
+            for sent_id, score in scores_by_doc.get(doc_id, {}).items():
+                if not (0 <= int(sent_id) < len(page_sentences)):
+                    continue
+                text = str(page_sentences[int(sent_id)]).strip()
+                if not text:
+                    continue
+                local_sentence_candidates.append({
+                    "doc_id": doc_id,
+                    "title": page["title"],
+                    "sent_id": int(sent_id),
+                    "text": text,
+                    "score": float(score),
+                    "local_page_rank": int(page["local_rerank_rank"]),
+                })
+
+        local_sentence_candidates.sort(key=lambda item: (
+            -float(item["score"]),
+            int(item["local_page_rank"]),
+            int(item["sent_id"]),
+            str(item["doc_id"]),
+        ))
+        for sentence_rank, candidate in enumerate(local_sentence_candidates, 1):
+            candidate["local_sentence_rank"] = sentence_rank
+            self._upsert_search_snippet(candidate, query)
+
+        added_keys, evicted_keys, active_hits = self._refresh_snippet_memory()
+
+        current_sentence_scores = scores_by_doc.get(current_doc_id, {})
+        observation, current_observation_sentences = self._current_page_observation(
+            query,
+            current_page,
+            current_sentence_scores,
+            selection_reason,
+        )
+        current_observation_hit = {
+            "doc_id": current_doc_id,
+            "title": current_page["title"],
+            "rank": current_page.get("retrieval_rank"),
+            "local_rerank_rank": current_page.get("local_rerank_rank"),
+            "local_rerank_score": current_page.get("local_rerank_score"),
+            "sentences": current_observation_sentences,
+        }
+        exposed_hits = self._merge_exposed_hits([current_observation_hit] + active_hits)
+
+        local_reranked_hits = [
+            {
+                "doc_id": str(page.get("doc_id", "")),
+                "title": page.get("title"),
+                "retrieval_rank": page.get("retrieval_rank"),
+                "local_rerank_rank": page.get("local_rerank_rank"),
+                "local_rerank_score": page.get("local_rerank_score"),
+                "bm25_rank": page.get("bm25_rank"),
+                "dense_rank": page.get("dense_rank"),
+                "fused_score": page.get("fused_score"),
+            }
+            for page in ranked_pages
         ]
-        added_titles = [self._evidence_archive[x]["document"]["title"] for x in added_ids]
-        evicted_titles = [self._evidence_archive[x]["document"]["title"] for x in evicted_ids]
-        rank1_in_memory = current_doc_id in active_id_set if current_doc_id else False
+        sentence_rerank_pages = [
+            {
+                "doc_id": str(page.get("doc_id", "")),
+                "title": page.get("title"),
+                "local_rerank_rank": page.get("local_rerank_rank"),
+                "sentence_pair_count": len(scores_by_doc.get(str(page.get("doc_id", "")), {})),
+            }
+            for page in sentence_pages
+        ]
 
-        observation = (
-            f"Observation: FullWiki retrieved {len(hits)} candidates for '{query}'. "
-            f"Cross-encoder evidence memory now retains {self.evidence_document_count} of "
-            f"{self.evidence_archive_count} unique documents. Current rank-1 page: "
-            f"[{self.current_title}]. Consult the Active Evidence Memory block above."
-        )
-        if not rank1_in_memory:
-            observation += " The rank-1 page was not retained by the evidence-memory reranker."
-        observation = observation[: self.max_observation_chars]
+        reranker = getattr(self.backend, "local_reranker", None)
+        if reranker is None:
+            reranker = getattr(self.backend, "evidence_reranker", None)
+        reranker_desc = reranker.describe() if reranker is not None and hasattr(reranker, "describe") else None
 
         self.last_result = {
             "action": "search",
@@ -1175,56 +1389,109 @@ class FullWikiRetriever:
             "status": "loaded",
             "retriever": result.get("mode"),
             "duplicate_query": False,
-            "query_matches_retrieved_title": title_match_rank is not None,
+            "query_matches_retrieved_title": exact_match_page is not None,
             "query_title_match_rank": title_match_rank,
+            "exact_title_injected": bool(exact_title_injected),
             "candidate_k": result.get("candidate_k"),
             "top_k": result.get("top_k"),
-            # hits = active evidence actually rendered into the recurrent model context.
-            "hits": active_hits,
-            # retrieved_hits = complete raw top-k search result before memory reranking.
+            "hits": exposed_hits,
             "retrieved_hits": raw_logged_hits,
-            "new_archive_documents": new_archive_titles,
-            "new_evidence_documents": added_titles,
-            "evicted_evidence_documents": evicted_titles,
-            "already_retained_documents": [
-                title for title in active_titles if title not in added_titles
-            ],
-            "omitted_due_to_evidence_cap": raw_omitted_titles,
-            "omitted_due_to_observation_cap": observation_omitted,
+            "local_reranked_hits": local_reranked_hits,
+            "sentence_rerank_pages": sentence_rerank_pages,
+            "current_page": self.current_title,
+            "current_page_doc_id": current_doc_id,
+            "current_page_local_rank": current_page.get("local_rerank_rank"),
+            "current_page_selection_reason": selection_reason,
+            "new_evidence_snippets": [self._snippet_summary(key) for key in added_keys],
+            "evicted_evidence_snippets": [self._snippet_summary(key) for key in evicted_keys],
+            "evidence_snippet_count": self.evidence_snippet_count,
+            "evidence_snippet_archive_count": self.evidence_snippet_archive_count,
             "evidence_document_count": self.evidence_document_count,
             "evidence_archive_count": self.evidence_archive_count,
-            "max_evidence_documents": self.max_evidence_documents,
-            "memory_policy": "cross_encoder_top_k",
-            "memory_reranker": self.backend.evidence_reranker.describe(),
-            "active_memory_documents": self.active_memory_snapshot(),
-            "rank1_in_active_memory": rank1_in_memory,
+            "max_evidence_snippets": self.max_evidence_snippets,
+            "max_evidence_chars": self.max_evidence_chars,
+            "memory_policy": "lookup_protected_then_within_search_sentence_rank",
+            "active_memory_snippets": self.active_memory_snapshot(),
+            "local_reranker": reranker_desc,
+            "local_page_pair_count": len(hits),
+            "local_sentence_pair_count": int(sentence_pair_count),
+            "page_pair_estimated_truncations": int(estimated_truncated),
             "graph_expansion_info": graph_expansion_logs or [],
             "latency_ms": {
                 **result.get("latency_ms", {}),
-                "memory_reranker": round(reranker_latency * 1000, 3),
+                "local_page_reranker": round(page_latency * 1000, 3),
+                "local_sentence_reranker": round(sentence_latency * 1000, 3),
+                "local_reranker_total": round((page_latency + sentence_latency) * 1000, 3),
             },
             "title": self.current_title,
-            "sentences": (
-                next(
-                    (hit["sentences"] for hit in active_hits if hit["doc_id"] == current_doc_id),
-                    [],
-                )
-            ),
+            "sentences": current_observation_sentences,
         }
         self._seen_search_queries[normalized_query] = {
             "retriever": result.get("mode"),
             "candidate_k": result.get("candidate_k"),
             "retrieved_hits": raw_logged_hits,
-            "retrieved_titles": [hit["title"] for hit in hits],
-            "retained_titles": active_titles,
-            "query_matches_retrieved_title": title_match_rank is not None,
+            "retrieved_titles": [hit.get("title") for hit in hits],
+            "query_matches_retrieved_title": exact_match_page is not None,
             "query_title_match_rank": title_match_rank,
+            "exact_title_injected": bool(exact_title_injected),
+        }
+        return observation
+
+    def _search_without_local_reranking(self, query, normalized_query, result, hits, raw_logged_hits):
+        current = dict(hits[0])
+        self.current_document = current
+        self.current_title = current["title"]
+        self._lookup_keyword = None
+        self._lookup_matches = []
+        self._lookup_index = 0
+        if self.current_title not in self.visited_pages:
+            self.visited_pages.append(self.current_title)
+
+        visible = []
+        for sent_id, text in enumerate(current.get("sentences", [])):
+            clean = str(text).strip()
+            if clean:
+                visible.append({"sent_id": sent_id, "text": clean})
+            if len(visible) >= 5:
+                break
+        prefix = f"Observation: FullWiki current page [{self.current_title}].\n"
+        body = "\n".join(
+            f"[{self.current_title} | sent {item['sent_id']}] {item['text']}" for item in visible
+        )
+        observation = (prefix + body)[: self.max_observation_chars]
+        hit = {
+            "doc_id": str(current.get("doc_id", "")),
+            "title": self.current_title,
+            "rank": current.get("rank", 1),
+            "sentences": visible,
+        }
+        self.last_result = {
+            "action": "search",
+            "query": query,
+            "status": "loaded",
+            "retriever": result.get("mode"),
+            "duplicate_query": False,
+            "candidate_k": result.get("candidate_k"),
+            "top_k": result.get("top_k"),
+            "hits": [hit],
+            "retrieved_hits": raw_logged_hits,
+            "title": self.current_title,
+            "sentences": visible,
+            "latency_ms": result.get("latency_ms", {}),
+        }
+        self._seen_search_queries[normalized_query] = {
+            "retriever": result.get("mode"),
+            "candidate_k": result.get("candidate_k"),
+            "retrieved_hits": raw_logged_hits,
+            "retrieved_titles": [hit.get("title") for hit in hits],
         }
         return observation
 
     def search(self, query):
         query = str(query).strip().strip("'\"")
         normalized_query = self._normalize_query(query)
+        if not normalized_query:
+            return "Observation: Search query cannot be empty."
 
         if self.duplicate_search_guard and normalized_query in self._seen_search_queries:
             previous = self._seen_search_queries[normalized_query]
@@ -1234,18 +1501,12 @@ class FullWikiRetriever:
                 "status": "duplicate_query",
                 "retriever": previous.get("retriever"),
                 "duplicate_query": True,
-                "query_matches_retrieved_title": previous.get("query_matches_retrieved_title", False),
-                "query_title_match_rank": previous.get("query_title_match_rank"),
                 "candidate_k": previous.get("candidate_k"),
                 "top_k": self.search_top_k,
                 "hits": [],
                 "retrieved_hits": previous.get("retrieved_hits", []),
-                "new_evidence_documents": [],
-                "already_retained_documents": previous.get("retained_titles", []),
-                "omitted_due_to_evidence_cap": [],
-                "omitted_due_to_observation_cap": [],
-                "evidence_document_count": self.evidence_document_count,
-                "max_evidence_documents": self.max_evidence_documents,
+                "evidence_snippet_count": self.evidence_snippet_count,
+                "max_evidence_snippets": self.max_evidence_snippets,
                 "latency_ms": {"total": 0.0},
                 "title": self.current_title,
                 "sentences": [],
@@ -1253,137 +1514,42 @@ class FullWikiRetriever:
             return f"Observation: The search query '{query}' was already performed earlier in this session."
 
         result = self.backend.search(query, top_k=self.search_top_k)
-        hits = result.get("hits", [])
+        hits = [dict(hit) for hit in result.get("hits", [])]
         raw_logged_hits = [self._raw_logged_hit(hit) for hit in hits]
-        retrieved_titles = [hit["title"] for hit in hits]
         title_match_rank = next(
-            (hit["rank"] for hit in hits if self._normalize_title(hit["title"]) == normalized_query),
+            (hit.get("rank") for hit in hits if self._normalize_title(hit.get("title", "")) == normalized_query),
             None,
         )
+        exact_title_injected = False
 
-        # Direct Title Index Injection:
-        # If an exact title match was missed by RRF (title_match_rank is None),
-        # query the backend directly by title. If found, inject it at position 0 of hits.
-        if self.use_reranked_memory and title_match_rank is None and hasattr(self.backend, "get_doc_by_title"):
+        # Keep Point 4's future fast-path separate. We still allow exact-title
+        # injection after first-stage retrieval, but it occupies one of the 15
+        # local-reranker slots instead of creating a 16th pair.
+        if self.use_local_reranking and title_match_rank is None and hasattr(self.backend, "get_doc_by_title"):
             direct_doc = self.backend.get_doc_by_title(query)
-            if direct_doc and str(direct_doc["doc_id"]) not in {str(h["doc_id"]) for h in hits}:
-                direct_hit = dict(direct_doc, rank=1, fused_score=1.0)
-                reordered_hits = [direct_hit] + hits
-                hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
-                title_match_rank = 1
+            if direct_doc:
+                direct_id = str(direct_doc.get("doc_id", direct_doc.get("id", "")))
+                existing_ids = {str(hit.get("doc_id", "")) for hit in hits}
+                if direct_id not in existing_ids:
+                    direct_hit = dict(direct_doc)
+                    direct_hit["doc_id"] = direct_id
+                    direct_hit["rank"] = (max([int(hit.get("rank") or 0) for hit in hits] or [0]) + 1)
+                    direct_hit.setdefault("bm25_rank", None)
+                    direct_hit.setdefault("bm25_score", None)
+                    direct_hit.setdefault("dense_rank", None)
+                    direct_hit.setdefault("dense_score", None)
+                    direct_hit.setdefault("fused_score", None)
+                    if len(hits) >= self.search_top_k:
+                        hits = hits[: self.search_top_k - 1] + [direct_hit]
+                    else:
+                        hits.append(direct_hit)
+                    title_match_rank = direct_hit["rank"]
+                    exact_title_injected = True
 
-        # Precision Hyperlink Graph Expansion:
-        # Expand outgoing links strictly from self.current_title and top 1-2 active memory pages.
-        # Rank candidates using source sentence score, anchor text overlap, target title overlap,
-        # and an IDF outdegree penalty -log(1 + outdegree) to penalize generic hub pages automatically.
-        # Quota: top 10 candidates max.
         graph_expansion_logs = []
-        if self.use_graph_expansion and self.use_reranked_memory and hasattr(self.backend, "get_outgoing_edges"):
-            focus_titles = []
-            if self.current_title:
-                focus_titles.append(self.current_title)
-
-            top_active_titles = [
-                self._evidence_archive[did]["document"]["title"]
-                for did in self._evidence_doc_ids[: self.graph_focus_doc_count]
-                if self._evidence_archive[did]["document"]["title"] not in focus_titles
-            ]
-            focus_titles.extend(top_active_titles)
-
-            q_tokens = set(self._normalize_query(self.question).split() + normalized_query.split())
-            candidate_edges = []
-            seen_target_norms = {self._normalize_title(t) for t in self.visited_pages}
-
-            for source_title in focus_titles:
-                edges = self.backend.get_outgoing_edges(source_title)
-                source_doc_id = None
-                if hasattr(self.backend, "title_to_doc_id"):
-                    source_doc_id = self.backend.title_to_doc_id.get(source_title.lower())
-
-                sent_scores = {}
-                if source_doc_id and source_doc_id in self._evidence_archive:
-                    sent_scores = self._evidence_archive[source_doc_id].get("sentence_scores", {})
-
-                for edge in edges:
-                    target_title = edge["target_title"]
-                    target_norm = self._normalize_title(target_title)
-                    if target_norm in seen_target_norms:
-                        continue
-
-                    source_sent_id = edge.get("source_sent_id", 0)
-                    source_sent_score = sent_scores.get(source_sent_id, 0.0)
-
-                    anchor_text = edge.get("anchor_text", target_title)
-                    anchor_tokens = set(self._normalize_title(anchor_text).split())
-                    anchor_overlap = len(q_tokens & anchor_tokens)
-
-                    target_tokens = set(target_norm.split())
-                    title_overlap = len(q_tokens & target_tokens)
-
-                    outdegree = self.backend.get_target_outdegree(target_title)
-                    outdegree_penalty = math.log1p(outdegree)
-
-                    # Multi-signal precision graph score
-                    score = (
-                        (self.graph_w_src * source_sent_score)
-                        + (self.graph_w_anchor * anchor_overlap)
-                        + (self.graph_w_title * title_overlap)
-                        - (self.graph_w_outdegree * outdegree_penalty)
-                    )
-
-                    candidate_edges.append({
-                        "source_title": source_title,
-                        "source_doc_id": edge.get("source_doc_id", ""),
-                        "source_sent_id": source_sent_id,
-                        "anchor_text": anchor_text,
-                        "target_title": target_title,
-                        "score": score,
-                    })
-
-            best_edges_by_target = {}
-            for edge in candidate_edges:
-                t = edge["target_title"]
-                if t not in best_edges_by_target or edge["score"] > best_edges_by_target[t]["score"]:
-                    best_edges_by_target[t] = edge
-
-            sorted_graph_edges = sorted(best_edges_by_target.values(), key=lambda e: e["score"], reverse=True)
-
-            existing_hit_ids = {str(h["doc_id"]) for h in hits}
-            injected_graph_count = 0
-
-            for edge in sorted_graph_edges:
-                if injected_graph_count >= self.graph_candidate_quota:
-                    break
-                graph_doc = self.backend.get_doc_by_title(edge["target_title"])
-                if graph_doc and str(graph_doc["doc_id"]) not in existing_hit_ids:
-                    graph_hit = dict(graph_doc, rank=len(hits) + 1, fused_score=0.5 + edge["score"])
-                    hits.append(graph_hit)
-                    existing_hit_ids.add(str(graph_doc["doc_id"]))
-                    injected_graph_count += 1
-                    graph_expansion_logs.append({
-                        "source_title": edge["source_title"],
-                        "source_sent_id": edge["source_sent_id"],
-                        "anchor_text": edge["anchor_text"],
-                        "target_title": edge["target_title"],
-                        "score": round(edge["score"], 4),
-                    })
-
-        # ReAct entity searches often name the exact Wikipedia page discovered on a
-        # previous hop. When that exact title is already inside the retrieved top-k,
-        # promote it to the session's rank-1/current page so lookup operates on the
-        # intended entity. Keep raw_logged_hits above untouched for retrieval audits.
-        if self.use_reranked_memory and title_match_rank not in {None, 1}:
-            title_match_index = next(
-                index
-                for index, hit in enumerate(hits)
-                if self._normalize_title(hit["title"]) == normalized_query
-            )
-            reordered_hits = (
-                [hits[title_match_index]]
-                + hits[:title_match_index]
-                + hits[title_match_index + 1:]
-            )
-            hits = [dict(hit, rank=rank) for rank, hit in enumerate(reordered_hits, 1)]
+        if hits:
+            hits, graph_expansion_logs = self._graph_expand_candidates(query, normalized_query, hits)
+            hits = hits[: self.search_top_k]
 
         if not hits:
             self.last_result = {
@@ -1392,130 +1558,43 @@ class FullWikiRetriever:
                 "status": "not_found",
                 "retriever": result.get("mode"),
                 "duplicate_query": False,
-                "query_matches_retrieved_title": False,
-                "query_title_match_rank": None,
                 "candidate_k": result.get("candidate_k"),
                 "top_k": result.get("top_k"),
                 "hits": [],
-                "retrieved_hits": [],
-                "new_evidence_documents": [],
-                "already_retained_documents": [],
-                "omitted_due_to_evidence_cap": [],
-                "omitted_due_to_observation_cap": [],
-                "evidence_document_count": self.evidence_document_count,
-                "max_evidence_documents": self.max_evidence_documents,
+                "retrieved_hits": raw_logged_hits,
+                "evidence_snippet_count": self.evidence_snippet_count,
+                "max_evidence_snippets": self.max_evidence_snippets,
                 "latency_ms": result.get("latency_ms", {}),
                 "title": None,
                 "sentences": [],
             }
-            self._seen_search_queries[normalized_query] = dict(self.last_result, retrieved_titles=[])
+            self._seen_search_queries[normalized_query] = dict(
+                self.last_result,
+                retrieved_titles=[],
+            )
             return f"Observation: FullWiki retrieval found no document for '{query}'."
 
-        # Rank 1 is the single classic ReAct current page used by lookup.
-        # A successful search resets lookup iteration state, just like the
-        # original WikiEnv.
-        self.current_document = hits[0]
-        self.current_title = hits[0]["title"]
-        self._lookup_keyword = None
-        self._lookup_matches = []
-        self._lookup_index = 0
-
-        if self.use_reranked_memory:
-            return self._search_with_reranked_memory(
-                query, normalized_query, result, hits, raw_logged_hits, title_match_rank, graph_expansion_logs
+        if self.use_local_reranking:
+            return self._search_with_local_reranking(
+                query,
+                normalized_query,
+                result,
+                hits,
+                raw_logged_hits,
+                title_match_rank,
+                exact_title_injected,
+                graph_expansion_logs,
             )
-
-        candidate_new_hits = []
-        already_retained = []
-        omitted = []
-        remaining_slots = (
-            None
-            if self.max_evidence_documents is None
-            else max(0, self.max_evidence_documents - self.evidence_document_count)
+        return self._search_without_local_reranking(
+            query, normalized_query, result, hits, raw_logged_hits
         )
-        for hit in hits:
-            doc_id = str(hit["doc_id"])
-            if doc_id in self._evidence_doc_id_set:
-                already_retained.append(hit["title"])
-                continue
-            if remaining_slots is not None and len(candidate_new_hits) >= remaining_slots:
-                omitted.append(hit["title"])
-                continue
-            candidate_new_hits.append(hit)
-
-        prefix = (
-            "Observation: FullWiki retrieval returned ranked HotpotQA-aligned Wikipedia "
-            "introductory paragraphs. Sentence IDs are exact 0-based HotpotQA sentence IDs.\n"
-        )
-        rendered, logged_hits, remaining_chars = self._render_new_hits(candidate_new_hits, prefix)
-        exposed_ids = {str(hit["doc_id"]) for hit in logged_hits}
-        exposed_titles = []
-        for hit in candidate_new_hits:
-            doc_id = str(hit["doc_id"])
-            if doc_id not in exposed_ids:
-                continue
-            self._evidence_doc_ids.append(doc_id)
-            self._evidence_doc_id_set.add(doc_id)
-            exposed_titles.append(hit["title"])
-            if hit["title"] not in self.visited_pages:
-                self.visited_pages.append(hit["title"])
-
-        observation_omitted = [
-            hit["title"] for hit in candidate_new_hits if str(hit["doc_id"]) not in exposed_ids
-        ]
-
-        if rendered:
-            observation = f"{prefix.rstrip()}\n{rendered}"
-        else:
-            observation = f"Observation: FullWiki retrieval found no new evidence for '{query}'."
-
-        self.last_result = {
-            "action": "search",
-            "query": query,
-            "status": "loaded",
-            "retriever": result.get("mode"),
-            "duplicate_query": False,
-            "query_matches_retrieved_title": title_match_rank is not None,
-            "query_title_match_rank": title_match_rank,
-            "candidate_k": result.get("candidate_k"),
-            "top_k": result.get("top_k"),
-            # hits = evidence actually shown to the LLM on this turn.
-            "hits": logged_hits,
-            # retrieved_hits = complete raw top-k result, preserved for auditing.
-            "retrieved_hits": raw_logged_hits,
-            "new_evidence_documents": exposed_titles,
-            "already_retained_documents": already_retained,
-            "omitted_due_to_evidence_cap": omitted,
-            "omitted_due_to_observation_cap": observation_omitted,
-            "evidence_document_count": self.evidence_document_count,
-            "max_evidence_documents": self.max_evidence_documents,
-            "latency_ms": result.get("latency_ms", {}),
-            "title": self.current_title,
-            "sentences": (
-                logged_hits[0]["sentences"]
-                if logged_hits and logged_hits[0]["title"] == self.current_title
-                else []
-            ),
-        }
-        self._seen_search_queries[normalized_query] = {
-            "retriever": result.get("mode"),
-            "candidate_k": result.get("candidate_k"),
-            "retrieved_hits": raw_logged_hits,
-            "retrieved_titles": retrieved_titles,
-            "retained_titles": list(dict.fromkeys(already_retained + exposed_titles)),
-            "query_matches_retrieved_title": title_match_rank is not None,
-            "query_title_match_rank": title_match_rank,
-        }
-        return observation
 
     def lookup(self, keyword):
-        """Classic ReAct lookup over the single current rank-1 page.
+        """Classic ReAct lookup over the current page, independent of memory.
 
-        Search may expose multiple ranked passages, but only rank 1 becomes the
-        current page. Repeating lookup with the same keyword advances through
-        matching sentences on that page, mirroring Yao et al.'s WikiEnv. A
-        lookup can never introduce a document that was not already admitted to
-        the bounded working-evidence set.
+        Repeating lookup with the same keyword advances through matching sentences
+        on the same current page. A successful lookup promotes the exact matched
+        sentence into persistent snippet memory, but memory never gates lookup.
         """
         keyword_raw = str(keyword).strip().strip("'\"")
         keyword_clean = keyword_raw.lower()
@@ -1532,23 +1611,6 @@ class FullWikiRetriever:
                 "hits": [],
             }
             return "Observation: No FullWiki document currently loaded. Perform a `search` first."
-
-        current_doc_id = str(self.current_document.get("doc_id", ""))
-        if current_doc_id not in self._evidence_doc_id_set:
-            self.last_result = {
-                "action": "lookup",
-                "query": keyword_raw,
-                "status": "current_page_not_exposed",
-                "title": self.current_title,
-                "sentences": [],
-                "hits": [],
-                "evidence_document_count": self.evidence_document_count,
-                "max_evidence_documents": self.max_evidence_documents,
-            }
-            return (
-                f"Observation: The current rank-1 page [{self.current_title}] was not admitted "
-                "to the bounded working evidence, so lookup cannot expose it."
-            )
 
         if self._lookup_keyword != keyword_clean:
             self._lookup_keyword = keyword_clean
@@ -1576,6 +1638,18 @@ class FullWikiRetriever:
         match = dict(self._lookup_matches[self._lookup_index])
         self._lookup_index += 1
         total_matches = len(self._lookup_matches)
+        current_doc_id = str(self.current_document.get("doc_id", self.current_document.get("id", "")))
+
+        added_keys = []
+        evicted_keys = []
+        if self.use_local_reranking:
+            key = self._upsert_lookup_snippet(match["sent_id"], match["text"], keyword_raw)
+            added_keys, evicted_keys, _ = self._refresh_snippet_memory()
+            if key not in self._active_snippet_keys:
+                # This should be extremely rare (only if a single lookup sentence
+                # cannot fit the character budget), but lookup itself still succeeds.
+                pass
+
         hit = {
             "doc_id": current_doc_id,
             "title": self.current_title,
@@ -1592,6 +1666,11 @@ class FullWikiRetriever:
             "lookup_result_index": self._lookup_index,
             "lookup_result_count": total_matches,
             "current_page_rank": 1,
+            "current_page_doc_id": current_doc_id,
+            "new_evidence_snippets": [self._snippet_summary(key) for key in added_keys],
+            "evicted_evidence_snippets": [self._snippet_summary(key) for key in evicted_keys],
+            "evidence_snippet_count": self.evidence_snippet_count,
+            "max_evidence_snippets": self.max_evidence_snippets,
         }
 
         prefix = f"Observation: (Result {self._lookup_index} / {total_matches}) "

@@ -26,12 +26,14 @@ from config import (
     MAX_AGENT_HOPS,
     OPENAI_API_BASE,
     OPENAI_API_KEY,
-    REACT_MAX_EVIDENCE_DOCUMENTS,
+    REACT_LOCAL_RERANK_PAGE_COUNT,
+    REACT_MAX_EVIDENCE_CHARS,
+    REACT_MAX_EVIDENCE_SNIPPETS,
     REACT_MAX_OBSERVATION_CHARS,
-    REACT_MEMORY_RERANKER_BATCH_SIZE,
-    REACT_MEMORY_RERANKER_DEVICE,
-    REACT_MEMORY_RERANKER_MAX_LENGTH,
-    REACT_MEMORY_RERANKER_MODEL,
+    REACT_LOCAL_RERANKER_BATCH_SIZE,
+    REACT_LOCAL_RERANKER_DEVICE,
+    REACT_LOCAL_RERANKER_MAX_LENGTH,
+    REACT_LOCAL_RERANKER_MODEL,
     REACT_SEARCH_TOP_K,
     USE_GRAPH_EXPANSION,
     load_eval_config,
@@ -107,7 +109,8 @@ def _sample_metadata(sample):
 
 def process_single_question(
     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend=None,
-    search_top_k=REACT_SEARCH_TOP_K, max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
+    search_top_k=REACT_SEARCH_TOP_K, local_rerank_page_count=REACT_LOCAL_RERANK_PAGE_COUNT,
+    max_evidence_snippets=REACT_MAX_EVIDENCE_SNIPPETS, max_evidence_chars=REACT_MAX_EVIDENCE_CHARS,
     max_observation_chars=REACT_MAX_OBSERVATION_CHARS, use_graph_expansion=USE_GRAPH_EXPANSION,
     graph_focus_doc_count=GRAPH_FOCUS_DOC_COUNT, graph_candidate_quota=GRAPH_CANDIDATE_QUOTA,
     graph_w_src=GRAPH_WEIGHT_SOURCE_SENT_SCORE, graph_w_anchor=GRAPH_WEIGHT_ANCHOR_OVERLAP,
@@ -124,8 +127,10 @@ def process_single_question(
             raise RuntimeError("FullWiki backend was not initialized.")
         toolset = fullwiki_backend.create_session(
             search_top_k=search_top_k,
+            local_rerank_page_count=local_rerank_page_count,
+            max_evidence_snippets=max_evidence_snippets,
+            max_evidence_chars=max_evidence_chars,
             max_observation_chars=max_observation_chars,
-            max_evidence_documents=max_evidence_documents,
             duplicate_search_guard=True,
             question=question,
             use_graph_expansion=use_graph_expansion,
@@ -149,7 +154,7 @@ def process_single_question(
     invalid_supporting_facts = agent_state.get("invalid_supporting_facts", []) or []
     visited_pages = agent_state.get("visited_pages", [])
     step_count = agent_state.get("step_count", 0)
-    active_memory_documents = (
+    active_memory_snippets = (
         toolset.active_memory_snapshot() if hasattr(toolset, "active_memory_snapshot") else []
     )
     evidence_archive_count = (
@@ -182,7 +187,7 @@ def process_single_question(
         "invalid_supporting_fact_count": len(invalid_supporting_facts),
         "gold_supporting_facts": gold_supporting_facts,
         "visited_pages": visited_pages,
-        "active_memory_documents": active_memory_documents,
+        "active_memory_snippets": active_memory_snippets,
         "evidence_archive_count": evidence_archive_count,
         "latency": round(latency, 3),
         "timestamp": datetime.now().isoformat(),
@@ -219,7 +224,7 @@ def process_single_question(
         "step_count": step_count,
         "latency_seconds": round(latency, 3),
         "visited_pages": visited_pages,
-        "active_memory_documents": active_memory_documents,
+        "active_memory_snippets": active_memory_snippets,
         "evidence_archive_count": evidence_archive_count,
         "observed_gold_document_recall": observed_info["observed_gold_document_recall"],
         "observed_gold_supporting_fact_recall": observed_info["observed_gold_supporting_fact_recall"],
@@ -326,7 +331,9 @@ def run_benchmark(
     rrf_k=FULLWIKI_RRF_K,
     index_dir=FULLWIKI_INDEX_DIR,
     search_top_k=REACT_SEARCH_TOP_K,
-    max_evidence_documents=REACT_MAX_EVIDENCE_DOCUMENTS,
+    local_rerank_page_count=REACT_LOCAL_RERANK_PAGE_COUNT,
+    max_evidence_snippets=REACT_MAX_EVIDENCE_SNIPPETS,
+    max_evidence_chars=REACT_MAX_EVIDENCE_CHARS,
     max_observation_chars=REACT_MAX_OBSERVATION_CHARS,
     use_graph_expansion=USE_GRAPH_EXPANSION,
     graph_focus_doc_count=GRAPH_FOCUS_DOC_COUNT,
@@ -340,17 +347,21 @@ def run_benchmark(
     reranker_max_length=None,
     reranker_batch_size=None,
 ):
-    reranker_model = reranker_model or REACT_MEMORY_RERANKER_MODEL
-    reranker_device = reranker_device or REACT_MEMORY_RERANKER_DEVICE
-    reranker_max_length = reranker_max_length or REACT_MEMORY_RERANKER_MAX_LENGTH
-    reranker_batch_size = reranker_batch_size or REACT_MEMORY_RERANKER_BATCH_SIZE
+    reranker_model = reranker_model or REACT_LOCAL_RERANKER_MODEL
+    reranker_device = reranker_device or REACT_LOCAL_RERANKER_DEVICE
+    reranker_max_length = reranker_max_length or REACT_LOCAL_RERANKER_MAX_LENGTH
+    reranker_batch_size = reranker_batch_size or REACT_LOCAL_RERANKER_BATCH_SIZE
 
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
     if search_top_k < 1:
         raise ValueError("search_top_k must be >= 1")
-    if max_evidence_documents < 1:
-        raise ValueError("max_evidence_documents must be >= 1")
+    if local_rerank_page_count < 1 or local_rerank_page_count > search_top_k:
+        raise ValueError("local_rerank_page_count must be between 1 and search_top_k")
+    if max_evidence_snippets < 1:
+        raise ValueError("max_evidence_snippets must be >= 1")
+    if max_evidence_chars < 1:
+        raise ValueError("max_evidence_chars must be >= 1")
     if max_observation_chars < 1:
         raise ValueError("max_observation_chars must be >= 1")
 
@@ -371,8 +382,10 @@ def run_benchmark(
         f"Graph Expansion Enabled: {use_graph_expansion if mode == 'fullwiki' else 'n/a'}\n"
         f"Graph Focus Doc Count: {graph_focus_doc_count if mode == 'fullwiki' and use_graph_expansion else 'n/a'}\n"
         f"Graph Candidate Quota: {graph_candidate_quota if mode == 'fullwiki' and use_graph_expansion else 'n/a'}\n"
-        f"Documents per adaptive search: {search_top_k if mode == 'fullwiki' else 1}\n"
-        f"Max unique working-evidence documents: {max_evidence_documents if mode == 'fullwiki' else 'n/a'}\n"
+        f"Documents hydrated per adaptive search: {search_top_k if mode == 'fullwiki' else 1}\n"
+        f"Pages sentence-reranked per search: {local_rerank_page_count if mode == 'fullwiki' else 'n/a'}\n"
+        f"Max active evidence snippets: {max_evidence_snippets if mode == 'fullwiki' else 'n/a'}\n"
+        f"Max active evidence characters: {max_evidence_chars if mode == 'fullwiki' else 'n/a'}\n"
         f"Max characters per retrieval observation: {max_observation_chars if mode == 'fullwiki' else 'n/a'}\n"
     )
     if mode == "live":
@@ -394,10 +407,10 @@ def run_benchmark(
             mode=retriever,
             candidate_k=candidate_k,
             rrf_k=rrf_k,
-            evidence_reranker_model=reranker_model,
-            evidence_reranker_device=reranker_device,
-            evidence_reranker_max_length=reranker_max_length,
-            evidence_reranker_batch_size=reranker_batch_size,
+            local_reranker_model=reranker_model,
+            local_reranker_device=reranker_device,
+            local_reranker_max_length=reranker_max_length,
+            local_reranker_batch_size=reranker_batch_size,
         )
 
     results = []
@@ -412,7 +425,8 @@ def run_benchmark(
             try:
                 eval_metrics, trajectory_entry = process_single_question(
                     sample, idx, total, mode, llm, max_hops, logger, fullwiki_backend, search_top_k,
-                    max_evidence_documents, max_observation_chars, use_graph_expansion,
+                    local_rerank_page_count, max_evidence_snippets, max_evidence_chars,
+                    max_observation_chars, use_graph_expansion,
                     graph_focus_doc_count, graph_candidate_quota, graph_w_src, graph_w_anchor,
                     graph_w_title, graph_w_out
                 )
@@ -435,8 +449,9 @@ def run_benchmark(
             future_to_meta = {
                 executor.submit(
                     process_single_question, sample, idx, total, mode, llm, max_hops, logger,
-                    fullwiki_backend, search_top_k, max_evidence_documents, max_observation_chars,
-                    use_graph_expansion, graph_focus_doc_count, graph_candidate_quota,
+                    fullwiki_backend, search_top_k, local_rerank_page_count, max_evidence_snippets,
+                    max_evidence_chars, max_observation_chars, use_graph_expansion,
+                    graph_focus_doc_count, graph_candidate_quota,
                     graph_w_src, graph_w_anchor, graph_w_title, graph_w_out
                 ): (idx, sample)
                 for idx, sample in enumerate(samples, 1)
@@ -545,11 +560,13 @@ def run_benchmark(
             "max_hops": max_hops,
             "documents_per_search": search_top_k if mode == "fullwiki" else 1,
             "retrieval_top_k": search_top_k if mode == "fullwiki" else 1,
-            "max_working_evidence_documents": max_evidence_documents if mode == "fullwiki" else None,
-            "working_evidence_policy": "cross_encoder_top_k" if mode == "fullwiki" else None,
+            "local_rerank_page_count": local_rerank_page_count if mode == "fullwiki" else None,
+            "max_working_evidence_snippets": max_evidence_snippets if mode == "fullwiki" else None,
+            "max_working_evidence_characters": max_evidence_chars if mode == "fullwiki" else None,
+            "working_evidence_policy": "lookup_protected_then_within_search_sentence_rank" if mode == "fullwiki" else None,
             "max_observation_characters": max_observation_chars if mode == "fullwiki" else None,
             "duplicate_search_guard": mode == "fullwiki",
-            "exact_title_promotion": False,
+            "exact_title_current_page_override": True,
             "retriever": retriever if mode == "fullwiki" else mode,
             "retrieval_backend": fullwiki_backend.describe() if fullwiki_backend is not None else None,
             "segmented_metrics": segmented_summary,
@@ -576,13 +593,15 @@ from config import (
     MAX_AGENT_HOPS,
     OPENAI_API_BASE,
     OPENAI_API_KEY,
-    REACT_MAX_EVIDENCE_DOCUMENTS,
+    REACT_LOCAL_RERANK_PAGE_COUNT,
+    REACT_MAX_EVIDENCE_CHARS,
+    REACT_MAX_EVIDENCE_SNIPPETS,
     REACT_MAX_OBSERVATION_CHARS,
     REACT_SEARCH_TOP_K,
-    REACT_MEMORY_RERANKER_BATCH_SIZE,
-    REACT_MEMORY_RERANKER_DEVICE,
-    REACT_MEMORY_RERANKER_MAX_LENGTH,
-    REACT_MEMORY_RERANKER_MODEL,
+    REACT_LOCAL_RERANKER_BATCH_SIZE,
+    REACT_LOCAL_RERANKER_DEVICE,
+    REACT_LOCAL_RERANKER_MAX_LENGTH,
+    REACT_LOCAL_RERANKER_MODEL,
     load_eval_config,
 )
 
@@ -595,7 +614,9 @@ if __name__ == "__main__":
     parser.add_argument("--retriever", choices=["bm25", "dense", "hybrid"], default=None, help="FullWiki first-stage retriever")
     parser.add_argument("--index-dir", type=str, default=FULLWIKI_INDEX_DIR, help="FullWiki index directory")
     parser.add_argument("--top-k", type=int, default=None, help="Documents returned by each adaptive FullWiki search")
-    parser.add_argument("--max-evidence-docs", type=int, default=None, help="Maximum unique FullWiki documents retained in ReAct working evidence")
+    parser.add_argument("--max-evidence-snippets", "--max-evidence-docs", dest="max_evidence_snippets", type=int, default=None, help="Maximum sentence snippets retained in ReAct Active Evidence Memory")
+    parser.add_argument("--max-evidence-chars", type=int, default=None, help="Maximum characters in ReAct Active Evidence Memory")
+    parser.add_argument("--local-rerank-pages", type=int, default=None, help="Number of locally reranked pages opened for exhaustive sentence scoring")
     parser.add_argument("--max-observation-chars", type=int, default=None, help="Maximum characters rendered by each FullWiki search observation")
     parser.add_argument("--candidate-k", type=int, default=None, help="First-stage RRF candidate pool size")
     parser.add_argument("--rrf-k", type=int, default=None, help="Reciprocal Rank Fusion smoothing parameter")
@@ -604,8 +625,8 @@ if __name__ == "__main__":
     parser.add_argument("--api-base", type=str, default=None, help="Local vLLM / OpenAI server URL")
     parser.add_argument("--output-dir", type=str, default="eval_results/react", help="Directory for outputs")
     parser.add_argument("--concurrency", type=int, default=16, help="Number of concurrent worker threads")
-    parser.add_argument("--reranker-model", type=str, default=None, help="Evidence reranker model name")
-    parser.add_argument("--reranker-device", type=str, default=None, help="Evidence reranker device (cpu/cuda)")
+    parser.add_argument("--reranker-model", type=str, default=None, help="Query-local cross-encoder reranker model name")
+    parser.add_argument("--reranker-device", type=str, default=None, help="Query-local reranker device (cpu/cuda)")
     parser.add_argument("--max-hops", type=int, default=None, help="Maximum hops per question")
     parser.add_argument("--enable-graph-expansion", action="store_true", default=False, help="Enable precision hyperlink graph expansion")
     parser.add_argument("--disable-graph-expansion", action="store_true", default=False, help="Disable precision hyperlink graph expansion")
@@ -616,7 +637,9 @@ if __name__ == "__main__":
     mode = args.mode or cfg.get("retrieval_mode") or "offline"
     retriever = args.retriever or cfg.get("retriever") or "hybrid"
     search_top_k = args.top_k or cfg.get("react_top_k") or REACT_SEARCH_TOP_K
-    max_evidence_docs = args.max_evidence_docs or cfg.get("max_evidence_documents") or REACT_MAX_EVIDENCE_DOCUMENTS
+    local_rerank_page_count = args.local_rerank_pages or cfg.get("local_rerank_page_count") or REACT_LOCAL_RERANK_PAGE_COUNT
+    max_evidence_snippets = args.max_evidence_snippets or cfg.get("max_evidence_snippets") or REACT_MAX_EVIDENCE_SNIPPETS
+    max_evidence_chars = args.max_evidence_chars or cfg.get("max_evidence_chars") or REACT_MAX_EVIDENCE_CHARS
     max_observation_chars = args.max_observation_chars or cfg.get("max_observation_chars") or REACT_MAX_OBSERVATION_CHARS
     source = args.source or cfg.get("dataset_source") or "sample"
     model = args.model or cfg.get("model_name") or LLM_MODEL_NAME
@@ -625,10 +648,10 @@ if __name__ == "__main__":
 
     candidate_k = args.candidate_k or cfg.get("candidate_k") or FULLWIKI_SEARCH_CANDIDATES
     rrf_k = args.rrf_k or cfg.get("rrf_k") or FULLWIKI_RRF_K
-    reranker_model = args.reranker_model or cfg.get("memory_reranker_model") or REACT_MEMORY_RERANKER_MODEL
-    reranker_device = args.reranker_device or cfg.get("memory_reranker_device") or REACT_MEMORY_RERANKER_DEVICE
-    reranker_batch_size = cfg.get("memory_reranker_batch_size") or REACT_MEMORY_RERANKER_BATCH_SIZE
-    reranker_max_length = cfg.get("memory_reranker_max_length") or REACT_MEMORY_RERANKER_MAX_LENGTH
+    reranker_model = args.reranker_model or cfg.get("local_reranker_model") or cfg.get("memory_reranker_model") or REACT_LOCAL_RERANKER_MODEL
+    reranker_device = args.reranker_device or cfg.get("local_reranker_device") or cfg.get("memory_reranker_device") or REACT_LOCAL_RERANKER_DEVICE
+    reranker_batch_size = cfg.get("local_reranker_batch_size") or cfg.get("memory_reranker_batch_size") or REACT_LOCAL_RERANKER_BATCH_SIZE
+    reranker_max_length = cfg.get("local_reranker_max_length") or cfg.get("memory_reranker_max_length") or REACT_LOCAL_RERANKER_MAX_LENGTH
 
     if args.enable_graph_expansion:
         use_graph_expansion = True
@@ -659,7 +682,9 @@ if __name__ == "__main__":
         rrf_k=rrf_k,
         index_dir=args.index_dir,
         search_top_k=search_top_k,
-        max_evidence_documents=max_evidence_docs,
+        local_rerank_page_count=local_rerank_page_count,
+        max_evidence_snippets=max_evidence_snippets,
+        max_evidence_chars=max_evidence_chars,
         max_observation_chars=max_observation_chars,
         use_graph_expansion=use_graph_expansion,
         graph_focus_doc_count=graph_focus_doc_count,
