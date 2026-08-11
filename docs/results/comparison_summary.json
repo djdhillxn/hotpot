@@ -1,0 +1,315 @@
+{
+  "schema_version": "1.0",
+  "comparison_validation": {
+    "status": "PASSED",
+    "question_count": 7405,
+    "question_id_sets_identical": true,
+    "question_and_gold_identity_verified": true,
+    "failed_records": 0,
+    "shared_settings": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dataset source": "official_json",
+      "dataset size": 7405,
+      "retrieval mode": "fullwiki",
+      "retriever": "hybrid",
+      "concurrency": 64,
+      "candidate_k": 50,
+      "rrf_k": 60,
+      "dense model": "BAAI/bge-base-en-v1.5",
+      "dense query device": "cpu",
+      "dense nprobe": 32,
+      "corpus SHA-256": "871838a975c3f96b07630627d9320be4e859d471ebbf278d52dc07145ef1cd3b",
+      "corpus source MD5": "01edf64cd120ecc03a2745352779514c",
+      "BM25 engine": "Lucene/Anserini via Pyserini",
+      "BM25 parameters": "Pyserini LuceneSearcher default BM25 (no tuned dataset-specific parameters)",
+      "BM25 corpus document count": 5233235,
+      "dense index factory": "IVF4096,PQ96x8",
+      "dense dimension": 768,
+      "dense corpus document count": 5233235,
+      "page reranker model": "BAAI/bge-reranker-base",
+      "page reranker device": "cuda",
+      "page reranker max length": 512,
+      "page reranker batch size": 32
+    },
+    "baseline_runner": "single_pass_rag",
+    "react_runner": "react",
+    "protocol_contracts": {
+      "baseline": {
+        "retrieval_calls_per_question": 1,
+        "generation_calls_per_question": 1,
+        "documents_hydrated_for_page_reranking": 15,
+        "documents_in_reader_context": 7,
+        "page_reranker_enabled": true,
+        "sentence_reranker_enabled": false
+      },
+      "react": {
+        "max_hops": 7,
+        "documents_per_search": 15,
+        "local_rerank_page_count": 4,
+        "max_working_evidence_snippets": 12,
+        "max_working_evidence_characters": 6000,
+        "working_evidence_policy": "lookup_protected_then_within_search_sentence_rank"
+      }
+    }
+  },
+  "official_metrics": {
+    "baseline": {
+      "count": 7405,
+      "em": 40.45,
+      "f1": 51.8,
+      "sp_em": 9.66,
+      "sp_f1": 43.97,
+      "joint_em": 6.08,
+      "joint_f1": 26.86,
+      "steps": 1.0,
+      "latency": 23.64
+    },
+    "react": {
+      "count": 7405,
+      "em": 46.67,
+      "f1": 60.48,
+      "sp_em": 14.91,
+      "sp_f1": 52.25,
+      "joint_em": 9.44,
+      "joint_f1": 37.11,
+      "steps": 3.35,
+      "latency": 64.4
+    },
+    "delta_pp": {
+      "em": 6.23,
+      "f1": 8.68,
+      "sp_em": 5.25,
+      "sp_f1": 8.28,
+      "joint_em": 3.36,
+      "joint_f1": 10.25
+    }
+  },
+  "by_question_type": {
+    "overall": {
+      "count": 7405,
+      "baseline": {
+        "count": 7405,
+        "em": 40.45,
+        "f1": 51.8,
+        "sp_em": 9.66,
+        "sp_f1": 43.97,
+        "joint_em": 6.08,
+        "joint_f1": 26.86,
+        "steps": 1.0,
+        "latency": 23.64
+      },
+      "react": {
+        "count": 7405,
+        "em": 46.67,
+        "f1": 60.48,
+        "sp_em": 14.91,
+        "sp_f1": 52.25,
+        "joint_em": 9.44,
+        "joint_f1": 37.11,
+        "steps": 3.35,
+        "latency": 64.4
+      },
+      "delta_pp": {
+        "em": 6.23,
+        "f1": 8.68,
+        "sp_em": 5.25,
+        "sp_f1": 8.28,
+        "joint_em": 3.36,
+        "joint_f1": 10.25
+      }
+    },
+    "bridge": {
+      "count": 5918,
+      "baseline": {
+        "count": 5918,
+        "em": 35.99,
+        "f1": 48.25,
+        "sp_em": 3.84,
+        "sp_f1": 39.14,
+        "joint_em": 2.25,
+        "joint_f1": 22.71,
+        "steps": 1.0,
+        "latency": 23.37
+      },
+      "react": {
+        "count": 5918,
+        "em": 42.94,
+        "f1": 58.1,
+        "sp_em": 6.88,
+        "sp_f1": 47.0,
+        "joint_em": 3.89,
+        "joint_f1": 32.94,
+        "steps": 3.44,
+        "latency": 65.86
+      },
+      "delta_pp": {
+        "em": 6.94,
+        "f1": 9.85,
+        "sp_em": 3.04,
+        "sp_f1": 7.86,
+        "joint_em": 1.64,
+        "joint_f1": 10.23
+      }
+    },
+    "comparison": {
+      "count": 1487,
+      "baseline": {
+        "count": 1487,
+        "em": 58.17,
+        "f1": 65.95,
+        "sp_em": 32.82,
+        "sp_f1": 63.21,
+        "joint_em": 21.32,
+        "joint_f1": 43.38,
+        "steps": 1.0,
+        "latency": 24.74
+      },
+      "react": {
+        "count": 1487,
+        "em": 61.53,
+        "f1": 69.95,
+        "sp_em": 46.87,
+        "sp_f1": 73.17,
+        "joint_em": 31.54,
+        "joint_f1": 53.71,
+        "steps": 3.0,
+        "latency": 58.59
+      },
+      "delta_pp": {
+        "em": 3.36,
+        "f1": 4.0,
+        "sp_em": 14.06,
+        "sp_f1": 9.96,
+        "joint_em": 10.22,
+        "joint_f1": 10.33
+      }
+    }
+  },
+  "evidence_diagnostics": {
+    "baseline": {
+      "supporting_document_f1": 34.25,
+      "observed_gold_document_recall": 77.02,
+      "observed_gold_supporting_fact_recall": 77.41,
+      "all_gold_supporting_facts_observed": 57.79
+    },
+    "react": {
+      "supporting_document_f1": 38.52,
+      "observed_gold_document_recall": 80.4,
+      "observed_gold_supporting_fact_recall": 80.01,
+      "all_gold_supporting_facts_observed": 63.67
+    },
+    "delta_pp": {
+      "supporting_document_f1": 4.27,
+      "observed_gold_document_recall": 3.38,
+      "observed_gold_supporting_fact_recall": 2.6,
+      "all_gold_supporting_facts_observed": 5.89
+    }
+  },
+  "paired_outcomes": {
+    "answer_exact_match": {
+      "both_correct": 2161,
+      "baseline_only": 834,
+      "react_only": 1295,
+      "both_wrong": 3115,
+      "net_gain": 461
+    },
+    "joint_exact_match": {
+      "both_correct": 253,
+      "baseline_only": 197,
+      "react_only": 446,
+      "both_wrong": 6509,
+      "net_gain": 249
+    }
+  },
+  "efficiency": {
+    "baseline": {
+      "latency_seconds": {
+        "mean": 23.644,
+        "median": 22.334,
+        "p90": 31.381,
+        "p95": 34.843
+      },
+      "avg_hops": 1.0,
+      "reranker": {
+        "total_pairs_scored": 111075,
+        "pairs_per_question": 15.0
+      },
+      "total_evaluation_seconds": 2741.153,
+      "throughput_questions_per_second": 2.701
+    },
+    "react": {
+      "latency_seconds": {
+        "mean": 64.398,
+        "median": 56.02,
+        "p90": 108.949,
+        "p95": 122.553
+      },
+      "avg_hops": 3.35,
+      "reranker": {
+        "total_pairs_scored": 410359,
+        "pairs_per_question": 55.41647535449021
+      },
+      "total_evaluation_seconds": 7483.312,
+      "throughput_questions_per_second": 0.99
+    },
+    "react_to_baseline_mean_latency_ratio": 2.724
+  },
+  "react_quality_by_hops": [
+    {
+      "hops": 1,
+      "count": 768,
+      "react_joint_f1": 34.12742752050911,
+      "baseline_joint_f1_same_questions": 30.61909372797563,
+      "react_answer_f1": 63.30431871852634,
+      "baseline_answer_f1_same_questions": 64.25962297565559
+    },
+    {
+      "hops": 2,
+      "count": 2435,
+      "react_joint_f1": 50.26434963060535,
+      "baseline_joint_f1_same_questions": 31.21349992310611,
+      "react_answer_f1": 71.5908289929938,
+      "baseline_answer_f1_same_questions": 53.22295337370063
+    },
+    {
+      "hops": 3,
+      "count": 1735,
+      "react_joint_f1": 41.141395096241915,
+      "baseline_joint_f1_same_questions": 25.787151320389533,
+      "react_answer_f1": 67.34415224292366,
+      "baseline_answer_f1_same_questions": 52.68830939116618
+    },
+    {
+      "hops": 4,
+      "count": 717,
+      "react_joint_f1": 32.98349083760694,
+      "baseline_joint_f1_same_questions": 25.111602779508484,
+      "react_answer_f1": 55.87011743071155,
+      "baseline_answer_f1_same_questions": 49.24429608007764
+    },
+    {
+      "hops": 5,
+      "count": 467,
+      "react_joint_f1": 27.86849226691347,
+      "baseline_joint_f1_same_questions": 24.804457725116123,
+      "react_answer_f1": 52.12472870931115,
+      "baseline_answer_f1_same_questions": 50.040613680870635
+    },
+    {
+      "hops": 6,
+      "count": 228,
+      "react_joint_f1": 25.838280584797612,
+      "baseline_joint_f1_same_questions": 21.044583409653555,
+      "react_answer_f1": 46.61002253107516,
+      "baseline_answer_f1_same_questions": 46.68805656708883
+    },
+    {
+      "hops": 7,
+      "count": 1055,
+      "react_joint_f1": 11.616947102413626,
+      "baseline_joint_f1_same_questions": 19.20293863869559,
+      "react_answer_f1": 31.31384828813042,
+      "baseline_answer_f1_same_questions": 41.63211649383938
+    }
+  ]
+}
