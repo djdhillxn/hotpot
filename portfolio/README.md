@@ -1,7 +1,7 @@
 # HotpotQA portfolio export
 
-The evaluator writes its complete analysis artifact to
-`portfolio/portfolio_trajectories.json`. That file is intentionally exhaustive:
+The evaluator writes its complete ReAct execution artifact to
+`eval_results/react/trajectories.json`. That file is intentionally exhaustive:
 it can include raw model turns, rank lists, active-evidence snapshots, retrieval
 telemetry, and every rendered observation.
 
@@ -10,14 +10,14 @@ artifact with:
 
 ```bash
 python3 portfolio/export_quiz_data.py \
-  portfolio/portfolio_trajectories.json \
-  ../djdhillxn.github.io/assets/json/hotpot/quiz.json
+  eval_results/react/trajectories.json \
+  ../djdhillxn.github.io/assets/json/hotpot/react_trajectories.json
 ```
 
-By default the exporter retains every question but caps each displayed
-observation at 900 characters, preserving both the beginning and end. Use
-`--observation-chars` to change that boundary, `--limit` for a smaller curated
-artifact, and `--pretty` when the output is intended for manual inspection.
+By default the exporter retains every question and every displayed observation
+in full. Use `--observation-chars` only when an explicitly shortened build is
+needed, `--limit` for a smaller development fixture, and `--pretty` when the
+output is intended for manual inspection.
 
 The compact schema contains run-level metrics and an `examples` array. Each
 example keeps only what the quiz renders:
@@ -34,8 +34,5 @@ The page implementation lives in the sibling portfolio repository:
 _projects/hotpot.md
 assets/css/hotpot/project.css
 assets/js/hotpot/quiz.js
-assets/json/hotpot/quiz.json
+assets/json/hotpot/react_trajectories.json
 ```
-
-Until the full validation run is exported, `quiz.json` is explicitly marked as
-demo data and the page reports every aggregate metric as pending.

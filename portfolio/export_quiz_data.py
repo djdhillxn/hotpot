@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build the compact JSON artifact used by the HotpotQA portfolio quiz.
+"""Build the single compact JSON artifact used by the HotpotQA portfolio quiz.
 
-The evaluator intentionally keeps exhaustive trajectories for analysis. This
-exporter removes retrieval internals and raw model payloads while retaining the
-question, both answers, official metrics, supporting facts, and a readable
+The evaluator intentionally keeps exhaustive trajectories for research. This
+exporter removes retrieval internals, duplicated raw model output, diagnostics,
+and infrastructure telemetry while retaining every question, both answers, all
+six official scores, supporting facts, visited pages, and the complete readable
 Thought/Action/Observation trace.
 """
 
@@ -11,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -44,6 +44,8 @@ def _first(record, *keys, default=None):
 def _clip_observation(value, max_chars):
     text = str(value or "").strip()
     if not text:
+        return text, False
+    if max_chars is None:
         return text, False
     if max_chars <= 0:
         return "", True
@@ -105,9 +107,6 @@ def _compact_record(record, max_observation_chars):
             "joint_f1": _as_number(record.get("joint_f1")),
         },
         "tool_steps": int(record.get("step_count") or 0),
-        "latency_seconds": _as_number(
-            _first(record, "latency_seconds", "latency")
-        ),
         "gold_supporting_facts": record.get("gold_supporting_facts") or [],
         "agent_supporting_facts": (
             record.get("predicted_supporting_facts") or []
@@ -173,7 +172,7 @@ def _summary_from_payload(metadata, records):
     return summary
 
 
-def build_quiz_payload(payload, max_observation_chars=900, limit=None):
+def build_quiz_payload(payload, max_observation_chars=None, limit=None):
     if isinstance(payload, list):
         metadata = {}
         raw_records = payload
@@ -199,7 +198,6 @@ def build_quiz_payload(payload, max_observation_chars=900, limit=None):
     return {
         "schema_version": SCHEMA_VERSION,
         "demo": False,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "dataset": "HotpotQA",
             "setting": "fullwiki",
@@ -221,8 +219,8 @@ def parse_args():
     parser.add_argument(
         "--observation-chars",
         type=int,
-        default=900,
-        help="Maximum characters retained per observation (default: 900)",
+        default=None,
+        help="Optional maximum characters per observation; the default retains full observations",
     )
     parser.add_argument(
         "--limit",
@@ -238,7 +236,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.observation_chars < 0:
+    if args.observation_chars is not None and args.observation_chars < 0:
         raise SystemExit("--observation-chars must be non-negative")
     if args.limit is not None and args.limit < 1:
         raise SystemExit("--limit must be at least 1")
